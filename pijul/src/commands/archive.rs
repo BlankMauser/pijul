@@ -1,0 +1,135 @@
+use anyhow::bail;
+use clap::{Parser, ValueHint};
+use log::debug;
+use pijul_core::{Hash, Merkle};
+use std::path::Path;
+
+use crate::commands::common_opts::RepoAndChannel;
+use crate::commands::load_channel;
+use pijul_repository::Repository;
+
+#[derive(Parser, Debug)]
+pub struct Archive {
+    #[clap(flatten)]
+    base: RepoAndChannel,
+    /// Ask the remote to send an archive
+    #[clap(long = "remote")]
+    remote: Option<String>,
+    /// Do not check certificates (HTTPS remotes only, this option might be dangerous)
+    #[clap(short = 'k')]
+    no_cert_check: bool,
+    /// Archive in this state
+    #[clap(long = "state")]
+    state: Option<String>,
+    /// Apply these changes after switching to the channel
+    #[clap(long = "change")]
+    change: Vec<String>,
+    /// Append this path in front of each path inside the archive
+    #[clap(long = "prefix")]
+    prefix: Option<String>,
+    /// Append this path in front of each path inside the archive
+    #[clap(long = "umask")]
+    umask: Option<String>,
+    /// Name of the output file
+    #[clap(short = 'o', value_hint = ValueHint::FilePath)]
+    name: String,
+}
+
+const DEFAULT_UMASK: u16 = 0o022;
+
+impl Archive {
+    pub fn repository_path(&mut self) -> Option<&Path> {
+        self.base.repo_path()
+    }
+
+    pub async fn run(mut self, config: &pijul_config::Config) -> Result<(), anyhow::Error> {
+        let state: Option<Merkle> = if let Some(ref state) = self.state {
+            Some(state.parse()?)
+        } else {
+            None
+        };
+        let umask = if let Some(ref umask) = self.umask {
+            if umask.len() < 2 {
+                bail!("Invalid umask: {:?}", umask)
+            }
+            let (a, b) = umask.split_at(2);
+            if a != "0o" {
+                bail!("Invalid umask: {:?}", umask)
+            }
+            u16::from_str_radix(b, 8)?
+        } else {
+            DEFAULT_UMASK
+        };
+        let mut extra: Vec<Hash> = Vec::new();
+        for h in self.change.iter() {
+            extra.push(h.parse()?);
+        }
+        if let Some(ref mut p) = self.prefix {
+            if std::path::Path::new(p).is_absolute() {
+                bail!("Prefix path cannot be absolute")
+            }
+            if !p.is_empty() && !p.ends_with("/") {
+                p.push('/');
+            }
+        }
+
+        let mut actual_repo = self.base.repo_path().map(|v| v.to_path_buf());
+
+        if let Some(ref rem) = self.remote {
+            debug!("unknown");
+            let mut remote = pijul_remote::unknown_remote(
+                config,
+                None,
+                None,
+                rem,
+                self.base.channel().unwrap_or(pijul_core::DEFAULT_CHANNEL),
+                self.no_cert_check,
+                true,
+            )
+            .await?;
+            if let pijul_remote::RemoteRepo::LocalChannel(_) = remote {
+                if self.base.repo_path().is_some() {
+                    actual_repo = Some(rem.into());
+                }
+            } else {
+                let mut p = std::path::Path::new(&self.name).to_path_buf();
+                if !self.name.ends_with(".tar.gz") {
+                    p.set_extension("tar.gz");
+                }
+                let f = std::fs::File::create(&p)?;
+                remote
+                    .archive(self.prefix, state.map(|x| (x, &extra[..])), umask, f)
+                    .await?;
+                return Ok(());
+            }
+        }
+        if let Ok(repo) = Repository::find_root(actual_repo.as_deref()) {
+            let mut p = std::path::Path::new(&self.name).to_path_buf();
+            if !self.name.ends_with(".tar.gz") {
+                p.set_extension("tar.gz");
+            }
+            let mut f = std::fs::File::create(&p)?;
+            let mut tarball = pijul_core::output::Tarball::new(&mut f, self.prefix, umask);
+
+            let txn = repo.pristine.arc_txn_begin()?;
+
+            let (channel, _) = load_channel(self.base.channel(), &*txn.read())?;
+
+            let conflicts = if let Some(state) = state {
+                txn.archive_with_state(
+                    &repo.changes,
+                    &channel,
+                    &state,
+                    &extra[..],
+                    &mut tarball,
+                    0,
+                )?
+            } else {
+                txn.archive(&repo.changes, &channel, &mut tarball)?
+            };
+
+            super::print_conflicts(&conflicts)?;
+        }
+        Ok(())
+    }
+}

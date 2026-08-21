@@ -1,0 +1,65 @@
+{
+  "name": "pijul-claude",
+  "displayName": "Pijul + Claude",
+  "description": "Isolated Pijul workspaces for parallel Claude agents, with patch validation (carve) before recording.",
+  "version": "0.0.1",
+  "publisher": "pijul",
+  "license": "GPL-2.0-or-later",
+  "repository": { "type": "pijul", "url": "https://nest.pijul.com/pijul/pijul" },
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["SCM Providers", "Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "pijul.fork", "title": "Pijul: New Agent Workspace (fork)" },
+      { "command": "pijul.carve", "title": "Pijul: Carve — Validate & Record Changes", "icon": "$(git-commit)" },
+      { "command": "pijul.recordHunk", "title": "Pijul: Record Hunk Under Cursor" },
+      { "command": "pijul.carveGroups", "title": "Pijul: Review Claude's Proposed Changes" },
+      { "command": "pijul.land", "title": "Pijul: Land to Main", "icon": "$(cloud-upload)" },
+      { "command": "pijul.integrate", "title": "Pijul: Integrate Agent Workspaces", "icon": "$(git-merge)" },
+      { "command": "pijul.refresh", "title": "Pijul: Refresh Changes", "icon": "$(refresh)" }
+    ],
+    "menus": {
+      "scm/title": [
+        { "command": "pijul.carve", "group": "navigation", "when": "scmProvider == pijul" },
+        { "command": "pijul.land", "group": "navigation", "when": "scmProvider == pijul" },
+        { "command": "pijul.refresh", "group": "navigation", "when": "scmProvider == pijul" },
+        { "command": "pijul.integrate", "group": "1_pijul", "when": "scmProvider == pijul" }
+      ],
+      "editor/context": [
+        { "command": "pijul.recordHunk", "group": "pijul", "when": "editorTextFocus" }
+      ]
+    },
+    "configuration": {
+      "title": "Pijul + Claude",
+      "properties": {
+        "pijul.path": {
+          "type": "string",
+          "default": "pijul",
+          "description": "pijul binary. Must support `record --from-change` (the carve patch)."
+        },
+        "piclaude.path": {
+          "type": "string",
+          "default": "piclaude",
+          "description": "piclaude launcher (fork / land / integrate)."
+        },
+        "pijul.carveProposal": {
+          "type": "string",
+          "default": ".pijul-carve.json",
+          "description": "Repo-relative file where Claude writes a proposed decomposition; watched to trigger the review UI."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  }
+}

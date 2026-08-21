@@ -1,0 +1,24 @@
+[package]
+name = "pijul-config"
+description = "Configuration for the pijul version control system"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+pijul-core.workspace = true
+serde.workspace = true
+blake3.workspace = true
+dialoguer = { workspace = true, features = ["editor"] }
+thiserror.workspace = true
+dirs-next.workspace = true
+figment.workspace = true
+log.workspace = true
+toml.workspace = true
+whoami.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+tempfile.workspace = true

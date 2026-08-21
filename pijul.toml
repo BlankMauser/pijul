@@ -1,0 +1,7 @@
+# Repository-wide configuration shared by every author (tracked, unlike the
+# personal, untracked `.pijul/config.toml`). Since the hooks below are versioned
+# code that runs on `pijul record`, each user approves their current content
+# once with `pijul hooks approve`; any edit to them invalidates that approval.
+
+[hooks]
+record = [ "cargo fmt" ]

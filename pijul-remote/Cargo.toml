@@ -1,0 +1,38 @@
+[package]
+name = "pijul-remote"
+description = "Functionality to communicate with a pijul repository remotely"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[features]
+default = ["openssl"]
+openssl = ["thrussh-keys/openssl", "thrussh/openssl"]
+
+[dependencies]
+pijul-core = { workspace = true, features = [ "tarball" ] }
+pijul-config.workspace = true
+pijul-identity.workspace = true
+pijul-interaction.workspace = true
+pijul-repository.workspace = true
+
+byteorder.workspace = true
+bytes.workspace = true
+data-encoding.workspace = true
+dirs-next.workspace = true
+futures-util.workspace = true
+futures.workspace = true
+log.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+sanakirja.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thrussh-config.workspace = true
+thrussh-keys.workspace = true
+thrussh.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+url.workspace = true

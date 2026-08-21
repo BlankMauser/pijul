@@ -1,0 +1,16 @@
+[package]
+name = "pijul-repository"
+description = "Functionality for interacting with a pijul repository"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+pijul-core.workspace = true
+pijul-config.workspace = true
+
+log.workspace = true
+thiserror.workspace = true
+rlimit.workspace = true

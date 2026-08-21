@@ -1,0 +1,67 @@
+[package]
+name = "pijul"
+description = "A distributed version control system."
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+repository.workspace = true
+license = "GPL-2.0-or-later"
+readme.workspace = true
+
+[features]
+git = ["pijul-core/git2", "git2"]
+default = ["openssl", "git"]
+openssl = ["pijul-identity/openssl", "pijul-remote/openssl"]
+
+[dependencies]
+pijul-core = { workspace = true, features = ["tarball"] }
+pijul-config.workspace = true
+pijul-identity.workspace = true
+pijul-interaction.workspace = true
+pijul-remote.workspace = true
+pijul-repository.workspace = true
+palimpsest.workspace = true
+
+anyhow.workspace = true
+byteorder.workspace = true
+canonical-path.workspace = true
+clap = { workspace = true, features = ["derive", "cargo"] }
+clap_complete.workspace = true
+clap_mangen.workspace = true
+ctrlc.workspace = true
+data-encoding.workspace = true
+edit.workspace = true
+env_logger.workspace = true
+git2 = { workspace = true, optional = true }
+human-panic.workspace = true
+hyper.workspace = true
+bytes.workspace = true
+http-body-util.workspace = true
+hyper-util.workspace = true
+ignore.workspace = true
+jiff.workspace = true
+log.workspace = true
+open.workspace = true
+path-slash.workspace = true
+ptree.workspace = true
+rand.workspace = true
+regex.workspace = true
+sanakirja.workspace = true
+serde_derive.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+tempfile.workspace = true
+termcolor.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml.workspace = true
+url.workspace = true
+validator.workspace = true
+whoami.workspace = true
+rand_distr = "0.6.0"
+
+[target.'cfg(unix)'.dependencies]
+pager.workspace = true
+
+[dev-dependencies]
+expectrl.workspace = true

@@ -1,0 +1,74 @@
+[package]
+name = "pijul-core"
+description = "Core library of Pijul, a distributed version control system based on a sound theory of collaborative work."
+version.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/pijul-core"
+authors.workspace = true
+edition.workspace = true
+license = "GPL-2.0-or-later"
+
+[features]
+ondisk-repos = [
+    "mmap",
+    "zstd",
+    "ignore",
+    "canonical-path",
+    "lru-cache",
+    "tempfile",
+    "path-slash",
+]
+mmap = ["sanakirja/mmap"]
+zstd = ["zstd-seekable"]
+text-changes = []
+default = ["ondisk-repos", "text-changes", "git2"]
+tarball = ["tar", "flate2"]
+
+[dependencies]
+pijul-macros.workspace = true
+
+canonical-path = { workspace = true, optional = true }
+flate2 = { workspace = true, optional = true }
+ignore = { workspace = true, optional = true }
+lru-cache = { workspace = true, optional = true }
+path-slash = { workspace = true, optional = true }
+tar = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
+zstd-seekable = { workspace = true, optional = true }
+
+adler32.workspace = true
+bincode.workspace = true
+bitflags = { workspace = true, features = ["serde"] }
+blake3.workspace = true
+byteorder.workspace = true
+chardetng.workspace = true
+crossbeam-deque.workspace = true
+curve25519-dalek = { workspace = true, features = ["serde"] }
+data-encoding.workspace = true
+diffs.workspace = true
+encoding_rs.workspace = true
+imara-diff.workspace = true
+jiff.workspace = true
+log.workspace = true
+nom.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+regex.workspace = true
+sanakirja.workspace = true
+serde_derive.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+git2 = { workspace = true, optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true, features = ["wasm_js"] }
+
+[dev-dependencies]
+anyhow.workspace = true
+env_logger.workspace = true
+quickcheck.workspace = true
+rand_chacha.workspace = true
+rand.workspace = true
