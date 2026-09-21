@@ -18,4 +18,8 @@ pub enum ConfigError {
     MissingSourceFile,
     #[error("Invalid config argument (expected `key=value`)")]
     InvalidConfigArg,
+    #[error("Malformed pijul.toml: {0}")]
+    MalformedShared(String),
+    #[error("Hook {command:?} exited with {status}")]
+    HookFailed { command: String, status: String },
 }

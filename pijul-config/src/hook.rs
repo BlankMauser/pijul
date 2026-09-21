@@ -99,10 +99,48 @@ impl HookEntry {
             }
         };
         if !proc.status.success() {
+            // Report the failure but *return* it — do not `std::process::exit`.
+            // The `pijul` CLI is a one-shot process and propagates this to its
+            // top-level error handler, but amphion runs hooks inside a
+            // long-running daemon at its land chokepoint and must survive a
+            // failing hook (see amphion `src/pijul/hooks.rs`). An `exit` here
+            // would take the whole server down.
             let mut stderr = std::io::stderr();
             writeln!(stderr, "Hook {:?} exited with code {:?}", s, proc.status)?;
-            std::process::exit(proc.status.code().unwrap_or(1))
+            return Err(ConfigError::HookFailed {
+                command: s,
+                status: format!("{:?}", proc.status),
+            });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A failing hook must *return* `ConfigError::HookFailed`, never
+    /// `std::process::exit`. amphion runs hooks inside a long-running daemon at
+    /// its land chokepoint (see amphion `src/pijul/hooks.rs`); an `exit` here
+    /// would take the whole server down when a formatter fails.
+    #[test]
+    fn failing_hook_returns_error_not_exit() {
+        let hook = HookEntry(toml::Value::String("exit 3".to_string()));
+        let err = hook
+            .run(std::env::temp_dir(), None)
+            .expect_err("a non-zero hook must return an error");
+        assert!(
+            matches!(err, ConfigError::HookFailed { .. }),
+            "expected HookFailed, got {err:?}"
+        );
+    }
+
+    /// A successful hook returns `Ok(())`.
+    #[test]
+    fn succeeding_hook_is_ok() {
+        let hook = HookEntry(toml::Value::String("true".to_string()));
+        hook.run(std::env::temp_dir(), None)
+            .expect("a zero-exit hook must succeed");
     }
 }

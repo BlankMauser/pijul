@@ -6,6 +6,11 @@ authors.workspace = true
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
+include = [
+    "Cargo.toml",
+    "src/error.rs",
+    "src/lib.rs",
+]
 
 [dependencies]
 pijul-core.workspace = true

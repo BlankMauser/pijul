@@ -6,6 +6,14 @@ authors = ["Finchie"]
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
+include = [
+    "Cargo.toml",
+    "src/create.rs",
+    "src/error.rs",
+    "src/lib.rs",
+    "src/load.rs",
+    "src/repair.rs",
+]
 
 [features]
 default = ["openssl"]

@@ -22,6 +22,7 @@ mod record_reads;
 mod replaces;
 mod rm_file;
 mod rollback;
+mod sub_root;
 mod text;
 mod text_changes;
 mod unrecord;
@@ -55,6 +56,27 @@ fn record_all_change<
 where
     R::Error: Send + Sync + 'static,
 {
+    let (hash, change, _) = record_all_change_markers(repo, store, txn, channel, prefix)?;
+    Ok((hash, change))
+}
+
+/// Like [`record_all_change`], but also returns [`Recorded::conflict_marker_files`]
+/// (the files whose content held a conflict marker, which the CLI would refuse to
+/// record without `--accept-conflict-markers`).
+fn record_all_change_markers<
+    T: MutTxnT + Send + Sync + 'static,
+    R: WorkingCopy + Clone + Send + Sync + 'static,
+    P: ChangeStore + Clone + Send + 'static,
+>(
+    repo: &R,
+    store: &P,
+    txn: &ArcTxn<T>,
+    channel: &ChannelRef<T>,
+    prefix: &str,
+) -> Result<(Hash, Change, Vec<String>), anyhow::Error>
+where
+    R::Error: Send + Sync + 'static,
+{
     let mut state = Builder::new();
     state.record(
         txn.clone(),
@@ -69,6 +91,7 @@ where
     )?;
 
     let rec = state.finish();
+    let conflict_marker_files = rec.conflict_marker_files.clone();
     let stat_updates = rec.take_stat_updates();
     let changes = rec
         .actions
@@ -126,7 +149,7 @@ where
     // Persist the per-inode stat cache now that the inodes exist with their
     // final positions (mirrors what the CLI does after applying).
     crate::record::update_stat_cache(&mut *txn.write(), &stat_updates, false)?;
-    Ok((hash, change0))
+    Ok((hash, change0, conflict_marker_files))
 }
 
 fn record_all<T: MutTxnT, R: WorkingCopy, P: ChangeStore>(

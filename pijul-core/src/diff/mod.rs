@@ -13,6 +13,7 @@ mod vertex_buffer;
 pub use algorithm::Algorithm;
 mod delete;
 mod replace;
+pub(crate) use replace::is_conflict_marker_line;
 
 pub static DEFAULT_SEPARATOR: LazyLock<regex::bytes::Regex> =
     LazyLock::new(|| regex::bytes::Regex::new("\n").unwrap());

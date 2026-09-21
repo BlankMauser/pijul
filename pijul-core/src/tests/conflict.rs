@@ -2890,3 +2890,377 @@ fn check_tree_inodes<T: TxnT>(txn: &T, channel: &T::Channel) {
         }
     }
 }
+
+// Recording a file that is still in conflict must treat the conflict markers as
+// *structure*, not as content: a still-conflicted file records nothing, and
+// editing the sides of the conflict (without resolving it) records only those
+// edits — never the marker lines themselves.
+//
+// This is the diff post-processing feature: the recorded change must not
+// contain any conflict-marker string (`>>>>>>>`, `=======`, `<<<<<<<`) as
+// inserted or deleted content. A regression that "just records the conflict
+// markers" as plain text would still round-trip through output (the markers
+// become literal content and reappear), so a round-trip assertion alone does
+// not catch it — we assert on the recorded change itself.
+#[test]
+fn record_conflict_ignores_markers() -> Result<(), anyhow::Error> {
+    env_logger::try_init().unwrap_or(());
+
+    let contents = b"a\nb\nc\n";
+    let alice = b"a\nx\nb\nc\n";
+    let bob = b"a\ny\nb\nc\n";
+
+    let mut repo = working_copy::memory::Memory::new();
+    let changes = changestore::memory::Memory::new();
+    repo.add_file("file", contents.to_vec());
+
+    let env = pristine::sanakirja::Pristine::new_anon()?;
+    let txn = env.arc_txn_begin().unwrap();
+    let channel_alice = txn
+        .write()
+        .open_or_create_channel(&SmallString::from_str("alice"))?;
+    txn.write().add_file("file", 0)?;
+    let init_h = record_all(&mut repo, &changes, &txn, &channel_alice, "")?;
+
+    let channel_bob = txn
+        .write()
+        .open_or_create_channel(&SmallString::from_str("bob"))?;
+    apply::apply_change_arc(&changes, &txn, &channel_bob, &init_h)?;
+    output::output_repository_no_pending(
+        &repo,
+        &changes,
+        &txn,
+        &channel_bob,
+        "",
+        true,
+        None,
+        1,
+        0,
+    )?;
+
+    repo.write_file("file", Inode::ROOT)
+        .unwrap()
+        .write_all(bob)
+        .unwrap();
+    let bob_h = record_all(&repo, &changes, &txn, &channel_bob, "")?;
+
+    repo.write_file("file", Inode::ROOT)
+        .unwrap()
+        .write_all(alice)
+        .unwrap();
+    let _alice_h = record_all(&repo, &changes, &txn, &channel_alice, "")?;
+
+    apply::apply_change_arc(&changes, &txn, &channel_alice, &bob_h)?;
+    output::output_repository_no_pending(
+        &repo,
+        &changes,
+        &txn,
+        &channel_alice,
+        "",
+        true,
+        None,
+        1,
+        0,
+    )?;
+    let mut conflicted = Vec::new();
+    repo.read_file("file", &mut conflicted)?;
+    let conflicted_str = std::str::from_utf8(&conflicted)?.to_string();
+    info!("conflicted:\n{}", conflicted_str);
+    // Sanity: the working copy really is in conflict (has both markers and both
+    // sides), otherwise the rest of the test proves nothing.
+    assert!(
+        conflicted_str.contains(">>>>>>>"),
+        "no start marker: {:?}",
+        conflicted_str
+    );
+    assert!(
+        conflicted_str.contains("======="),
+        "no separator: {:?}",
+        conflicted_str
+    );
+    assert!(
+        conflicted_str.contains("<<<<<<<"),
+        "no end marker: {:?}",
+        conflicted_str
+    );
+    assert!(conflicted_str.contains("\nx\n") && conflicted_str.contains("\ny\n"));
+
+    // 1. Recording the still-conflicted file *unchanged* must be a no-op: the
+    //    conflict parts are ignored, so there is nothing to record.
+    let (_h, noop) = record_all_change(&repo, &changes, &txn, &channel_alice, "")?;
+    assert!(
+        noop.changes.is_empty(),
+        "recording an unchanged conflict produced hunks:\n{}",
+        render_change(&changes, &noop)
+    );
+
+    // 2. Edit both sides of the conflict without resolving it: x -> X, y -> Y,
+    //    leaving every marker line untouched.
+    let edited: String = conflicted_str
+        .lines()
+        .map(|l| match l {
+            "x" => "X".to_string(),
+            "y" => "Y".to_string(),
+            other => other.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    repo.write_file("file", Inode::ROOT)
+        .unwrap()
+        .write_all(edited.as_bytes())
+        .unwrap();
+
+    let (_h, edit, markers) = record_all_change_markers(&repo, &changes, &txn, &channel_alice, "")?;
+    let rendered = render_change(&changes, &edit);
+    info!("recorded edit:\n{}", rendered);
+
+    // The recorded change must contain the side edits …
+    assert!(
+        !edit.changes.is_empty(),
+        "editing the conflict sides recorded nothing"
+    );
+    // … and the file must NOT be flagged as carrying conflict markers: here the
+    // graph *is* in conflict, so the markers are handled as structure and never
+    // reach content — the record proceeds without `--accept-conflict-markers`.
+    assert!(
+        markers.is_empty(),
+        "the nominal edited-sides case must not be flagged, got {:?}",
+        markers
+    );
+    // … but MUST NOT record any conflict-marker line as content. This is the
+    // assertion that a marker-dumping regression fails.
+    for line in rendered.lines() {
+        let content = line.strip_prefix("+ ").or_else(|| line.strip_prefix("- "));
+        if let Some(content) = content {
+            for marker in [">>>>>>>", "=======", "<<<<<<<"] {
+                assert!(
+                    !content.contains(marker),
+                    "recorded a conflict marker as content ({:?}):\n{}",
+                    marker,
+                    rendered
+                );
+            }
+        }
+    }
+
+    // The edit really did register: X and Y are recorded as content.
+    assert!(
+        rendered.contains("+ X"),
+        "the 'x -> X' edit was not recorded:\n{}",
+        rendered
+    );
+    assert!(
+        rendered.contains("+ Y"),
+        "the 'y -> Y' edit was not recorded:\n{}",
+        rendered
+    );
+
+    // Round-trip: outputting again reproduces the same still-conflicted file
+    // with the edited sides (modulo the bracketed marker ids). The two sides are
+    // now authored by the same change, so their relative order is a tie-break and
+    // not guaranteed — compare the lines as a multiset rather than in order.
+    output::output_repository_no_pending(
+        &repo,
+        &changes,
+        &txn,
+        &channel_alice,
+        "",
+        true,
+        None,
+        1,
+        0,
+    )?;
+    let mut reout = Vec::new();
+    repo.read_file("file", &mut reout)?;
+    let re = regex::bytes::Regex::new(r#"\[[^\]]*\]"#).unwrap();
+    let a = re.replace_all(edited.as_bytes(), &[][..]);
+    let b = re.replace_all(&reout, &[][..]);
+    let mut a: Vec<_> = std::str::from_utf8(&a)?.lines().collect();
+    let mut b: Vec<_> = std::str::from_utf8(&b)?.lines().collect();
+    a.sort_unstable();
+    b.sort_unstable();
+    assert_eq!(a, b, "round-trip changed the conflicted file's content");
+    Ok(())
+}
+
+fn render_change<C: changestore::ChangeStore>(
+    changes: &C,
+    change: &crate::change::Change,
+) -> String {
+    let mut out = Vec::new();
+    change.write(changes, None, true, &mut out).unwrap();
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+// Reproduction: one side of a conflict is a *pending* patch (an ephemeral
+// change recorded to represent the working copy's unrecorded edits, as `pijul
+// pull`/push do). That patch is later unrecorded and its change file dropped
+// from the changestore — "déjà disparu du repo" — while the working copy keeps
+// the conflict markers that reference it.
+//
+// A live conflict is re-emitted by the graph and the diff aligns those markers
+// as structure, so they never reach recorded content. Once the pending side is
+// unrecorded the graph is no longer in conflict, so recording the working copy
+// would bake the marker lines (and the vanished side) in as literal content.
+// Pijul does not heuristically guess-and-drop; it records faithfully but flags
+// the file in `Recorded::conflict_marker_files` (via `is_conflict_marker_line`),
+// which the CLI turns into a refusal unless `--accept-conflict-markers`.
+#[test]
+fn record_conflict_pending_side_gone() -> Result<(), anyhow::Error> {
+    env_logger::try_init().unwrap_or(());
+
+    let contents = b"a\nb\nc\n";
+    let local = b"a\nx\nb\nc\n"; // the working copy's unrecorded (pending) edit
+    let incoming = b"a\ny\nb\nc\n"; // the change pulled in, conflicting with it
+
+    let mut repo = working_copy::memory::Memory::new();
+    let changes = changestore::memory::Memory::new();
+    repo.add_file("file", contents.to_vec());
+
+    let env = pristine::sanakirja::Pristine::new_anon()?;
+    let txn = env.arc_txn_begin().unwrap();
+    let channel = txn
+        .write()
+        .open_or_create_channel(&SmallString::from_str("main"))?;
+    txn.write().add_file("file", 0)?;
+    let init_h = record_all(&mut repo, &changes, &txn, &channel, "")?;
+
+    // The "incoming" change is authored on a separate channel and pulled in.
+    let channel_other = txn
+        .write()
+        .open_or_create_channel(&SmallString::from_str("other"))?;
+    apply::apply_change_arc(&changes, &txn, &channel_other, &init_h)?;
+    output::output_repository_no_pending(
+        &repo,
+        &changes,
+        &txn,
+        &channel_other,
+        "",
+        true,
+        None,
+        1,
+        0,
+    )?;
+    repo.write_file("file", Inode::ROOT)
+        .unwrap()
+        .write_all(incoming)
+        .unwrap();
+    let incoming_h = record_all(&repo, &changes, &txn, &channel_other, "")?;
+
+    // Back on `main`: the working copy has an unrecorded edit. Record it as an
+    // ephemeral *pending* patch (mirrors `pijul_remote::pending`) and apply it.
+    repo.write_file("file", Inode::ROOT)
+        .unwrap()
+        .write_all(local)
+        .unwrap();
+    let pending_h = record_all(&repo, &changes, &txn, &channel, "")?;
+
+    // Pull the incoming change on top → conflict between the pending patch and
+    // the incoming change; output the merged (conflicted) working copy.
+    apply::apply_change_arc(&changes, &txn, &channel, &incoming_h)?;
+    output::output_repository_no_pending(&repo, &changes, &txn, &channel, "", true, None, 1, 0)?;
+    let mut conflicted = Vec::new();
+    repo.read_file("file", &mut conflicted)?;
+    let conflicted_str = std::str::from_utf8(&conflicted)?.to_string();
+    info!("conflicted working copy:\n{}", conflicted_str);
+    assert!(
+        conflicted_str.contains(">>>>>>>"),
+        "expected a conflict: {:?}",
+        conflicted_str
+    );
+
+    // Restore the pending patch to unrecorded state: unrecord it AND drop its
+    // change file — exactly what `Local::upload_changes` / `pijul pull` do. Now
+    // one side of the conflict markers still sitting in the working copy points
+    // at a change that no longer exists anywhere.
+    use crate::changestore::ChangeStore;
+    crate::unrecord::unrecord(
+        &mut *txn.write(),
+        &channel,
+        &changes,
+        &pending_h,
+        0,
+        &mut Default::default(),
+    )?;
+    changes.del_change(&pending_h)?;
+
+    // Record the still-marked working copy. Pijul does not guess that these are
+    // conflict markers and silently drop them; instead it records them faithfully
+    // as content but *flags the file* in `conflict_marker_files`, which is what
+    // the CLI turns into a refusal ("resolve the conflict, or re-run with
+    // --accept-conflict-markers"). This models the `--accept-conflict-markers`
+    // path (the marker text is committed verbatim) plus the signal used to refuse.
+    let (_h, change, markers) = record_all_change_markers(&repo, &changes, &txn, &channel, "")?;
+    let rendered = render_change(&changes, &change);
+    info!("recorded:\n{}", rendered);
+    assert_eq!(
+        markers,
+        vec!["file".to_string()],
+        "the orphaned conflict markers should flag the file for the record refusal"
+    );
+    // The markers really are what got recorded as content (the accepted path).
+    assert!(
+        rendered.lines().any(|l| l
+            .strip_prefix("+ ")
+            .is_some_and(|c| c.starts_with(">>>>>>>"))),
+        "expected the marker line to be recorded verbatim:\n{}",
+        rendered
+    );
+
+    // A clean file (no markers) is never flagged: resolving the conflict lets the
+    // record go through untouched.
+    repo.write_file("file", Inode::ROOT)
+        .unwrap()
+        .write_all(b"a\nx\nb\nc\n")
+        .unwrap();
+    let (_h, _change, markers) = record_all_change_markers(&repo, &changes, &txn, &channel, "")?;
+    assert!(
+        markers.is_empty(),
+        "a resolved file must not be flagged, got {:?}",
+        markers
+    );
+    Ok(())
+}
+
+// A brand-new file bypasses the diff (its content is inserted wholesale), so the
+// conflict-marker guard also lives on the add path. A freshly added file whose
+// content contains markers is flagged just like a tracked one.
+#[test]
+fn record_new_file_conflict_markers() -> Result<(), anyhow::Error> {
+    env_logger::try_init().unwrap_or(());
+
+    let marked = b"a\n>>>>>>> 1 [ABCD1234 msg]\nx\n======= 1 [EFGH5678 msg]\ny\n<<<<<<< 1\nb\n";
+    let repo = working_copy::memory::Memory::new();
+    let changes = changestore::memory::Memory::new();
+    repo.add_file("file", marked.to_vec());
+
+    let env = pristine::sanakirja::Pristine::new_anon()?;
+    let txn = env.arc_txn_begin().unwrap();
+    let channel = txn
+        .write()
+        .open_or_create_channel(&SmallString::from_str("main"))?;
+    txn.write().add_file("file", 0)?;
+    let (_h, _change, markers) = record_all_change_markers(&repo, &changes, &txn, &channel, "")?;
+    assert_eq!(
+        markers,
+        vec!["file".to_string()],
+        "a new file containing conflict markers must be flagged for the record refusal"
+    );
+
+    // A clean new file is not flagged.
+    let repo2 = working_copy::memory::Memory::new();
+    let changes2 = changestore::memory::Memory::new();
+    repo2.add_file("clean", b"a\nb\nc\n".to_vec());
+    let channel2 = txn
+        .write()
+        .open_or_create_channel(&SmallString::from_str("two"))?;
+    txn.write().add_file("clean", 0)?;
+    let (_h, _change, markers) = record_all_change_markers(&repo2, &changes2, &txn, &channel2, "")?;
+    assert!(
+        markers.is_empty(),
+        "a clean new file must not be flagged, got {:?}",
+        markers
+    );
+    Ok(())
+}

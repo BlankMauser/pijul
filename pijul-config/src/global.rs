@@ -17,6 +17,12 @@ pub struct Global {
     pub author: Author,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub ignore_kinds: HashMap<String, Vec<String>>,
+    /// How many recent patch titles to keep on screen during push/pull. When a
+    /// batch is no larger than this, every title stays visible; beyond it, the
+    /// most recent `progress_window` scroll past above a summary bar. Defaults to
+    /// 10 when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_window: Option<usize>,
 
     #[serde(flatten)]
     pub shared_config: Shared,

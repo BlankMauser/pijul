@@ -417,6 +417,20 @@ impl thrussh::client::Handler for SshClient {
         trace!("data {:?} {:?}", channel, data.len());
         let data = data.to_vec();
         Box::pin(async move {
+            {
+                let st = self.state.lock().await;
+                let tag = match &*st {
+                    State::None => "None",
+                    State::State { .. } => "State",
+                    State::Id { .. } => "Id",
+                    State::Changes { .. } => "Changes",
+                    State::Changelist { .. } => "Changelist",
+                    State::Archive { .. } => "Archive",
+                    State::Prove { .. } => "Prove",
+                    State::Identities { .. } => "Identities",
+                };
+                debug!("DBG client recv {} bytes in state {}", data.len(), tag);
+            }
             match *self.state.lock().await {
                 State::State { ref mut sender } => {
                     debug!("state: State");
@@ -555,7 +569,17 @@ impl thrussh::client::Handler for SshClient {
                             } else {
                                 &data[p..p + i]
                             };
-                            let l = std::str::from_utf8(line)?;
+                            let l = match std::str::from_utf8(line) {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    error!(
+                                        "DBG Changelist got non-utf8 while push idle ({} bytes): {:?} — this kills the event loop",
+                                        line.len(),
+                                        e
+                                    );
+                                    return Err(e.into());
+                                }
+                            };
                             if !l.is_empty() {
                                 debug!("line = {:?}", l);
                                 sender.send(parse_line(l).ok()).await.unwrap_or(())
@@ -768,7 +792,9 @@ impl Ssh {
     ) -> Result<(), RemoteError> {
         self.run_protocol().await?;
         let sig_b64 = data_encoding::BASE64_NOPAD.encode(sig);
-        self.c
+        debug!("DBG sending pushsig {} {}", channel, hash.to_base32());
+        if let Err(e) = self
+            .c
             .data(
                 format!(
                     "pushsig {} {} {} {} {}\n",
@@ -780,7 +806,12 @@ impl Ssh {
                 )
                 .as_bytes(),
             )
-            .await?;
+            .await
+        {
+            error!("DBG pushsig send failed: {:?}", e);
+            return Err(e.into());
+        }
+        debug!("DBG pushsig sent for {}", hash.to_base32());
         Ok(())
     }
 
@@ -931,13 +962,29 @@ impl Ssh {
                     let mut change = thrussh::CryptoVec::new_zeroed(change_len as usize);
                     use std::io::Read;
                     change_file.read_exact(&mut change[..])?;
-                    self.c
+                    debug!(
+                        "DBG sending apply {} {} len={}",
+                        to_channel,
+                        c.to_base32(),
+                        change_len
+                    );
+                    if let Err(e) = self
+                        .c
                         .data(
                             format!("apply {} {} {}\n", to_channel, c.to_base32(), change_len)
                                 .as_bytes(),
                         )
-                        .await?;
-                    self.c.data(&change[..]).await?;
+                        .await
+                    {
+                        error!("DBG apply-cmd send failed: {:?}", e);
+                        return Err(e.into());
+                    }
+                    debug!("DBG apply cmd sent, sending change body len={}", change_len);
+                    if let Err(e) = self.c.data(&change[..]).await {
+                        error!("DBG change-body send failed: {:?}", e);
+                        return Err(e.into());
+                    }
+                    debug!("DBG change body sent for {}", c.to_base32());
                     pijul_core::changestore::filesystem::pop_filename(&mut local);
                 }
                 CS::State(_) => unimplemented!(),

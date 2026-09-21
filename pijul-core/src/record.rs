@@ -83,6 +83,12 @@ pub struct Builder {
     /// Instant the walk started; a file whose mtime is `>=` this is considered
     /// "ambiguous" (it may have changed while we were looking) and is not cached.
     walk_start: std::time::SystemTime,
+    /// Declared monorepo boundaries (from the tracked `pijul.toml`, via
+    /// [`Config::boundaries`]). Plain data — no config dependency in core. When
+    /// non-empty, a `FileMove` whose two endpoints resolve to different
+    /// boundaries is collected into [`Recorded::boundary_crossings`] so the CLI
+    /// can refuse it unless `--force`.
+    boundaries: Arc<Vec<String>>,
 }
 
 type NewRoot = (Position<Option<ChangeId>>, u64);
@@ -122,6 +128,18 @@ pub struct Recorded {
     stat_updates: Arc<Mutex<Vec<(Inode, u64, u64, bool)>>>,
     /// See [`Builder::walk_start`].
     walk_start: std::time::SystemTime,
+    /// See [`Builder::boundaries`].
+    boundaries: Arc<Vec<String>>,
+    /// `(old_path, new_path)` of every recorded `FileMove` that crosses a
+    /// declared boundary (empty when no boundaries are configured). The CLI
+    /// refuses the record unless `--force`.
+    pub boundary_crossings: Vec<(String, String)>,
+    /// Paths whose recorded content includes a Pijul conflict marker line
+    /// (`>>>>>>> N` / `======= N` / `<<<<<<< N`). This only happens when a file
+    /// carries orphaned markers the graph no longer backs — a live conflict is
+    /// re-emitted by the graph and handled as structure, so its markers never
+    /// reach content. The CLI refuses the record unless `--accept-conflict-markers`.
+    pub conflict_marker_files: Vec<String>,
 }
 
 impl Recorded {
@@ -169,6 +187,7 @@ impl Default for Builder {
             new_root: Arc::new(Mutex::new(None)),
             stat_updates: Arc::new(Mutex::new(Vec::new())),
             walk_start: std::time::SystemTime::UNIX_EPOCH,
+            boundaries: Arc::new(Vec::new()),
         }
     }
 }
@@ -177,6 +196,12 @@ impl Builder {
     /// Initialise a `Builder`.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Declare the monorepo boundaries to check moves against (see
+    /// [`Builder::boundaries`]). Call before recording; empty = no check.
+    pub fn set_boundaries(&mut self, boundaries: Vec<String>) {
+        self.boundaries = Arc::new(boundaries);
     }
 
     pub fn recorded(&mut self) -> Arc<Mutex<Recorded>> {
@@ -200,6 +225,9 @@ impl Builder {
             new_root: self.new_root.clone(),
             stat_updates: self.stat_updates.clone(),
             walk_start: self.walk_start,
+            boundaries: self.boundaries.clone(),
+            boundary_crossings: Vec::new(),
+            conflict_marker_files: Vec::new(),
         }
     }
 
@@ -233,7 +261,11 @@ impl Builder {
             {
                 result.oldest_change = rec.oldest_change
             }
-            result.redundant.extend(rec.redundant)
+            result.redundant.extend(rec.redundant);
+            result.boundary_crossings.extend(rec.boundary_crossings);
+            result
+                .conflict_marker_files
+                .extend(rec.conflict_marker_files);
         }
         debug!(
             "result = {:?}, updatables = {:?}",
@@ -246,7 +278,7 @@ impl Builder {
 /// An account of the files that have been added, moved or deleted, as
 /// returned by record, and used by apply (when applying a change
 /// created locally) to update the trees and inodes databases.
-#[derive(Debug, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum InodeUpdate {
     Add {
         /// Inode vertex in the graph.
@@ -258,6 +290,15 @@ pub enum InodeUpdate {
         /// `Inode` of the deleted file.
         inode: Inode,
     },
+}
+
+impl InodeUpdate {
+    /// The inode this update touches.
+    pub fn inode(&self) -> Inode {
+        match *self {
+            InodeUpdate::Add { inode, .. } | InodeUpdate::Deleted { inode } => inode,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1005,6 +1046,27 @@ impl Builder {
         <W as crate::working_copy::WorkingCopyRead>::Error: 'static,
     {
         debug!("push_children, vertex = {:?}, item = {:?}", vertex, item);
+        // If `item`'s directory is the mount point of a relocated sub-root
+        // (`clone --into`), its working-copy children live, in the graph, under
+        // the mounted SUBROOT-INODE — reached through an empty, working-copy-less
+        // sub-root NAME. Parent them there so they are not recorded as spurious
+        // moves out of the sub-root. See `resolve_sub_root_mount`.
+        let vertex = if let Some(change) = vertex.change {
+            let resolved = resolve_sub_root_mount(
+                txn,
+                txn.graph(channel),
+                Position {
+                    change,
+                    pos: vertex.pos,
+                },
+            )?;
+            Position {
+                change: Some(resolved.change),
+                pos: resolved.pos,
+            }
+        } else {
+            vertex
+        };
         let comp = components.next();
         let full_path = item.full_path.clone();
         let fileid = OwnedPathId {
@@ -1162,6 +1224,17 @@ impl Recorded {
             self.has_binary_files |= encoding.is_none();
             let end = ChangePosition(contents.len().into());
             self.largest_file = self.largest_file.max(end.0.as_u64() - start.0.as_u64());
+            // A newly added file bypasses the diff, so check its content for
+            // conflict markers here (the bytes were just decoded, no extra pass
+            // over the working copy). Same guard as the diff path: flag the file
+            // so the CLI refuses it unless `--accept-conflict-markers`.
+            if encoding.is_some()
+                && contents[start.0.as_u64() as usize..end.0.as_u64() as usize]
+                    .split(|&c| c == b'\n')
+                    .any(crate::diff::is_conflict_marker_line)
+            {
+                self.conflict_marker_files.push(item.full_path.clone());
+            }
             contents.push(0);
             if end > start {
                 (
@@ -1257,14 +1330,21 @@ impl Recorded {
                 pos: inode_pos,
             },
         );
-        if meta.is_dir() {
-            Ok(Some(Position {
-                change: None,
-                pos: inode_pos,
-            }))
-        } else {
-            Ok(None)
-        }
+        // Return the freshly-created inode vertex for *both* files and
+        // directories. The caller records it in `recorded_inodes` so a second
+        // visit of the same inode is deduplicated: when ROOT has more than one
+        // alive root vertex (e.g. two independent repositories merged into one
+        // channel), the traversal calls `push_children` once per root and thus
+        // re-walks the shared working-copy tree under `Inode::ROOT` once per
+        // root. Previously files returned `None`, so their inode was never
+        // marked recorded and every extra walk emitted another `FileAdd` for
+        // the same path — a duplicate that then conflicts on its name.
+        // `push_children` on a file inode is a no-op (a file has no tree
+        // children), exactly as it already is for existing files.
+        Ok(Some(Position {
+            change: None,
+            pos: inode_pos,
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1612,16 +1692,30 @@ impl Recorded {
                         inode: item_v_papa,
                     })
                 };
+                // `find_path` is evaluated against the *current* (pre-apply)
+                // graph, where `vertex` still sits at its old location: this is
+                // the OLD full path. `item.full_path` is the working-copy path,
+                // i.e. the NEW one. If the two resolve to different declared
+                // boundaries, the move crosses one — collect it for the CLI's
+                // `--force` gate (both endpoints are only available here).
+                let old_path = crate::fs::find_path(changes, txn, channel, true, vertex)?
+                    .unwrap()
+                    .path
+                    .join("/");
+                if !self.boundaries.is_empty()
+                    && boundary_of(&old_path, &self.boundaries)
+                        != boundary_of(&item.full_path, &self.boundaries)
+                {
+                    self.boundary_crossings
+                        .push((old_path.clone(), item.full_path.clone()));
+                }
                 self.actions.push(Hunk::FileMove {
                     del: Atom::EdgeMap(EdgeMap {
                         edges: moved.edges,
                         inode: item.v_papa,
                     }),
                     add,
-                    path: crate::fs::find_path(changes, txn, channel, true, vertex)?
-                        .unwrap()
-                        .path
-                        .join("/"),
+                    path: old_path,
                 });
             } else {
                 self.actions.push(Hunk::SolveNameConflict {
@@ -1676,7 +1770,14 @@ where
     let mut former_parents = Vec::new();
     let f0 = EdgeFlags::FOLDER | EdgeFlags::PARENT;
     let f1 = EdgeFlags::all();
-    let mut is_deleted = true;
+    // True iff the file's NAME edge is itself DELETED (a zombie/deleted entry);
+    // set below when such an edge is seen. It must start `false`: an alive file
+    // whose name/parent/metadata are unchanged is *not* moved. (Initialising it
+    // to `true` forced `move_needed` for every existing file — harmless when
+    // `record_moved_file` is idempotent, but for a relocated sub-root file it
+    // re-links across the working-copy-less passthrough and records a spurious
+    // move, flattening the sub-root.)
+    let mut is_deleted = false;
     let mut encoding_ = None;
     for name_ in iter_adjacent(txn, txn.graph(channel), vertex.inode_vertex(), f0, f1)? {
         debug!("name_ = {:?}", name_);
@@ -2243,4 +2344,351 @@ impl Recorded {
         }
         Ok(())
     }
+}
+
+/// The declared boundary that owns `path`: the longest entry of `boundaries`
+/// that is a path-**component** prefix of `path` (or equal to it). Returns
+/// `None` when `path` lies in no declared boundary — the residual/unowned
+/// "root" zone, which counts as a distinct zone for crossing purposes (so
+/// moving a file out of a boundary into unowned territory crosses too).
+///
+/// Component-aware: `libs/foo` owns `libs/foo` and `libs/foo/x`, but **not**
+/// `libs/foobar`. Longest-match makes nesting work: with `[libs, libs/foo]`,
+/// `libs/foo/x` resolves to `libs/foo`, not `libs`.
+///
+/// A move crosses iff `boundary_of(old) != boundary_of(new)` — symmetric by
+/// construction, so both directions (child→ancestor and ancestor→child) are
+/// caught. Never implement this as an asymmetric containment test.
+pub fn boundary_of<'a>(path: &str, boundaries: &'a [String]) -> Option<&'a str> {
+    let mut best: Option<&'a str> = None;
+    for b in boundaries {
+        let prefix = b.trim_matches('/');
+        if prefix.is_empty() {
+            continue;
+        }
+        let matches = path == prefix
+            || (path.len() > prefix.len()
+                && path.starts_with(prefix)
+                && path.as_bytes()[prefix.len()] == b'/');
+        if matches && best.map_or(true, |cur| prefix.len() > cur.len()) {
+            best = Some(prefix);
+        }
+    }
+    best
+}
+
+/// Which sub-root a recorded hunk belongs to (see
+/// [`crate::pristine::owning_sub_root`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SubRoot {
+    /// An existing sub-root, identified by its INODE vertex.
+    Existing(Position<ChangeId>),
+    /// The single brand-new sub-root created by this very change (an `AddRoot`
+    /// hunk, or a new root-level entry in a repo that has no sub-root yet — the
+    /// legacy zero-root layout). A working-copy record creates at most one new
+    /// sub-root (`add_root_if_needed` memoises it), so all new-sub-root hunks
+    /// collapse into this one group — otherwise a first record of a fresh
+    /// project, whose `AddRoot` and new files each yield a distinct new inode,
+    /// would be misreported as touching several sub-roots. Note that once a
+    /// sub-root exists, a *new top-level file* resolves to that existing
+    /// sub-root (see [`inode_sub_root`]), not to this variant.
+    New,
+}
+
+/// The sub-root a single (globalized) hunk touches.
+fn hunk_sub_root<T, L>(
+    txn: &T,
+    channel: &T::Channel,
+    idx: usize,
+    hunk: &Hunk<Option<Hash>, L>,
+    updatables: &HashMap<usize, InodeUpdate>,
+) -> Result<SubRoot, TxnErr<T::GraphError>>
+where
+    T: ChannelTxnT + TreeTxnT<TreeError = <T as GraphTxnT>::GraphError>,
+{
+    // All atoms of a hunk share one inode; the first is representative.
+    if let Some(inode_pos) = hunk.iter().next().map(|a| a.inode()) {
+        if let Some(h) = inode_pos.change {
+            if let Some(cid) = txn.get_internal(&h.into())? {
+                let gpos = Position {
+                    change: *cid,
+                    pos: inode_pos.pos,
+                };
+                if let Some(inode) = txn.get_revinodes(&gpos, None).map_err(|e| TxnErr(e.0))? {
+                    let inode = *inode;
+                    if let Some(sr) = owning_sub_root(txn, txn.graph(channel), inode)? {
+                        return Ok(SubRoot::Existing(sr));
+                    }
+                }
+            }
+        }
+    }
+    // Newly-added inode: climb the tree until we hit one already in the graph,
+    // and use its sub-root. If we reach the root, it's a brand-new sub-root.
+    //
+    // The `InodeUpdate` describing hunk `idx` is keyed on `idx + 1`, not `idx`:
+    // both `Recorded::add_file` and `record_deleted_file` insert it as
+    // `actions.len()` / `actions.len() + 1` immediately around pushing their
+    // hunk, so `key == hunk_index + 1` (see the same invariant used by the
+    // `--split-per-root` update partition). Reading `&idx` fetched the previous
+    // hunk's update, misclassifying every added file by its neighbour.
+    if let Some(InodeUpdate::Add { inode, .. }) = updatables.get(&(idx + 1)) {
+        return inode_sub_root(txn, channel, *inode);
+    }
+    Ok(SubRoot::New)
+}
+
+/// The sub-root an inode belongs to, resolving both existing inodes (via the
+/// graph) and freshly-added ones (by climbing the `tree` table to the nearest
+/// ancestor already in the graph). When the climb reaches [`Inode::ROOT`], the
+/// inode is a new top-level entry: in the multi-root layout it belongs to the
+/// existing root sub-root (via [`crate::pristine::owning_sub_root`], which maps
+/// `Inode::ROOT` to its passthrough INODE), and only in the legacy zero-root
+/// layout — where root has no owning sub-root — is it a brand-new sub-root.
+pub fn inode_sub_root<T>(
+    txn: &T,
+    channel: &T::Channel,
+    inode: Inode,
+) -> Result<SubRoot, TxnErr<T::GraphError>>
+where
+    T: ChannelTxnT + TreeTxnT<TreeError = <T as GraphTxnT>::GraphError>,
+{
+    let mut cur = inode;
+    let mut seen = HashSet::default();
+    loop {
+        if !seen.insert(cur) {
+            return Ok(SubRoot::New);
+        }
+        if txn
+            .get_inodes(&cur, None)
+            .map_err(|e| TxnErr(e.0))?
+            .is_some()
+        {
+            if let Some(sr) = owning_sub_root(txn, txn.graph(channel), cur)? {
+                return Ok(SubRoot::Existing(sr));
+            }
+            return Ok(SubRoot::New);
+        }
+        match txn.get_revtree(&cur, None).map_err(|e| TxnErr(e.0))? {
+            Some(pathid) if !pathid.parent_inode.is_root() => cur = pathid.parent_inode,
+            // The tree parent is the repo root: climb to `Inode::ROOT` and let
+            // the next iteration resolve it. In the multi-root layout
+            // `get_inodes(Inode::ROOT)` is the top sub-root's INODE, so a new
+            // top-level entry is attributed to that existing project; in the
+            // legacy zero-root layout root owns no sub-root and it stays `New`.
+            Some(_) => cur = Inode::ROOT,
+            None => return Ok(SubRoot::New),
+        }
+    }
+}
+
+/// Group hunk indices by the sub-root each touches, preserving first-seen
+/// order. `hunks.len()` distinct sub-roots means the record spans that many
+/// independent projects; the returned groups partition the hunk indices so a
+/// caller can emit one commuting change per sub-root.
+pub fn group_by_sub_root<T, L>(
+    txn: &T,
+    channel: &T::Channel,
+    hunks: &[Hunk<Option<Hash>, L>],
+    updatables: &HashMap<usize, InodeUpdate>,
+) -> Result<Vec<(SubRoot, Vec<usize>)>, TxnErr<T::GraphError>>
+where
+    T: ChannelTxnT + TreeTxnT<TreeError = <T as GraphTxnT>::GraphError>,
+{
+    let mut order: Vec<SubRoot> = Vec::new();
+    let mut groups: HashMap<SubRoot, Vec<usize>> = HashMap::default();
+    for (idx, hunk) in hunks.iter().enumerate() {
+        let sr = hunk_sub_root(txn, channel, idx, hunk, updatables)?;
+        groups
+            .entry(sr)
+            .or_insert_with(|| {
+                order.push(sr);
+                Vec::new()
+            })
+            .push(idx);
+    }
+    Ok(order
+        .into_iter()
+        .map(|s| {
+            let v = groups.remove(&s).unwrap();
+            (s, v)
+        })
+        .collect())
+}
+
+/// Error type for [`relocate_sub_root`].
+#[derive(Error)]
+pub enum RelocateError<T: GraphTxnT> {
+    #[error(transparent)]
+    Txn(#[from] TxnErr<T::GraphError>),
+    #[error("Not a live sub-root name vertex (no alive FOLDER edge to ROOT)")]
+    NotASubRoot,
+    #[error("Building relocation change: {0}")]
+    MakeChange(#[from] crate::change::MakeChangeError<T>),
+}
+
+impl<T: GraphTxnT> std::fmt::Debug for RelocateError<T> {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            RelocateError::Txn(e) => std::fmt::Debug::fmt(e, fmt),
+            RelocateError::NotASubRoot => write!(fmt, "NotASubRoot"),
+            RelocateError::MakeChange(e) => std::fmt::Debug::fmt(e, fmt),
+        }
+    }
+}
+
+/// Build a change that relocates the sub-root whose (empty) NAME vertex is
+/// `name_vertex` into a freshly-created directory `dir_name`, itself a new
+/// child of the inode vertex `dest_parent` (typically the current channel's
+/// own sub-root INODE, so the relocated project ends up under `dir_name/`).
+///
+/// The relocation is a [`Hunk::FileMove`] that deletes the alive `ROOT → NAME`
+/// folder edge and re-introduces the *same* NAME vertex under the new
+/// directory's inode. Keeping the same NAME vertex (rather than minting a fresh
+/// one) is what preserves the sub-root signature: after the move the NAME
+/// retains a `DELETED | FOLDER | PARENT` edge to ROOT, so
+/// `is_sub_root_name(.., require_relocated = true)` and `owning_sub_root` keep
+/// recognising it. See the `monorepo-sub-roots` campaign node.
+///
+/// `dest_parent` must be an inode vertex whose own NAME is *not* a direct child
+/// of ROOT (i.e. it must itself live under some sub-root), otherwise `dir_name`
+/// would spuriously satisfy `is_sub_root_name`. Callers pass the current
+/// channel's sub-root INODE for this.
+pub fn relocate_sub_root<T>(
+    txn: &T,
+    channel: &ChannelRef<T>,
+    dest_parent: Position<ChangeId>,
+    name_vertex: Vertex<ChangeId>,
+    dir_name: &str,
+    header: ChangeHeader,
+) -> Result<Change, RelocateError<T>>
+where
+    T: ChannelTxnT + DepsTxnT<DepsError = <T as GraphTxnT>::GraphError>,
+{
+    // Locate the alive `ROOT → NAME` folder edge we are about to delete. It is
+    // stored on `name_vertex` as a `FOLDER | PARENT` edge whose `dest()` is the
+    // ROOT position.
+    // (flag, introduced_by) of the alive `ROOT → NAME` edge.
+    let (root_edge_flag, root_edge_intro) = {
+        let ch = channel.read();
+        let graph = txn.graph(&*ch);
+        let mut found = None;
+        for e in iter_adjacent(
+            txn,
+            graph,
+            name_vertex,
+            EdgeFlags::FOLDER | EdgeFlags::PARENT,
+            EdgeFlags::all(),
+        )? {
+            let e = e?;
+            if !e.flag().is_parent() || !e.flag().is_folder() || e.flag().is_deleted() {
+                continue;
+            }
+            if e.dest() == Position::ROOT {
+                found = Some((e.flag(), e.introduced_by()));
+                break;
+            }
+        }
+        found.ok_or(RelocateError::NotASubRoot)?
+    };
+
+    // Contents buffer: the new directory's inode marker byte, then its
+    // `FileMetadata` (name + dir metadata), mirroring `Recorded::add_file`.
+    let mut contents = Vec::new();
+    contents.push(0);
+    let dir_inode_pos = ChangePosition(contents.len().into());
+    contents.push(0);
+    let name_start = ChangePosition(contents.len().into());
+    FileMetadata {
+        // Must match what the working copy reports for a directory:
+        // `file_metadata` normalises dir permissions to `perm & 0o100`, so a
+        // freshly output directory always reads back as `new(0o100, true)`.
+        // Using `0o755` here made the mount directory's recorded metadata differ
+        // from the working copy, so the next record saw a spurious dir move.
+        metadata: InodeMetadata::new(0o100, true),
+        basename: dir_name,
+        encoding: None,
+    }
+    .write(&mut contents);
+    let name_end = ChangePosition(contents.len().into());
+    contents.push(0);
+
+    let dir_inode_local = Position {
+        change: None,
+        pos: dir_inode_pos,
+    };
+
+    // Hunk 1: create the directory `dir_name` as a child of `dest_parent`.
+    let add_dir: Hunk<Option<ChangeId>, LocalByte> = Hunk::FileAdd {
+        add_name: Atom::NewVertex(NewVertex {
+            up_context: vec![dest_parent.to_option()],
+            down_context: vec![],
+            start: name_start,
+            end: name_end,
+            flag: EdgeFlags::FOLDER | EdgeFlags::BLOCK,
+            inode: dest_parent.to_option(),
+        }),
+        add_inode: Atom::NewVertex(NewVertex {
+            up_context: vec![Position {
+                change: None,
+                pos: name_end,
+            }],
+            down_context: vec![],
+            start: dir_inode_pos,
+            end: dir_inode_pos,
+            flag: EdgeFlags::FOLDER | EdgeFlags::BLOCK,
+            inode: dest_parent.to_option(),
+        }),
+        contents: None,
+        path: dir_name.to_string(),
+        encoding: None,
+    };
+
+    // Hunk 2: reparent the sub-root NAME vertex under the new directory.
+    //
+    // `del` deletes the alive `ROOT → NAME` edge (turning it into a
+    // `DELETED | FOLDER | PARENT` edge, the relocation signature). `add`
+    // re-introduces the same NAME vertex as a child of `dir_inode`. Since no
+    // `dir_inode → NAME` edge existed before, we model the introduction as a
+    // resurrection (`previous = DELETED`): apply's `del_graph_with_rev` is then
+    // a no-op and `put_graph_with_rev` adds the alive edge, while the reverse
+    // (unrecord) correctly deletes it again.
+    let del_flag = root_edge_flag - EdgeFlags::PARENT - EdgeFlags::PSEUDO;
+    let move_hunk: Hunk<Option<ChangeId>, LocalByte> = Hunk::FileMove {
+        del: Atom::EdgeMap(EdgeMap {
+            edges: vec![NewEdge {
+                previous: del_flag,
+                flag: EdgeFlags::FOLDER | EdgeFlags::BLOCK | EdgeFlags::DELETED,
+                from: Position::ROOT.to_option(),
+                to: name_vertex.to_option(),
+                introduced_by: Some(root_edge_intro),
+            }],
+            inode: dir_inode_local,
+        }),
+        add: Atom::EdgeMap(EdgeMap {
+            edges: vec![NewEdge {
+                previous: EdgeFlags::FOLDER | EdgeFlags::BLOCK | EdgeFlags::DELETED,
+                flag: EdgeFlags::FOLDER | EdgeFlags::BLOCK,
+                from: dir_inode_local,
+                to: name_vertex.to_option(),
+                introduced_by: None,
+            }],
+            inode: dir_inode_local,
+        }),
+        path: dir_name.to_string(),
+    };
+
+    let hunks = vec![
+        add_dir.globalize(txn).map_err(|e| TxnErr(e))?,
+        move_hunk.globalize(txn).map_err(|e| TxnErr(e))?,
+    ];
+
+    Ok(Change::make_change(
+        txn,
+        channel,
+        hunks,
+        contents,
+        header,
+        Vec::new(),
+    )?)
 }

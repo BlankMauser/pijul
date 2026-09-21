@@ -25,6 +25,20 @@ pub struct Record {
     /// Record all paths that have changed
     #[clap(short = 'a', long = "all")]
     pub all: bool,
+    /// When the change touches more than one sub-root (imported project),
+    /// split it into one commuting change per sub-root instead of erroring.
+    #[clap(long = "split-per-root", conflicts_with_all = ["amend", "force"])]
+    pub split_per_root: bool,
+    /// Allow a single change to span more than one sub-root (imported project)
+    /// instead of erroring. The change will not commute across projects.
+    #[clap(long = "force")]
+    pub force: bool,
+    /// Record files that still contain conflict markers (`>>>>>>>` / `=======` /
+    /// `<<<<<<<`) as literal content. By default such a record is refused, since
+    /// the markers are almost always an unresolved conflict rather than intended
+    /// text.
+    #[clap(long = "accept-conflict-markers")]
+    pub accept_conflict_markers: bool,
     /// Set the change message
     #[clap(short = 'm', long = "message")]
     pub message: Option<String>,
@@ -173,17 +187,20 @@ impl Record {
 
             let salt = self.timestamp.map(Timestamp::as_second).unwrap_or(0) as u64;
             let mut txn = txn.write();
-            // Superseding unrecord: drop the amended predecessor WITHOUT clearing
-            // obsolescence markers (a plain unrecord would resurrect the whole
-            // amend chain). The marker for this amend is written below, once the
-            // new change exists, via `unrecord_superseded`.
-            txn.unrecord_superseding(&repo.changes, &mut channel, &h, salt, &mut touched_inodes)?;
+            // Drop the amended predecessor from the channel. This also drops the
+            // markers it owned, but that is harmless: the new amend, recorded
+            // below, carries the predecessor's whole chain plus the predecessor
+            // itself, and its `unrecord_superseded` re-marks all of them — so the
+            // lineage stays filtered without any special "superseding" unrecord.
+            txn.unrecord(&repo.changes, &mut channel, &h, salt, &mut touched_inodes)?;
             txn.touch_inodes(&mut repo.working_copy, &mut touched_inodes)?;
             header
         } else {
             self.header(config).await?
         };
         let no_prefixes = self.prefixes.is_empty();
+        let split_per_root = self.split_per_root;
+        let force = self.force;
         let repo_path = CanonicalPathBuf::canonicalize(&repo.path)?;
 
         let complete =
@@ -202,24 +219,201 @@ impl Record {
             repo_path,
             header,
             &extra,
+            config.boundaries(),
         )?;
         match result {
             Some((mut change, updates, oldest, actions_before_edit)) => {
-                // Stamp lineage before hashing: `replaces` = the amended change,
-                // `root` = its group id (its own root, or itself if it was an
-                // original). Precomputing the root here — where the full local
-                // chain is visible — lets the Nest group revisions even when it
-                // never received the intermediate iterations.
+                // How many distinct sub-roots (imported projects) does this
+                // change touch? Recording several at once produces a change
+                // that cannot commute across projects, so it is gated behind
+                // an explicit choice (see below).
+                let groups = {
+                    let txn_ = txn.read();
+                    pijul_core::record::group_by_sub_root(
+                        &*txn_,
+                        &*channel.read(),
+                        &change.hashed.changes,
+                        &updates,
+                    )?
+                };
+                if groups.len() > 1 && !split_per_root && !force {
+                    let mut names = String::new();
+                    {
+                        let txn_ = txn.read();
+                        let channel_ = channel.read();
+                        for (sr, _) in groups.iter() {
+                            match sr {
+                                pijul_core::record::SubRoot::Existing(pos) => {
+                                    let relocated = pijul_core::pristine::is_relocated_sub_root(
+                                        &*txn_,
+                                        txn_.graph(&*channel_),
+                                        *pos,
+                                    )
+                                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                                    let path = pijul_core::pristine::path_of_sub_root(&*txn_, *pos)
+                                        .map_err(|e| anyhow::anyhow!("{}", e))?
+                                        .filter(|p| !p.is_empty());
+                                    match (relocated, path) {
+                                        (true, Some(p)) => names
+                                            .push_str(&format!("\n  - {} (imported project)", p)),
+                                        (true, None) => names.push_str("\n  - (imported project)"),
+                                        (false, Some(p)) => names.push_str(&format!("\n  - {}", p)),
+                                        (false, None) => names.push_str("\n  - . (main project)"),
+                                    }
+                                }
+                                pijul_core::record::SubRoot::New => {
+                                    names.push_str("\n  - (new project)")
+                                }
+                            }
+                        }
+                    }
+                    bail!(
+                        "This record touches {} independent roots:{}\n\
+                         A single change may not commute across projects.\n\
+                         Re-run with --split-per-root to record one commuting change per root,\n\
+                         or --force to record them together as a single (non-commuting) change.",
+                        groups.len(),
+                        names,
+                    );
+                }
+                if groups.len() > 1 && split_per_root {
+                    // One commuting change per sub-root. `apply_local_change`
+                    // only reads the *values* of the inode-update map (never
+                    // the keys), and those reference positions in the shared
+                    // `contents` buffer, so each sub-change keeps the full
+                    // buffer and receives only the updates for its own hunks.
+                    //
+                    // Partition the inode-updates by *hunk index*, reusing the
+                    // grouping `group_by_sub_root` already computed. An
+                    // `InodeUpdate` with key `K` always describes the hunk at
+                    // index `K - 1`: both insertion sites key it on
+                    // `actions.len()` (`Add`, just after its hunk is pushed) or
+                    // `actions.len() + 1` (`Deleted`, just before the deletion
+                    // hunk is pushed), so `key == hunk_index + 1` in either
+                    // case. Re-deriving the sub-root from the inode (via
+                    // `inode_sub_root`) instead can disagree with the hunk
+                    // grouping for nested/relocated sub-roots and route both
+                    // updates into one group's change — leaving the other
+                    // file's inode unmapped, so the next record reintroduces it
+                    // (a spurious duplicate that then conflicts on its name).
+                    let mut split_changes = Vec::new();
+                    {
+                        let txn_ = txn.read();
+                        for (_sr, indices) in groups.iter() {
+                            let index_set: std::collections::HashSet<usize> =
+                                indices.iter().copied().collect();
+                            let hunks: Vec<_> = indices
+                                .iter()
+                                .map(|&i| change.hashed.changes[i].clone())
+                                .collect();
+                            let c = pijul_core::change::LocalChange::make_change(
+                                &*txn_,
+                                &channel,
+                                hunks,
+                                change.contents.clone(),
+                                change.hashed.header.clone(),
+                                Vec::new(),
+                            )?;
+                            let ups: HashMap<usize, pijul_core::InodeUpdate> = updates
+                                .iter()
+                                .filter(|(k, _)| {
+                                    k.checked_sub(1).map_or(false, |h| index_set.contains(&h))
+                                })
+                                .map(|(k, u)| (*k, u.clone()))
+                                .collect();
+                            split_changes.push((c, ups));
+                        }
+                    }
+
+                    let mut txn_ = txn.write();
+                    for (mut c, ups) in split_changes {
+                        if c.hashed.header.message.is_empty() {
+                            continue;
+                        }
+                        let hash_for_sig = c.hash()?;
+                        let sig_pem =
+                            pijul_identity::sign_pem(&secret, &hash_for_sig.to_bytes()).await?;
+                        c.unhashed = Some(serde_json::json!({ "signature": sig_pem }));
+                        let hash = repo
+                            .changes
+                            .save_change(&mut c, |_, _| Ok::<_, anyhow::Error>(()))?;
+                        txn_.apply_local_change(&mut channel, &c, &hash, &ups)?;
+                        writeln!(stdout, "Hash: {}", hash.to_base32())?;
+                    }
+                    pijul_core::record::update_stat_cache(&mut *txn_, &stat_updates, false)
+                        .map_err(|e| anyhow::anyhow!("stat cache: {:?}", e))?;
+
+                    let mut path = repo.path.join(pijul_core::DOT_DIR);
+                    path.push("identities");
+                    std::fs::create_dir_all(&path)?;
+
+                    if no_prefixes {
+                        let mut oldest = oldest
+                            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as u64;
+                        if oldest == 0 {
+                            oldest = std::time::SystemTime::now()
+                                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as u64;
+                        }
+                        txn_.touch_channel(&mut *channel.write(), Some(oldest + 1));
+                        // The set of touched inodes is the same as the
+                        // un-split change; use its atoms to decide which
+                        // working-copy files to refresh.
+                        let mut actions_after_edit = HashMap::new();
+                        for i in change.hashed.changes.iter() {
+                            for i in i.iter() {
+                                match i {
+                                    Atom::NewVertex(n) => {
+                                        actions_after_edit
+                                            .entry(n.inode)
+                                            .or_insert(HashSet::new())
+                                            .insert(Atom::NewVertex(n.clone()));
+                                    }
+                                    Atom::EdgeMap(e) => {
+                                        actions_after_edit
+                                            .entry(e.inode)
+                                            .or_insert(HashSet::new())
+                                            .insert(Atom::EdgeMap(e.clone()));
+                                    }
+                                }
+                            }
+                        }
+                        let mut touched = pijul_core::unrecord::TouchedInodes::new();
+                        for (i, x) in actions_before_edit.iter() {
+                            if let Some(y) = actions_after_edit.get(i) {
+                                if x != y {
+                                    touched.insert((ChangeId::ROOT, *i));
+                                }
+                            } else {
+                                touched.insert((ChangeId::ROOT, *i));
+                            }
+                        }
+                        txn_.touch_inodes(&mut repo.working_copy, &touched)?;
+                    }
+                    std::mem::drop(txn_);
+                    txn.commit()?;
+                    return Ok(());
+                }
+
+                // Stamp lineage before hashing: the amend chain is the amended
+                // change's own chain, extended with the amended change itself
+                // (now superseded too). `root` is derived as the chain's first
+                // element. Carrying the *whole* chain — computed here, where the
+                // full local lineage is visible — lets any peer supersede every
+                // iteration and group revisions even when it never received the
+                // intermediate ones.
                 if let Some(replaced) = amend_of {
-                    let root = repo
+                    let mut chain = repo
                         .changes
                         .get_change(&replaced)
                         .ok()
-                        .and_then(|c| c.root())
-                        .unwrap_or(replaced);
-                    change
-                        .hashed
-                        .set_change_metadata(Some(replaced), Some(root));
+                        .map(|c| c.replaces_chain())
+                        .unwrap_or_default();
+                    chain.push(replaced);
+                    change.hashed.set_change_metadata(&chain);
                 }
                 let hash_for_sig = change.hash()?;
                 let sig_pem = pijul_identity::sign_pem(&secret, &hash_for_sig.to_bytes()).await?;
@@ -503,6 +697,7 @@ impl Record {
         repo_path: CanonicalPathBuf,
         header: ChangeHeader,
         extra_deps: &[pijul_core::Hash],
+        boundaries: &[String],
     ) -> Result<
         (
             // Per-inode (mtime, size, clean) observed during the walk. Always
@@ -522,6 +717,10 @@ impl Record {
         anyhow::Error,
     > {
         let mut state = pijul_core::RecordBuilder::new();
+        // Monorepo boundaries (from the tracked `pijul.toml`): a `FileMove`
+        // crossing one is collected during the walk and refused below unless
+        // `--force`.
+        state.set_boundaries(boundaries.to_vec());
         let algorithm = match self.algorithm {
             Some(DiffAlgorithm::Patience) => pijul_core::Algorithm::Patience,
             Some(DiffAlgorithm::Histogram) => pijul_core::Algorithm::ImaraHistogram,
@@ -561,6 +760,46 @@ impl Record {
         let stat_updates = rec.take_stat_updates();
         if rec.actions.is_empty() {
             return Ok((stat_updates, None));
+        }
+
+        // Monorepo boundary guard: a boundary-crossing move is the one
+        // non-splittable operation that couples two projects (it reparents a
+        // NAME vertex across the boundary), so refuse it unless `--force`. A
+        // multi-boundary record WITHOUT such a move stays splittable and is not
+        // blocked here (see `--split-per-root`).
+        if !self.force && !rec.boundary_crossings.is_empty() {
+            let mut list = String::new();
+            for (old, new) in &rec.boundary_crossings {
+                list.push_str(&format!("\n  - {} -> {}", old, new));
+            }
+            bail!(
+                "This record moves {} file(s) across a monorepo boundary:{}\n\
+                 A boundary-crossing move couples two projects and breaks their separability.\n\
+                 Re-run with --force to record it anyway (and update `boundaries` in \
+                 pijul.toml if a boundary root itself moved).",
+                rec.boundary_crossings.len(),
+                list,
+            );
+        }
+
+        // Conflict-marker guard: recording a file whose content still holds
+        // `>>>>>>>` / `=======` / `<<<<<<<` markers is almost always a conflict
+        // left unresolved (a live conflict is handled as structure and never
+        // reaches content; markers reach content only once orphaned). Refuse it
+        // unless the user explicitly opts in.
+        if !self.accept_conflict_markers && !rec.conflict_marker_files.is_empty() {
+            let mut list = String::new();
+            for path in &rec.conflict_marker_files {
+                list.push_str(&format!("\n  - {}", path));
+            }
+            bail!(
+                "This record would commit conflict markers as content in {} file(s):{}\n\
+                 These files still contain `>>>>>>>` / `=======` / `<<<<<<<` markers.\n\
+                 Resolve the conflict (edit the file and remove the markers), or re-run \
+                 with --accept-conflict-markers to record them verbatim.",
+                rec.conflict_marker_files.len(),
+                list,
+            );
         }
 
         if rec.has_binary_files && !self.all {

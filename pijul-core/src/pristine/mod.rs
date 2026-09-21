@@ -838,6 +838,15 @@ pub(crate) fn tree_path<T: TreeTxnT>(
     Ok(None)
 }
 
+/// The working-copy path of a sub-root's INODE vertex (its current placement in
+/// the `tree` tables), for display. `None` if not tracked.
+pub fn path_of_sub_root<T: TreeTxnT>(
+    txn: &T,
+    pos: Position<ChangeId>,
+) -> Result<Option<String>, TreeErr<T::TreeError>> {
+    tree_path(txn, &pos)
+}
+
 pub(crate) fn internal<T: GraphTxnT>(
     txn: &T,
     h: &Option<Hash>,
@@ -1026,6 +1035,239 @@ pub(crate) fn is_alive<T: GraphTxnT>(
         }
     }
     Ok(false)
+}
+
+/// True iff `name_vertex` — the empty "NAME" vertex of a sub-root (the
+/// first, empty `FOLDER|BLOCK` vertex introduced under [`Vertex::ROOT`]
+/// by an `AddRoot` hunk) — has a `FOLDER|PARENT` edge whose source is
+/// [`Vertex::ROOT`]. When `require_relocated` is true, only a `DELETED`
+/// such edge counts, i.e. the sub-root has been *moved out* of ROOT (a
+/// move deletes the old parent edge and adds a new one, so a relocated
+/// sub-root retains a `DELETED|FOLDER|PARENT` edge back to ROOT).
+pub fn is_sub_root_name<T: GraphTxnT>(
+    txn: &T,
+    graph: &T::Graph,
+    name_vertex: &Vertex<ChangeId>,
+    require_relocated: bool,
+) -> Result<bool, TxnErr<T::GraphError>> {
+    // A genuine sub-root NAME vertex is the *empty* vertex minted by `AddRoot`
+    // (`start == end`). A non-empty NAME vertex directly under ROOT is just a
+    // top-level file or directory of a "zero-root" repository (the pre-multi-root
+    // format, where entries hang straight off ROOT). Without this guard every
+    // such top-level entry is reported as its own sub-root, so any record
+    // touching two of them is falsely flagged as a cross-root record.
+    if !name_vertex.is_empty() {
+        return Ok(false);
+    }
+    for e in iter_adjacent(
+        txn,
+        graph,
+        *name_vertex,
+        EdgeFlags::FOLDER | EdgeFlags::PARENT,
+        EdgeFlags::all(),
+    )? {
+        let e = e?;
+        if !e.flag().is_parent() || !e.flag().is_folder() {
+            continue;
+        }
+        if require_relocated && !e.flag().is_deleted() {
+            continue;
+        }
+        // The `dest` of a PARENT edge is its source vertex.
+        if e.dest() == Position::ROOT {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The first alive (non-deleted) `FOLDER|PARENT` parent vertex of `v`, if
+/// any. Returns [`Vertex::ROOT`] directly when the parent is ROOT.
+fn alive_folder_parent<T: GraphTxnT>(
+    txn: &T,
+    graph: &T::Graph,
+    v: &Vertex<ChangeId>,
+) -> Result<Option<Vertex<ChangeId>>, TxnErr<T::GraphError>> {
+    for e in iter_adjacent(
+        txn,
+        graph,
+        *v,
+        EdgeFlags::FOLDER | EdgeFlags::PARENT,
+        EdgeFlags::all(),
+    )? {
+        let e = e?;
+        if !e.flag().is_parent() || !e.flag().is_folder() || e.flag().is_deleted() {
+            continue;
+        }
+        let dest = e.dest();
+        if dest == Position::ROOT {
+            return Ok(Some(Vertex::ROOT));
+        }
+        // A PARENT edge points to the *end* position of its source vertex.
+        return Ok(Some(*txn.find_block_end(graph, dest).unwrap()));
+    }
+    Ok(None)
+}
+
+/// Walk up the `FOLDER` hierarchy from `inode` until reaching the sub-root
+/// it belongs to, and return that sub-root's INODE vertex (the grandchild
+/// of ROOT). Returns `None` for a detached inode or if the walk cannot
+/// reach a sub-root (e.g. broken hierarchy, or the legacy "zero-root"
+/// layout where entries hang straight off ROOT).
+///
+/// [`Inode::ROOT`] is resolved through `get_inodes`: in the multi-root
+/// layout it maps to the top-level sub-root's INODE passthrough (grandchild
+/// of ROOT), so this returns that sub-root — this is what lets a *new*
+/// top-level file (whose only ancestor in the tree is `Inode::ROOT`) be
+/// attributed to the existing root project rather than a spurious new one.
+/// In the legacy zero-root layout `Inode::ROOT` owns no sub-root and this
+/// returns `None`.
+///
+/// Only a *relocated* root counts as a sub-root here: the walk matches via
+/// `is_sub_root_name(.., require_relocated = true)`, so the empty NAME vertex
+/// must retain a `DELETED | FOLDER | PARENT` edge to ROOT (i.e. it was moved
+/// out of ROOT into a subdirectory, as `clone --into` does). A plain,
+/// non-relocated root sitting directly under ROOT — the *main* project, or a
+/// bare `AddRoot` such as the one `apply_root_change` mints — is **not** a
+/// sub-root: its content resolves to `None` and, in [`crate::record`], folds
+/// into the single "main project" group rather than a spurious extra root.
+/// This is what stops a record touching such a repo from being falsely
+/// reported as crossing several independent roots.
+///
+/// Uses the *graph* (not the `tree`/`revtree` tables), so it keeps
+/// returning the imported project's own sub-root even after the sub-root
+/// has been relocated under a subdirectory.
+pub fn owning_sub_root<T: GraphTxnT + TreeTxnT<TreeError = <T as GraphTxnT>::GraphError>>(
+    txn: &T,
+    graph: &T::Graph,
+    inode: Inode,
+) -> Result<Option<Position<ChangeId>>, TxnErr<T::GraphError>> {
+    let pos = match txn.get_inodes(&inode, None).map_err(|e| TxnErr(e.0))? {
+        Some(p) => *p,
+        None => return Ok(None),
+    };
+    let mut cur = pos.inode_vertex();
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        if !seen.insert(cur) {
+            // Cycle (possible through pseudo-edges): give up.
+            return Ok(None);
+        }
+        let name = match alive_folder_parent(txn, graph, &cur)? {
+            Some(n) => n,
+            None => return Ok(None),
+        };
+        if name == Vertex::ROOT {
+            // `cur` was a NAME vertex directly under ROOT; the sub-root
+            // INODE is one level below, which we've already passed.
+            return Ok(None);
+        }
+        if is_sub_root_name(txn, graph, &name, true)? {
+            // `cur` is the sub-root INODE vertex.
+            return Ok(Some(Position {
+                change: cur.change,
+                pos: cur.start,
+            }));
+        }
+        // Otherwise `name`'s FOLDER parent is the enclosing directory's
+        // INODE vertex; keep climbing.
+        cur = match alive_folder_parent(txn, graph, &name)? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+    }
+}
+
+/// True iff the sub-root whose INODE vertex is at `pos` (as returned by
+/// [`owning_sub_root`]) has been *relocated* out of [`Vertex::ROOT`] — i.e. it
+/// is an imported sub-module (`clone --into <dir>`), whose NAME vertex retains
+/// a `DELETED|FOLDER|PARENT` edge back to ROOT. The repository's main root,
+/// which was never moved, keeps an *alive* such edge and so returns `false`.
+pub fn is_relocated_sub_root<T: GraphTxnT>(
+    txn: &T,
+    graph: &T::Graph,
+    pos: Position<ChangeId>,
+) -> Result<bool, TxnErr<T::GraphError>> {
+    let inode_vertex = match txn.find_block(graph, pos) {
+        Ok(v) => *v,
+        Err(_) => return Ok(false),
+    };
+    match alive_folder_parent(txn, graph, &inode_vertex)? {
+        Some(name) if name != Vertex::ROOT => is_sub_root_name(txn, graph, &name, true),
+        _ => Ok(false),
+    }
+}
+
+/// Resolve a directory INODE vertex through any relocated sub-root **mount**
+/// hanging directly off it, returning the deepest mounted sub-root INODE (or
+/// `dir_inode` itself if it is not a mount point).
+///
+/// `clone --into <dir>` relocates an imported project by re-parenting its empty
+/// sub-root NAME vertex under `<dir>`'s INODE (see [`crate::record::relocate_sub_root`]).
+/// The resulting graph has an extra, working-copy-less level:
+///
+/// ```text
+///   <dir>-INODE ──folder──▶ SUBROOT-NAME(empty, DELETED edge to ROOT) ──▶ SUBROOT-INODE ──▶ files…
+/// ```
+///
+/// On disk the imported files live *directly* under `<dir>/`, so the record
+/// traversal reaches them with `<dir>`'s inode as their working-copy parent. To
+/// avoid recording every one of them as a spurious move (their real graph parent
+/// is `SUBROOT-INODE`, not `<dir>-INODE`), the traversal parents `<dir>`'s
+/// working-copy children on the resolved `SUBROOT-INODE`. The descent repeats so
+/// nested `clone --into` mounts resolve to the innermost sub-root.
+pub fn resolve_sub_root_mount<T: GraphTxnT>(
+    txn: &T,
+    graph: &T::Graph,
+    dir_inode: Position<ChangeId>,
+) -> Result<Position<ChangeId>, TxnErr<T::GraphError>> {
+    let f0 = EdgeFlags::FOLDER | EdgeFlags::BLOCK;
+    let f1 = f0 | EdgeFlags::PSEUDO;
+    let mut cur = dir_inode;
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        if !seen.insert(cur) {
+            // Defensive: a cycle through pseudo-edges — stop descending.
+            return Ok(cur);
+        }
+        let cur_vertex = match txn.find_block(graph, cur) {
+            Ok(v) => *v,
+            Err(_) => return Ok(cur),
+        };
+        // Look for an alive FOLDER|BLOCK child of `cur` that is an *empty*,
+        // *relocated* sub-root NAME (i.e. a mount hanging off this directory).
+        let mut mounted = None;
+        for e in iter_adjacent(txn, graph, cur_vertex, f0, f1)? {
+            let e = e?;
+            if e.flag().is_parent() {
+                continue;
+            }
+            let name = *txn.find_block(graph, e.dest()).unwrap();
+            if name.start != name.end {
+                continue; // non-empty name: a regular file/dir, not a sub-root mount
+            }
+            if !is_sub_root_name(txn, graph, &name, true)? {
+                continue; // not a relocated sub-root (no DELETED edge back to ROOT)
+            }
+            // The sub-root INODE is the NAME's alive FOLDER child.
+            if let Some(e2) = iter_adjacent(txn, graph, name, f0, f1)?.next() {
+                let e2 = e2?;
+                if e2.flag().is_parent() {
+                    continue;
+                }
+                let inode = *txn.find_block(graph, e2.dest()).unwrap();
+                mounted = Some(Position {
+                    change: inode.change,
+                    pos: inode.start,
+                });
+                break;
+            }
+        }
+        match mounted {
+            Some(next) => cur = next,
+            None => return Ok(cur),
+        }
+    }
 }
 
 pub fn make_changeid<T: GraphTxnT>(txn: &T, h: &Hash) -> Result<ChangeId, TxnErr<T::GraphError>> {
@@ -1873,14 +2115,22 @@ pub trait MutTxnT:
     + TreeMutTxnT<TreeError = <Self as GraphTxnT>::GraphError>
     + TxnT
 {
-    /// Record that `pred` is superseded by `succ` (an amend). Written when an
-    /// amend is applied, via [`MutTxnTExt::unrecord_superseded`].
+    /// Record that `pred` is superseded by `succ` (an amend). Written for every
+    /// element of an applied change's amend chain, via
+    /// [`MutTxnTExt::unrecord_superseded`]. The table is multi-valued: `pred`
+    /// may be superseded by several concurrent successors at once.
     fn mark_superseded(&mut self, pred: &Hash, succ: &Hash)
     -> Result<(), TxnErr<Self::GraphError>>;
 
-    /// Drop the obsolescence marker keyed by `h`, if present (no-op otherwise).
-    /// Used on a non-superseding unrecord to resurrect a predecessor.
-    fn unmark_superseded(&mut self, h: &Hash) -> Result<(), TxnErr<Self::GraphError>>;
+    /// Drop the single obsolescence marker `pred -> succ` (no-op if absent),
+    /// leaving any other successor of `pred` in place. Called for every element
+    /// of a change's amend chain when that change (`succ`) leaves every channel,
+    /// so a marker lives exactly as long as its superseding change is applied.
+    fn unmark_superseded(
+        &mut self,
+        pred: &Hash,
+        succ: &Hash,
+    ) -> Result<(), TxnErr<Self::GraphError>>;
 
     /// Open a channel, creating it if it is missing. The return type
     /// is a `Rc<RefCell<…>>` in order to avoid:

@@ -77,28 +77,27 @@
           features = [ "git" ];
         };
 
-        # VSCode + Claude setup. Reuses the patched `pijul` built above, so
-        # piclaude and the extension get `record --from-change` natively.
-        # Needs allowUnfree (bundles vscode + the Claude Code extension).
+        # VSCode + Claude setup. Reuses the patched `pijul` built
+        # above, so the extension get `record --from-change` natively.
+        # Needs allowUnfree (bundles vscode + the Claude Code
+        # extension).
         vscodeSetup = import ./editors/vscode/pijul-code.nix {
           pkgs = import nixpkgs { inherit system; config.allowUnfree = true; };
           inherit pijul;
         };
 
         # Emacs with the Pijul modes, binary paths baked in (fixes GUI-Emacs
-        # PATH issues). Reuses the patched pijul + the piclaude package above.
+        # PATH issues). Reuses the patched pijul.
         emacsSetup = import ./editors/emacs/pijul-emacs.nix {
           inherit pkgs;
           inherit pijul;
-          inherit (vscodeSetup) piclaude;
         };
       in
       {
         packages = {
           default = pijul;
           inherit pijul pijul-git;
-          # `nix run .#code`  /  `nix shell .#piclaude`
-          inherit (vscodeSetup) code piclaude;
+          inherit (vscodeSetup) code;
           # `nix run .#emacs` — Emacs with the Pijul modes + baked binaries.
           # `pijul-emacs` is the bare elisp package to add to your own
           # emacsWithPackages list (see editors/emacs/pijul-emacs.nix).
@@ -114,21 +113,20 @@
           ];
         };
         # `nix develop .#vscode --command code` — VSCode with rust-analyzer,
-        # our pijul-claude extension, Claude Code, and the patched pijul + piclaude.
+        # our pijul-claude extension, Claude Code, and the patched pijul.
         devShells.vscode = vscodeSetup.shell;
       }
     )) // {
-      # Nixpkgs overlay: adds `pkgs.pijul-emacs` (the elisp package, built
-      # against the consuming pkgs' Emacs, with the flake's patched pijul +
-      # piclaude baked in). In your configuration.nix:
-      #   nixpkgs.overlays = [ inputs.pijul.overlays.default ];
-      #   # then, in your emacsWithPackages list:  pkgs.pijul-emacs
+      # Nixpkgs overlay: adds `pkgs.pijul-emacs` (the elisp package,
+      # built against the consuming pkgs' Emacs, with the flake's
+      # patched pijul baked in). In your configuration.nix:
+      # nixpkgs.overlays = [ inputs.pijul.overlays.default ]; # then,
+      # in your emacsWithPackages list: pkgs.pijul-emacs
       overlays.default = final: _prev:
         let
           es = import ./editors/emacs/pijul-emacs.nix {
             pkgs = final;
             pijul = self.packages.${final.stdenv.hostPlatform.system}.pijul;
-            piclaude = self.packages.${final.stdenv.hostPlatform.system}.piclaude;
           };
         in
         { inherit (es) pijul-emacs; };

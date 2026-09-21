@@ -36,6 +36,26 @@ use pijul_interaction::{
 
 pub const PROTOCOL_VERSION: usize = 3;
 
+/// Build display titles for `changes`, in order, for the titled progress bar.
+/// A change's title is its header message; a tag has none, so it gets a short
+/// label. A missing/unreadable header degrades to the hash so the list stays
+/// aligned one-to-one with the count.
+fn change_titles<S: pijul_core::changestore::ChangeStore>(
+    store: &S,
+    changes: &[CS],
+) -> Vec<String> {
+    changes
+        .iter()
+        .map(|c| match c {
+            CS::Change(h) => store
+                .get_header(h)
+                .map(|hdr| hdr.message)
+                .unwrap_or_else(|_| h.to_base32()),
+            CS::State(h) => format!("Tag {}", h.to_base32()),
+        })
+        .collect()
+}
+
 /// Record the working copy's pending (unrecorded) changes as an ephemeral patch
 /// on `channel`, returning its hash — or `None` if the working copy is clean.
 ///
@@ -1316,7 +1336,14 @@ impl RemoteRepo {
         to_channel: Option<&str>,
         changes: &[CS],
     ) -> Result<(), error::Error<T>> {
-        let upload_bar = ProgressBar::new(changes.len() as u64, UPLOAD_MESSAGE)?;
+        // Titles come from the local change files (they exist — we're the sender),
+        // so the bar can list each patch as it uploads.
+        let title_store = pijul_core::changestore::filesystem::FileSystem::from_changes(
+            local.clone(),
+            pijul_repository::max_files(),
+        );
+        let upload_bar =
+            ProgressBar::with_titles(change_titles(&title_store, changes), UPLOAD_MESSAGE)?;
 
         match self {
             RemoteRepo::Local(l) => l.upload_changes(upload_bar, local, to_channel, changes)?,

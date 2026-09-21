@@ -147,12 +147,12 @@ impl Unrecord {
         if let Some(h) = pending_hash {
             let mut txn = txn.write();
             txn.unrecord(&repo.changes, &channel, &h, 0, &mut touched)?;
-            txn.touch_inodes(&mut repo.working_copy, &touched)?;
             // The pending patch is ephemeral (regenerated on demand): drop its
             // change file now that it has been unrecorded.
             repo.changes.del_change(&h)?;
         }
 
+        txn.write().touch_inodes(&mut repo.working_copy, &touched)?;
         txn.commit()?;
 
         Ok(())

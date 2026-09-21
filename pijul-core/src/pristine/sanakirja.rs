@@ -597,32 +597,24 @@ impl std::convert::From<BlockError<::sanakirja::Error>> for BlockError<Sanakirja
 }
 
 #[doc(hidden)]
-pub fn next_adj<'a, T: ::sanakirja::LoadPage>(
-    txn: &'a T,
-    a: &mut Adj,
-) -> Option<Result<&'a SerializedEdge, T::Error>>
+pub fn next_adj<'a, T>(txn: &'a T, a: &mut Adj) -> Option<Result<&'a SerializedEdge, T::Error>>
 where
+    T: sanakirja::LoadPage,
     T::Error: std::error::Error,
 {
     loop {
-        let x: Result<Option<(&Vertex<ChangeId>, &SerializedEdge)>, _> = a.cursor.next(txn);
-        match x {
-            Ok(Some((v, e))) => {
-                if *v == a.key {
-                    if e.flag() >= a.min_flag {
-                        if e.flag() <= a.max_flag {
-                            return Some(Ok(e));
-                        } else {
-                            return None;
-                        }
-                    }
-                } else if *v > a.key {
+        match a.cursor.next(txn).transpose()? {
+            Err(error) => return Some(Err(error)),
+            Ok((vertex, edge)) => {
+                if *vertex == a.key && edge.flag() >= a.min_flag && edge.flag() <= a.max_flag {
+                    return Some(Ok(edge));
+                }
+                if *vertex == a.key && edge.flag() >= a.min_flag && edge.flag() > a.max_flag {
                     return None;
                 }
-            }
-            Err(e) => return Some(Err(e)),
-            Ok(None) => {
-                return None;
+                if *vertex > a.key {
+                    return None;
+                }
             }
         }
     }
@@ -2221,13 +2213,20 @@ impl<T: RawMutTxnT> MutTxnT for MutTxn<T> {
         Ok(())
     }
 
-    fn unmark_superseded(&mut self, h: &Hash) -> Result<(), TxnErr<Self::GraphError>> {
+    fn unmark_superseded(
+        &mut self,
+        pred: &Hash,
+        succ: &Hash,
+    ) -> Result<(), TxnErr<Self::GraphError>> {
         let mut db = match self.superseded.take() {
             Some(db) => db,
             None => return Ok(()),
         };
-        let k: SerializedHash = h.into();
-        btree::del(&mut self.txn, &mut db, &k, None)?;
+        // Delete only the exact `pred -> succ` pair; the table is multi-valued
+        // (concurrent amends can supersede the same `pred`), so a keyed-only
+        // delete would wrongly drop siblings.
+        let (pk, sk): (SerializedHash, SerializedHash) = (pred.into(), succ.into());
+        btree::del(&mut self.txn, &mut db, &pk, Some(&sk))?;
         self.txn.set_root(Root::Superseded as usize, db.db.into());
         self.superseded = Some(db);
         Ok(())

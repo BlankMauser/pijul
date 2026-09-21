@@ -6,6 +6,18 @@ authors.workspace = true
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
+include = [
+    "Cargo.toml",
+    "src/author.rs",
+    "src/defaults.toml",
+    "src/error.rs",
+    "src/global.rs",
+    "src/hook.rs",
+    "src/lib.rs",
+    "src/local.rs",
+    "src/remote.rs",
+    "src/template.rs",
+]
 
 [dependencies]
 pijul-core.workspace = true

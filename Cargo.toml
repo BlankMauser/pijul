@@ -13,7 +13,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "1.0.0-beta.20"
+version = "1.0.0-beta.22"
 authors = ["Pierre-Étienne Meunier <pe@pijul.org>"]
 edition = "2024"
 repository = "https://nest.pijul.com/pijul/pijul"
@@ -21,14 +21,14 @@ license = "GPL-2.0"
 readme = "README.md"
 
 [workspace.dependencies]
-pijul-core = { path = "pijul-core", version = "1.0.0-beta.20" }
-pijul-config = { path = "pijul-config", version = "1.0.0-beta.15" }
-pijul-identity = { path = "pijul-identity", version = "1.0.0-beta.19" }
+pijul-core = { path = "pijul-core", version = "1.0.0-beta.22" }
+pijul-config = { path = "pijul-config", version = "1.0.0-beta.22" }
+pijul-identity = { path = "pijul-identity", version = "1.0.0-beta.22" }
 pijul-interaction = { path = "pijul-interaction", version = "1.0.0-beta.15" }
 pijul-macros = { path = "pijul-macros", version = "1.0.0-beta.13" }
-pijul-remote = { path = "pijul-remote", version = "1.0.0-beta.19" }
+pijul-remote = { path = "pijul-remote", version = "1.0.0-beta.22" }
 pijul-repository = { path = "pijul-repository", version = "1.0.0-beta.15" }
-palimpsest = { path = "./palimpsest" }
+palimpsest = { path = "./palimpsest", version = "0.3.0" }
 
 adler32 = "1.2"
 anyhow = "1.0"
@@ -94,9 +94,9 @@ tar = "0.4"
 tempfile = "3.20"
 termcolor = "1.4"
 thiserror = "2.0"
-thrussh = "0.45.0"
+thrussh = "0.49.0"
 thrussh-config = "0.6"
-thrussh-keys = "0.43.0"
+thrussh-keys = "0.44.0"
 tokio = { version = "1.45", features = [
     "rt-multi-thread",
     "macros",

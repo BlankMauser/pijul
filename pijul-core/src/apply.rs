@@ -607,6 +607,19 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
 
     let mut visited = BTreeSet::new();
     let mut descendants = BTreeSet::new();
+    // `entering[d]` = alive vertices that reach a dead vertex `d` (the
+    // `last_alive` of each revisit of `d`). Together with `descendants[d]`
+    // (the alive vertices below `d`), this is the bipartite order relation
+    // "every entering < every exiting" that the reconnection must preserve.
+    // We collect it here and emit its *transitive reduction* after the DFS,
+    // instead of materialising the full product on every revisit.
+    let mut entering: BTreeSet<(Vertex<ChangeId>, Vertex<ChangeId>)> = BTreeSet::new();
+    // Deferred "reconnect to nearest alive ancestor" edges (the old branches B
+    // and C). Like the `entering × exiting` product, a single alive ancestor
+    // reconnects to *every* alive vertex below a dead region, which is the
+    // transitive closure; we defer them and emit only those not already made
+    // reachable by another reconnection (transitive reduction).
+    let mut bridges: Vec<(Vertex<ChangeId>, Vertex<ChangeId>)> = Vec::new();
 
     while let Some(elt) = stack.pop() {
         debug!("elt {:?}", elt);
@@ -617,21 +630,13 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
         // Has this vertex been visited already?
         if !visited.insert(elt.vertex) {
             debug!("already visited!");
-            for (_, r) in descendants.range((elt.vertex, Vertex::ROOT)..=(elt.vertex, Vertex::MAX))
-            {
-                debug!("put_pseudo, descendant {:?} {:?}", elt.last_alive, r);
-                // If we aren't in a direct cycle, reconnect.
-                if elt.last_alive != *r {
-                    put_graph_with_rev(
-                        txn,
-                        channel,
-                        EdgeFlags::PSEUDO,
-                        elt.last_alive,
-                        *r,
-                        ChangeId::ROOT,
-                    )?;
-                }
-            }
+            // `elt.last_alive` reaches the (dead) vertex `elt.vertex`, so it
+            // is upstream of every alive descendant recorded for it. Record
+            // the relation; the actual bridging edges are emitted, reduced,
+            // after the DFS. (The old code reconnected `last_alive` to every
+            // descendant here, which is the transitive *closure* and blows up
+            // quadratically when both sides are chains.)
+            entering.insert((elt.vertex, elt.last_alive));
             // `elt.is_alive()` (vertex == last_alive) only reflects the vertex's
             // own aliveness on its *first* visit. On a revisit reached through a
             // different path, `last_alive` is an ancestor, so we must test the
@@ -658,14 +663,7 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
                             // on the path, which means we've already
                             // pushed all its children onto the stack.).
                             debug!("alive, put_pseudo {:?} {:?}", v.vertex, elt.vertex);
-                            put_graph_with_rev(
-                                txn,
-                                channel,
-                                EdgeFlags::PSEUDO,
-                                v.vertex,
-                                elt.vertex,
-                                ChangeId::ROOT,
-                            )?;
+                            bridges.push((v.vertex, elt.vertex));
                         }
                         break;
                     } else {
@@ -758,14 +756,7 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
                         match txn.get_graph(channel, &v.last_alive, Some(&edge.into()))? {
                             Some(e) if e.dest() == edge.dest && e.flag() == EdgeFlags::BLOCK => {}
                             _ => {
-                                put_graph_with_rev(
-                                    txn,
-                                    channel,
-                                    EdgeFlags::PSEUDO,
-                                    v.last_alive,
-                                    stack[len - 1].vertex,
-                                    ChangeId::ROOT,
-                                )?;
+                                bridges.push((v.last_alive, stack[len - 1].vertex));
                             }
                         }
                         break;
@@ -784,6 +775,148 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
         }
     }
 
+    // Emit the transitive reduction of the `entering × exiting` relation for
+    // each dead vertex. Because the entering vertices are internally chained
+    // (by real, non-deleted edges) and so are the exiting ones, we only need
+    // to bridge the *maximal* entering vertices to the *minimal* exiting ones;
+    // transitivity through the existing alive chains recovers every other
+    // relation. For genuine antichains (many parallel conflicts) the reduction
+    // is wider — that is irreducible and correct.
+    let dead_vertices: Vec<Vertex<ChangeId>> = {
+        let mut v: Vec<_> = entering.iter().map(|(d, _)| *d).collect();
+        v.dedup();
+        v
+    };
+    let mut reached = HashSet::default();
+    for d in dead_vertices {
+        let ent: HashSet<Vertex<ChangeId>> = entering
+            .range((d, Vertex::ROOT)..=(d, Vertex::MAX))
+            .map(|(_, l)| *l)
+            .collect();
+        let exi: HashSet<Vertex<ChangeId>> = descendants
+            .range((d, Vertex::ROOT)..=(d, Vertex::MAX))
+            .map(|(_, r)| *r)
+            .collect();
+        if exi.is_empty() {
+            continue;
+        }
+
+        // Maximal entering: an entering vertex is redundant if it reaches
+        // another entering vertex through alive edges (that other one is
+        // closer to the dead region and will carry the bridge).
+        let mut maximal = Vec::new();
+        for &l in ent.iter() {
+            forward_reachable_within(txn, channel, l, &ent, &mut reached)?;
+            if reached.is_empty() {
+                maximal.push(l)
+            }
+        }
+
+        // Minimal exiting: an exiting vertex is redundant if another exiting
+        // vertex reaches it (that other one is closer to the dead region).
+        let mut non_minimal = HashSet::default();
+        for &r in exi.iter() {
+            forward_reachable_within(txn, channel, r, &exi, &mut reached)?;
+            for &x in reached.iter() {
+                non_minimal.insert(x);
+            }
+        }
+
+        for &l in maximal.iter() {
+            for &r in exi.iter() {
+                if non_minimal.contains(&r) || l == r {
+                    continue;
+                }
+                debug!("put_pseudo (reduced) {:?} {:?}", l, r);
+                put_graph_with_rev(txn, channel, EdgeFlags::PSEUDO, l, r, ChangeId::ROOT)?;
+            }
+        }
+    }
+
+    // Emit the deferred nearest-alive-ancestor reconnections, but only when the
+    // target is not already reachable from the source through the alive graph
+    // (real edges plus the bridges already emitted above and here). This turns
+    // the fan of "ancestor → every alive vertex below the dead region" into a
+    // single edge to the frontier, the rest following transitively.
+    for (u, v) in bridges {
+        if u == v {
+            continue;
+        }
+        if is_forward_reachable(txn, channel, u, v)? {
+            continue;
+        }
+        debug!("put_pseudo (bridge) {:?} {:?}", u, v);
+        put_graph_with_rev(txn, channel, EdgeFlags::PSEUDO, u, v, ChangeId::ROOT)?;
+    }
+
+    Ok(())
+}
+
+/// Forward BFS: is `to` reachable from `from` over alive (non-`DELETED`,
+/// non-`PARENT`) edges? Used to skip a reconnection whose endpoints are
+/// already transitively connected.
+fn is_forward_reachable<T: GraphTxnT>(
+    txn: &T,
+    channel: &T::Graph,
+    from: Vertex<ChangeId>,
+    to: Vertex<ChangeId>,
+) -> Result<bool, BlockError<T::GraphError>> {
+    let mut visited = HashSet::default();
+    let mut stack = vec![from];
+    while let Some(w) = stack.pop() {
+        if w == to {
+            return Ok(true);
+        }
+        if !visited.insert(w) {
+            continue;
+        }
+        for e in iter_adjacent(
+            txn,
+            channel,
+            w,
+            EdgeFlags::empty(),
+            EdgeFlags::all() - EdgeFlags::DELETED - EdgeFlags::PARENT,
+        )? {
+            let e = e?;
+            stack.push(*txn.find_block(channel, e.dest())?);
+        }
+    }
+    Ok(false)
+}
+
+/// Forward BFS from `from` over alive (non-`DELETED`, non-`PARENT`) edges,
+/// collecting into `out` every vertex of `targets` reached (excluding `from`
+/// itself). Used to compute maximal/minimal elements of a set in the alive
+/// partial order.
+fn forward_reachable_within<T: GraphTxnT>(
+    txn: &T,
+    channel: &T::Graph,
+    from: Vertex<ChangeId>,
+    targets: &HashSet<Vertex<ChangeId>>,
+    out: &mut HashSet<Vertex<ChangeId>>,
+) -> Result<(), BlockError<T::GraphError>> {
+    out.clear();
+    let mut visited = HashSet::default();
+    let mut stack = vec![from];
+    while let Some(v) = stack.pop() {
+        if !visited.insert(v) {
+            continue;
+        }
+        for e in iter_adjacent(
+            txn,
+            channel,
+            v,
+            EdgeFlags::empty(),
+            EdgeFlags::all() - EdgeFlags::DELETED - EdgeFlags::PARENT,
+        )? {
+            let e = e?;
+            let c = *txn.find_block(channel, e.dest())?;
+            if c != from && targets.contains(&c) {
+                out.insert(c);
+            }
+            stack.push(c);
+        }
+    }
     Ok(())
 }
 
@@ -1320,9 +1453,10 @@ pub fn apply_root_change<R: rand::Rng, T: MutTxnT, P: ChangeStore>(
 ) -> Result<Option<AppliedRoot>, ApplyError<P::Error, T>> {
     let mut change = {
         // If the graph already has a root.
-        {
+        let existing_root = {
             let channel = channel.read();
             let gr = txn.graph(&*channel);
+            let mut existing = None;
             if let Some(v) = iter_adjacent(
                 &*txn,
                 gr,
@@ -1332,16 +1466,55 @@ pub fn apply_root_change<R: rand::Rng, T: MutTxnT, P: ChangeStore>(
             )?
             .next()
             {
-                let v = txn.find_block(gr, v?.dest())?;
+                let v = *txn.find_block(gr, v?.dest())?;
                 if v.start == v.end {
-                    // Already has a root
-                    return Ok(None);
+                    // Already has a root. Locate its INODE vertex (the empty
+                    // NAME's alive FOLDER child) for the `inodes` check below.
+                    let mut inode = None;
+                    for e in iter_adjacent(
+                        &*txn,
+                        gr,
+                        v,
+                        EdgeFlags::FOLDER,
+                        EdgeFlags::FOLDER | EdgeFlags::BLOCK,
+                    )? {
+                        let e = e?;
+                        if e.flag().is_parent() {
+                            continue;
+                        }
+                        let iv = *txn.find_block(gr, e.dest())?;
+                        inode = Some(Position {
+                            change: iv.change,
+                            pos: iv.start,
+                        });
+                        break;
+                    }
+                    existing = Some(inode);
                 }
             } else {
                 // Non-empty channel without a root
             }
             // If we are here, either the channel is empty, or it
             // isn't and doesn't have a root.
+            existing
+        };
+        if let Some(inode) = existing_root {
+            // The root change is already on the channel, but the `inodes`
+            // table may lack the `Inode::ROOT → root INODE` entry: that entry
+            // is normally written from the `InodeUpdate::Add` registered by
+            // the record-side `add_root_if_needed`, a path not taken when the
+            // root change was applied here (or arrived through a plain
+            // apply/pull). Without it, `inode_sub_root` cannot attribute a
+            // *new top-level file* to the existing root project and every
+            // record adding one is misreported as touching a spurious "new
+            // project". This function runs at the start of every record, so
+            // repair the mapping whenever it is missing.
+            if txn.get_inodes(&Inode::ROOT, None)?.is_none() {
+                if let Some(pos) = inode {
+                    put_inodes_with_rev(txn, &Inode::ROOT, &pos)?;
+                }
+            }
+            return Ok(None);
         }
         let root = Position {
             change: Some(Hash::None),
@@ -1390,5 +1563,19 @@ pub fn apply_root_change<R: rand::Rng, T: MutTxnT, P: ChangeStore>(
         .save_change(&mut change, |_, _| Ok(()))
         .map_err(ApplyError::Changestore)?;
     let (n, merkle) = apply_change(store, txn, &mut channel.write(), &h)?;
+    // Mirror the `InodeUpdate::Add { inode: Inode::ROOT, .. }` that the
+    // record-side `add_root_if_needed` registers: map `Inode::ROOT` to the new
+    // root's INODE vertex (position 1 of the root change), so later records
+    // can attribute new top-level files to this root project.
+    if let Some(&internal) = txn.get_internal(&h.into())? {
+        put_inodes_with_rev(
+            txn,
+            &Inode::ROOT,
+            &Position {
+                change: internal,
+                pos: ChangePosition(1u64.into()),
+            },
+        )?;
+    }
     Ok(Some((h, n, merkle)))
 }

@@ -238,26 +238,15 @@ pub trait MutTxnTExt: pristine::MutTxnT {
         unrecord::unrecord(self, channel, changes, hash, salt, touched)
     }
 
-    /// Like [`Self::unrecord`] but for a supersede: preserves obsolescence
-    /// markers (see [`unrecord::unrecord_superseding`]).
-    fn unrecord_superseding<C: changestore::ChangeStore>(
-        &mut self,
-        changes: &C,
-        channel: &pristine::ChannelRef<Self>,
-        hash: &pristine::Hash,
-        salt: u64,
-        touched: &mut unrecord::TouchedInodes,
-    ) -> Result<bool, unrecord::UnrecordError<C::Error, Self>> {
-        unrecord::unrecord_superseding(self, channel, changes, hash, salt, touched)
-    }
-
-    /// If `hash` is an amend (its lineage names a `replaces` predecessor),
-    /// record the obsolescence marker "predecessor superseded by `hash`", then —
-    /// if that predecessor is currently on `channel` — unrecord it, so the amend
-    /// replaces its predecessor instead of stacking on top (which would surface
-    /// as a conflict). The marker is written even when the predecessor isn't on
-    /// this channel, so a later `pull` won't re-introduce it (the amend-after-
-    /// push case). A no-op when the change replaces nothing.
+    /// If `hash` is an amend (its lineage carries a `replaces` chain), record the
+    /// obsolescence marker "predecessor superseded by `hash`" for *every* element
+    /// of that chain, and — for each element currently on `channel` — unrecord it,
+    /// so the amend replaces its whole lineage instead of stacking on top (which
+    /// would surface as a conflict). Markers are written even for elements absent
+    /// from this channel, so a later `pull` won't re-introduce them (the
+    /// amend-after-push case). Carrying the full chain (not one hop) is what lets
+    /// a peer that never saw the intermediate iterations still supersede the
+    /// original. A no-op when the change replaces nothing.
     ///
     /// This is the single write path for markers, and it runs for every applied
     /// change: `apply`/`pull`/`push` call it before applying, and `record
@@ -270,11 +259,19 @@ pub trait MutTxnTExt: pristine::MutTxnT {
         channel: &pristine::ChannelRef<Self>,
         hash: &pristine::Hash,
     ) -> Result<(), unrecord::UnrecordError<C::Error, Self>> {
-        if let Some(parent) = changes.get_change(hash).ok().and_then(|c| c.replaces()) {
+        let chain = changes
+            .get_change(hash)
+            .ok()
+            .map(|c| c.replaces_chain())
+            .unwrap_or_default();
+        for parent in chain {
             self.mark_superseded(&parent, hash)?;
             let mut touched = unrecord::TouchedInodes::default();
-            // Preserve markers: this is a supersede, not an undo.
-            match self.unrecord_superseding(changes, channel, &parent, 0, &mut touched) {
+            // A plain unrecord: if `parent` is on the channel it leaves, and the
+            // replacement `hash` re-marks the whole chain, so predecessors stay
+            // filtered. `ChangeNotInChannel` (or an unknown change) just means
+            // this peer never had `parent` — the marker alone does the job.
+            match self.unrecord(changes, channel, &parent, 0, &mut touched) {
                 Ok(_) | Err(unrecord::UnrecordError::ChangeNotInChannel { .. }) => {}
                 Err(e) => return Err(e),
             }
@@ -344,6 +341,31 @@ pub trait TxnTExt: pristine::TxnT {
         P: changestore::ChangeStore,
     {
         fs::iter_graph_children(self, changes, self.graph(channel), key)
+    }
+
+    /// True iff `name_vertex` is the empty NAME vertex of a sub-root, i.e.
+    /// it has a `FOLDER|PARENT` edge whose source is `Vertex::ROOT`. When
+    /// `require_relocated`, only a `DELETED` such edge counts (the sub-root
+    /// has been moved out of ROOT into a subdirectory).
+    fn is_sub_root_name(
+        &self,
+        channel: &Self::Channel,
+        name_vertex: &pristine::Vertex<ChangeId>,
+        require_relocated: bool,
+    ) -> Result<bool, Self::GraphError> {
+        pristine::is_sub_root_name(self, self.graph(channel), name_vertex, require_relocated)
+            .map_err(|e| e.0)
+    }
+
+    /// The sub-root INODE vertex that `inode` belongs to (the grandchild of
+    /// `Vertex::ROOT` under which `inode` hangs), walking the FOLDER graph.
+    /// `None` for `Inode::ROOT` or a detached inode.
+    fn owning_sub_root(
+        &self,
+        channel: &Self::Channel,
+        inode: pristine::Inode,
+    ) -> Result<Option<pristine::Position<ChangeId>>, Self::GraphError> {
+        pristine::owning_sub_root(self, self.graph(channel), inode).map_err(|e| e.0)
     }
 
     fn has_change(

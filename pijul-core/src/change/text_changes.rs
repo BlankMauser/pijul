@@ -829,7 +829,12 @@ impl Hunk<Option<Hash>, Local> {
                 let inode = from_printable_pos(changes, pos)?;
                 let change = match change {
                     PrintableAtom::NewVertex(new_vertex) => {
-                        assert!(!contents.is_empty());
+                        // An `Edit` whose atom is a `NewVertex` may carry
+                        // empty contents (e.g. inserting a zero-length
+                        // vertex). The write side emits these, so accept
+                        // them here and build an empty vertex rather than
+                        // panicking — cf. the `SolveOrderConflict` branch,
+                        // which handles the empty case the same way.
                         let mut x = default_newvertex();
                         x.inode = inode;
                         x.flag = EdgeFlags::BLOCK;

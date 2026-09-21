@@ -107,3 +107,49 @@ fn approval_round_trip() -> Result<(), anyhow::Error> {
 
     Ok(())
 }
+
+/// `[monorepo] boundaries` from the tracked `pijul.toml` are exposed via
+/// `Config::boundaries()` (pulled out of the figment merge, like shared hooks).
+#[test]
+fn boundaries_are_read_from_shared() -> Result<(), anyhow::Error> {
+    let contents = r#"
+[monorepo]
+boundaries = ["libs/foo", "apps/bar"]
+"#;
+    let config = Config::load_with_shared(None, None, shared(contents), None, Vec::new())?;
+    assert_eq!(config.boundaries(), &["libs/foo", "apps/bar"]);
+    // Absent section => empty, not an error.
+    let empty = Config::load_with_shared(
+        None,
+        None,
+        shared("default_remote = \"x\"\n"),
+        None,
+        Vec::new(),
+    )?;
+    assert!(empty.boundaries().is_empty());
+    Ok(())
+}
+
+/// `add_boundary_to_shared` creates `pijul.toml`/section as needed and is
+/// idempotent (a boundary already present is not duplicated).
+#[test]
+fn add_boundary_round_trip() -> Result<(), anyhow::Error> {
+    let repo = tempfile::tempdir()?;
+    let root = repo.path();
+
+    // First add creates the file + section.
+    assert!(pijul_config::add_boundary_to_shared(root, "sub")?);
+    let config = Config::load(Some(root), Vec::new())?;
+    assert_eq!(config.boundaries(), &["sub"]);
+
+    // Second, distinct boundary appends.
+    assert!(pijul_config::add_boundary_to_shared(root, "vendor/lib")?);
+    let config = Config::load(Some(root), Vec::new())?;
+    assert_eq!(config.boundaries(), &["sub", "vendor/lib"]);
+
+    // Re-adding an existing boundary is a no-op (returns false, no dup).
+    assert!(!pijul_config::add_boundary_to_shared(root, "sub")?);
+    let config = Config::load(Some(root), Vec::new())?;
+    assert_eq!(config.boundaries(), &["sub", "vendor/lib"]);
+    Ok(())
+}

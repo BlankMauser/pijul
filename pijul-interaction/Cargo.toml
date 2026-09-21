@@ -6,6 +6,12 @@ authors = ["Finchie"]
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
+include = [
+    "Cargo.toml",
+    "src/lib.rs",
+    "src/progress/mod.rs",
+    "src/progress/terminal.rs",
+]
 
 [dependencies]
 indicatif.workspace = true

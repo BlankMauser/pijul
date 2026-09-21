@@ -13,6 +13,25 @@ pub const OUTPUT_MESSAGE: &str = "Outputting repository";
 
 static INTERACTIVE_CONTEXT: OnceLock<InteractiveContext> = OnceLock::new();
 
+static PROGRESS_WINDOW: OnceLock<usize> = OnceLock::new();
+
+/// Default number of recent patch titles kept on screen during push/pull.
+pub const DEFAULT_PROGRESS_WINDOW: usize = 10;
+
+/// Set (once, at startup) how many recent patch titles the progress display
+/// keeps visible. Read from the user's global config; ignored if already set.
+pub fn set_progress_window(window: usize) {
+    let _ = PROGRESS_WINDOW.set(window);
+}
+
+/// The configured window size, or [`DEFAULT_PROGRESS_WINDOW`] if unset.
+pub fn progress_window() -> usize {
+    PROGRESS_WINDOW
+        .get()
+        .copied()
+        .unwrap_or(DEFAULT_PROGRESS_WINDOW)
+}
+
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
 pub enum InteractionError {

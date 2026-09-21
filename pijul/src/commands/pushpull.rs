@@ -924,7 +924,25 @@ impl Pull {
             // Now that .pull is always given `false` for `do_apply`...
             let mut ws = pijul_core::ApplyWorkspace::new();
             debug!("to_download = {:#?}", to_download);
-            let apply_bar = ProgressBar::new(to_download.len() as u64, APPLY_MESSAGE)?;
+            // The changes are downloaded by now, so their titles are readable —
+            // list each patch as it applies. Order matches the apply loop below
+            // (`to_download` reversed) so the sliding window tracks reality.
+            let apply_titles: Vec<String> = {
+                use pijul_core::Base32;
+                to_download
+                    .iter()
+                    .rev()
+                    .map(|c| match c {
+                        CS::Change(h) => repo
+                            .changes
+                            .get_header(h)
+                            .map(|hdr| hdr.message)
+                            .unwrap_or_else(|_| h.to_base32()),
+                        CS::State(h) => format!("Tag {}", h.to_base32()),
+                    })
+                    .collect()
+            };
+            let apply_bar = ProgressBar::with_titles(apply_titles, APPLY_MESSAGE)?;
 
             let mut channel = channel.write();
             let mut txn = txn.write();

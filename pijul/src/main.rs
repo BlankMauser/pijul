@@ -4,7 +4,7 @@ use clap::{ColorChoice, Parser};
 use human_panic::setup_panic;
 use pijul_config::{Config, parse_config_arg};
 use std::ffi::OsString;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 
 use crate::commands::*;
 
@@ -161,7 +161,31 @@ async fn main() {
     builder.init();
 
     let opts = Opts::parse();
-    pijul_interaction::set_context(pijul_interaction::InteractiveContext::NotInteractive);
+    // Progress bars are drawn to stderr; only show them when it is a terminal,
+    // so that piped/captured output (e.g. running under Amphion) stays clean.
+    let context = if std::io::stderr().is_terminal() {
+        pijul_interaction::InteractiveContext::Terminal
+    } else {
+        pijul_interaction::InteractiveContext::NotInteractive
+    };
+    pijul_interaction::set_context(context);
+
+    // Honor the user's `progress_window` preference for how many recent patch
+    // titles push/pull keeps on screen. Best-effort: any config problem just
+    // leaves the built-in default in place.
+    if let Some(window) = pijul_config::global::Global::config_file()
+        .and_then(|path| {
+            pijul_config::global::Global::read_contents(&path)
+                .ok()
+                .map(|c| (path, c))
+        })
+        .and_then(|(path, contents)| {
+            pijul_config::global::Global::parse_contents(&path, &contents).ok()
+        })
+        .and_then(|global| global.progress_window)
+    {
+        pijul_interaction::set_progress_window(window);
+    }
 
     if let Err(e) = run(opts).await {
         // This will only activate with the following environment variables:

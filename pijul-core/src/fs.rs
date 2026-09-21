@@ -1047,9 +1047,29 @@ pub fn find_path<T: ChannelTxnT, C: ChangeStore>(
         let (name, _, next) = next_v.unwrap();
         seen.insert(next);
         if name.start == name.end {
-            // Non-zero root vertex
-            assert!(next.change.is_root());
-            break;
+            // Empty NAME vertex = a sub-root passthrough. A non-relocated
+            // sub-root's only alive folder parent is ROOT, so the path is
+            // complete. A *relocated* sub-root instead lives under a directory
+            // (keeping a lingering DELETED folder edge to ROOT — that edge may
+            // be the `next` picked above), so climb through its alive folder
+            // parent, emitting no path segment for the empty name.
+            let mut alive_parent = None;
+            for e in iter_adjacent(txn, txn.graph(channel), *name, flag0, flag1)? {
+                let e = e?;
+                if e.flag().contains(EdgeFlags::PARENT | EdgeFlags::FOLDER)
+                    && !e.flag().contains(EdgeFlags::DELETED)
+                {
+                    alive_parent = Some(e.dest());
+                    break;
+                }
+            }
+            match alive_parent {
+                Some(p) if !p.change.is_root() => {
+                    v = p;
+                    continue 'outer;
+                }
+                _ => break,
+            }
         }
         if alive {
             name_buf.resize(name.end - name.start, 0);

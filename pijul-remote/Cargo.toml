@@ -6,6 +6,15 @@ authors.workspace = true
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
+include = [
+    "Cargo.toml",
+    "src/error.rs",
+    "src/http.rs",
+    "src/lib.rs",
+    "src/local.rs",
+    "src/ssh.rs",
+    "src/ssh_config.rs",
+]
 
 [features]
 default = ["openssl"]

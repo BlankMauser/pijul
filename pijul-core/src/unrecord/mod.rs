@@ -66,11 +66,16 @@ impl<C: std::error::Error, T: GraphTxnT + TreeTxnT> std::fmt::Debug for Unrecord
 
 pub type TouchedInodes = HashSet<(ChangeId, Position<Option<Hash>>)>;
 
-/// Unrecord `hash` with "undo" intent: besides removing the change, this clears
-/// obsolescence markers — it resurrects any predecessor `hash` had superseded
-/// and drops `hash`'s own marker. Use [`unrecord_superseding`] instead when the
-/// removal is part of a supersede (amend / `unrecord_superseded`), where markers
-/// must be preserved so a chain of amends keeps its predecessors filtered.
+/// Unrecord `hash` from `channel`, reverting its effect on the graph.
+///
+/// There is a **single** unrecord path (no superseding/undo variants): when the
+/// change thereby leaves *every* channel, the obsolescence markers it owns are
+/// dropped — one `pred -> hash` pair for every element of its amend chain — so a
+/// marker lives exactly as long as its superseding change is applied somewhere.
+/// A re-amend and a plain undo therefore behave identically: re-amending
+/// unrecords the predecessor (dropping its markers) and the replacement's own
+/// apply re-marks the whole chain, so predecessors stay filtered without any
+/// special casing; undoing simply leaves them unmarked, i.e. resurrectable.
 pub fn unrecord<T: MutTxnT, P: ChangeStore>(
     txn: &mut T,
     channel: &ChannelRef<T>,
@@ -78,30 +83,6 @@ pub fn unrecord<T: MutTxnT, P: ChangeStore>(
     hash: &Hash,
     salt: u64,
     touched: &mut TouchedInodes,
-) -> Result<bool, UnrecordError<P::Error, T>> {
-    unrecord_(txn, channel, changes, hash, salt, touched, false)
-}
-
-/// Like [`unrecord`] but for a supersede: leaves obsolescence markers untouched.
-pub fn unrecord_superseding<T: MutTxnT, P: ChangeStore>(
-    txn: &mut T,
-    channel: &ChannelRef<T>,
-    changes: &P,
-    hash: &Hash,
-    salt: u64,
-    touched: &mut TouchedInodes,
-) -> Result<bool, UnrecordError<P::Error, T>> {
-    unrecord_(txn, channel, changes, hash, salt, touched, true)
-}
-
-fn unrecord_<T: MutTxnT, P: ChangeStore>(
-    txn: &mut T,
-    channel: &ChannelRef<T>,
-    changes: &P,
-    hash: &Hash,
-    salt: u64,
-    touched: &mut TouchedInodes,
-    superseding: bool,
 ) -> Result<bool, UnrecordError<P::Error, T>> {
     let change_id = if let Some(&h) = txn.get_internal(&hash.into())? {
         h
@@ -127,17 +108,16 @@ fn unrecord_<T: MutTxnT, P: ChangeStore>(
         touched,
     )?;
 
-    if !superseding {
-        // Undo intent: resurrect any predecessor this change superseded (drop the
-        // marker keyed by it) and drop this change's own marker, so the table
-        // doesn't accumulate and a re-pull of the predecessor is no longer skipped.
-        if let Some(parent) = change.replaces() {
-            txn.unmark_superseded(&parent)?;
-        }
-        txn.unmark_superseded(hash)?;
-    }
-
     if unused {
+        // The change is now on no channel at all, so the obsolescence markers it
+        // owns must go: drop the exact `pred -> hash` pair for every element of
+        // its amend chain. Concurrent amends of the same predecessor keep their
+        // own pairs (multi-valued table), and a still-applied copy on another
+        // channel keeps the marker alive (we only reach here when `unused`).
+        for parent in change.replaces_chain() {
+            txn.unmark_superseded(&parent, hash)?;
+        }
+
         assert!(txn.get_revdep(&change_id, None)?.is_none());
         while txn.del_dep(&change_id, None)? {}
         txn.del_external(&change_id, None)?;

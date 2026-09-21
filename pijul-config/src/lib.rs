@@ -48,6 +48,16 @@ pub struct Shared {
     pub signing_key: Option<String>,
 }
 
+/// Monorepo boundaries: top-level directories (or imported sub-roots) that
+/// should stay separable. Lives in the tracked `pijul.toml` so the whole team
+/// shares the same map; `clone --into` maintains it, and `record` refuses a
+/// `FileMove` that crosses a boundary unless `--force`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Monorepo {
+    #[serde(default)]
+    pub boundaries: Vec<String>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub struct Config {
     // Store a copy of the original files, so that they can be modified independently
@@ -62,6 +72,12 @@ pub struct Config {
     /// and, being versioned code shared with everyone, gated behind approval.
     #[serde(skip)]
     pub shared_hooks: hook::Hooks,
+    /// Monorepo boundaries declared in the tracked `pijul.toml`. Like
+    /// `shared_hooks`, kept out of the figment merge so a personal
+    /// `.pijul/config.toml` cannot silently weaken enforcement — the boundary
+    /// map is a shared, team-wide invariant.
+    #[serde(skip)]
+    pub monorepo: Monorepo,
 
     // Global
     #[serde(default)]
@@ -196,11 +212,17 @@ impl Config {
         // pulled out into `shared_hooks` (ordered and approval-gated separately)
         // and stripped from the layer so they never enter the personal `hooks`.
         let mut shared_hooks = hook::Hooks::default();
+        let mut shared_monorepo = Monorepo::default();
         if let Some((_path, contents)) = shared_config_file {
             let mut value: toml::Value = toml::from_str(&contents)?;
             if let Some(table) = value.as_table_mut() {
                 if let Some(hooks_value) = table.remove("hooks") {
                     shared_hooks = hooks_value.try_into()?;
+                }
+                // Boundaries are a shared invariant: pull them out of the figment
+                // merge so no personal layer can override (weaken) them.
+                if let Some(monorepo_value) = table.remove("monorepo") {
+                    shared_monorepo = monorepo_value.try_into()?;
                 }
             }
             layers = layers.merge(Toml::string(&toml::to_string(&value)?));
@@ -249,8 +271,15 @@ impl Config {
         config.local_config = local_config;
         config.repo_root = repo_root;
         config.shared_hooks = shared_hooks;
+        config.monorepo = shared_monorepo;
 
         Ok(config)
+    }
+
+    /// The declared monorepo boundaries (from the tracked `pijul.toml`). The thin
+    /// interface consumed by `record` (crossing-move guard) and `clone --into`.
+    pub fn boundaries(&self) -> &[String] {
+        &self.monorepo.boundaries
     }
 
     /// Fingerprint of the shared hooks: a BLAKE3 hash of their canonical
@@ -388,6 +417,43 @@ pub fn global_config_directory() -> Result<PathBuf, ConfigError> {
         // 3. ~/.pijulconfig/
         .or_else(|| dirs_next::home_dir().map(|home_dir| home_dir.join(CONFIG_DIR)))
         .ok_or(ConfigError::ConfigDirNotFound)
+}
+
+/// Append `dir` to `[monorepo] boundaries` in the tracked `pijul.toml` at
+/// `repo_root`, creating the file and/or section if needed. Idempotent: a
+/// boundary already present is left untouched. Returns `true` iff the file was
+/// modified. Used by `clone --into` to register the imported sub-root as a
+/// shared boundary.
+pub fn add_boundary_to_shared(repo_root: &Path, dir: &str) -> Result<bool, ConfigError> {
+    let path = repo_root.join(SHARED_CONFIG_FILE);
+    let mut value: toml::Value = match std::fs::read_to_string(&path) {
+        Ok(s) => toml::from_str(&s)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            toml::Value::Table(Default::default())
+        }
+        Err(e) => return Err(ConfigError::Io(e)),
+    };
+    let table = value
+        .as_table_mut()
+        .ok_or_else(|| ConfigError::MalformedShared("top level is not a table".into()))?;
+    let monorepo = table
+        .entry("monorepo".to_string())
+        .or_insert_with(|| toml::Value::Table(Default::default()));
+    let monorepo = monorepo
+        .as_table_mut()
+        .ok_or_else(|| ConfigError::MalformedShared("`monorepo` is not a table".into()))?;
+    let boundaries = monorepo
+        .entry("boundaries".to_string())
+        .or_insert_with(|| toml::Value::Array(Vec::new()));
+    let boundaries = boundaries
+        .as_array_mut()
+        .ok_or_else(|| ConfigError::MalformedShared("`boundaries` is not an array".into()))?;
+    if boundaries.iter().any(|v| v.as_str() == Some(dir)) {
+        return Ok(false);
+    }
+    boundaries.push(toml::Value::String(dir.to_string()));
+    std::fs::write(&path, toml::to_string(&value)?)?;
+    Ok(true)
 }
 
 /// Parse a command-line configuration argument into a key/value pair

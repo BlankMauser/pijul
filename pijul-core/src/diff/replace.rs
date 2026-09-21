@@ -26,6 +26,34 @@ impl ConflictContexts {
     }
 }
 
+/// Whether `line` is one of Pijul's conflict markers — `>>>>>>> N`, `======= N`
+/// or `<<<<<<< N` — as written by [`crate::vertex_buffer`]. `line` still carries
+/// its trailing separator. Requiring the full `<marker> <id>` shape (seven
+/// identical marker bytes, a space, then a decimal id) keeps stray
+/// `>>>>>>>`-looking prose from being mistaken for a marker.
+///
+/// A live conflict is re-emitted by the graph and handled as structure, so its
+/// markers never reach recorded *content*. When one does, the file carries
+/// orphaned markers (e.g. a conflict whose other side was a pending patch that
+/// has since been unrecorded and dropped) and recording it would bake the marker
+/// text in — which the caller refuses unless explicitly accepted.
+pub(crate) fn is_conflict_marker_line(line: &[u8]) -> bool {
+    let Some((&head, rest)) = line.split_first() else {
+        return false;
+    };
+    if !matches!(head, b'>' | b'<' | b'=') || rest.len() < 8 {
+        return false;
+    }
+    if rest[..6].iter().any(|&c| c != head) || rest[6] != b' ' {
+        return false;
+    }
+    rest[7..]
+        .iter()
+        .take_while(|&&c| c != b' ' && c != b'\n')
+        .all(|c| c.is_ascii_digit())
+        && rest[7].is_ascii_digit()
+}
+
 impl Recorded {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn replace(
@@ -67,6 +95,17 @@ impl Recorded {
 
         let mut contents = self.contents.lock();
         for &line in &lines_b[from_new..(from_new + len)] {
+            // A conflict marker reaching recorded content means the working copy
+            // carries orphaned markers the graph no longer backs (see
+            // [`is_conflict_marker_line`]). Flag the file so the caller can refuse
+            // the record unless conflict markers were explicitly accepted; the
+            // content is still emitted so `--accept-conflict-markers` records it
+            // verbatim. Files are recorded one at a time, so dedup on the last.
+            if is_conflict_marker_line(line.l)
+                && self.conflict_marker_files.last() != Some(&diff.path)
+            {
+                self.conflict_marker_files.push(diff.path.clone());
+            }
             contents.extend(line.l);
         }
         let end = contents.len();

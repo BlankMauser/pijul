@@ -210,20 +210,26 @@ pub type Change = LocalChange<Hunk<Option<Hash>, Local>, Author>;
 /// these bytes with its own (possibly different) `pijul-core`.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangeMetadata {
-    /// The change this one supersedes (its immediate predecessor), base32. On
-    /// apply, if it is present on the target channel it is unrecorded first.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub replaces: Option<String>,
+    /// The full amend chain this change supersedes: every superseded ancestor
+    /// hash, base32, ordered from the original (`root`, first) down to the
+    /// immediate predecessor (last). Carrying the *whole* chain — not just a
+    /// single hop — is what lets a repository that never received the
+    /// intermediate iterations supersede every one of them, and lets any peer
+    /// decide amend-ancestry between two tips (is one in the other's chain?).
+    /// On apply, each element present on the target channel is unrecorded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replaces: Vec<String>,
     /// Stable identity of the logical change across iterations: the base32 hash
-    /// of the original (replaces-nothing) version. Groups revisions for display
-    /// only; never used to pick an unrecord target.
+    /// of the original (replaces-nothing) version, i.e. `replaces.first()`.
+    /// Kept as its own field for display grouping; never used to pick an
+    /// unrecord target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
 }
 
 impl ChangeMetadata {
     pub fn is_empty(&self) -> bool {
-        self.replaces.is_none() && self.root.is_none()
+        self.replaces.is_empty() && self.root.is_none()
     }
 }
 
@@ -238,10 +244,22 @@ impl<Hunk, Author> Hashed<Hunk, Author> {
         }
     }
 
-    /// The change this one supersedes, if any.
+    /// The full amend chain this change supersedes, ordered root-first with the
+    /// immediate predecessor last. Empty for a change that supersedes nothing.
+    pub fn replaces_chain(&self) -> Vec<Hash> {
+        self.change_metadata()
+            .replaces
+            .iter()
+            .filter_map(|s| Hash::from_base32(s.as_bytes()))
+            .collect()
+    }
+
+    /// The change this one *directly* supersedes (its immediate predecessor) —
+    /// the last element of the amend chain — if any.
     pub fn replaces(&self) -> Option<Hash> {
         self.change_metadata()
             .replaces
+            .last()
             .and_then(|s| Hash::from_base32(s.as_bytes()))
     }
 
@@ -252,13 +270,15 @@ impl<Hunk, Author> Hashed<Hunk, Author> {
             .and_then(|s| Hash::from_base32(s.as_bytes()))
     }
 
-    /// Write lineage metadata into the hashed blob. Must be called before the
-    /// change is hashed. An empty lineage leaves `metadata` empty so unrelated
+    /// Write lineage metadata into the hashed blob. `chain` is the full ordered
+    /// amend chain this change supersedes (root-first, immediate predecessor
+    /// last); `root` is derived as its first element. Must be called before the
+    /// change is hashed. An empty chain leaves `metadata` empty so unrelated
     /// changes keep hashing exactly as before.
-    pub fn set_change_metadata(&mut self, replaces: Option<Hash>, root: Option<Hash>) {
+    pub fn set_change_metadata(&mut self, chain: &[Hash]) {
         let m = ChangeMetadata {
-            replaces: replaces.map(|h| h.to_base32()),
-            root: root.map(|h| h.to_base32()),
+            replaces: chain.iter().map(|h| h.to_base32()).collect(),
+            root: chain.first().map(|h| h.to_base32()),
         };
         self.metadata = if m.is_empty() {
             Vec::new()
@@ -303,13 +323,17 @@ pub fn dependencies<
                 for e in edges {
                     assert!(!e.flag.contains(EdgeFlags::PARENT));
                     assert!(e.introduced_by != Some(Hash::None));
-                    if let Some(p) = e.from.change {
+                    // `Hash::None` is the root vertex, which is always present
+                    // and is never a real dependency (mirrors the `NewVertex`
+                    // arm above). A sub-root relocation deletes a folder edge
+                    // whose `from` is ROOT, so this filter matters here.
+                    if let Some(p) = e.from.change.filter(|p| *p != Hash::None) {
                         deps.insert(p);
                     }
                     if let Some(p) = e.introduced_by {
                         deps.insert(p);
                     }
-                    if let Some(p) = e.to.change {
+                    if let Some(p) = e.to.change.filter(|p| *p != Hash::None) {
                         deps.insert(p);
                     }
                     add_zombie_deps_from(txn, txn.graph(channel), &mut zombie_deps, e.from)?;
