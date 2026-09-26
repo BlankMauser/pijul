@@ -182,6 +182,8 @@ where
     let mut annotations: HashMap<Vertex<ChangeId>, Ann> = HashMap::new();
     // One alive graph per file (inode position) the change touched.
     let mut graphs: HashMap<Position<ChangeId>, G> = HashMap::new();
+    // The path each touched file had when this change was recorded.
+    let mut hunk_paths: HashMap<Position<ChangeId>, String> = HashMap::new();
 
     {
         let txnr = txn_.read();
@@ -201,6 +203,9 @@ where
                 }
 
                 let inode = internal_pos(txn, &atom.inode(), id)?;
+                hunk_paths
+                    .entry(inode)
+                    .or_insert_with(|| h.path().to_string());
 
                 let chan = channel.read();
                 let graph = txn.graph(&chan);
@@ -300,12 +305,34 @@ where
 
         // Resolve the file's (youngest) path from the graph itself, so
         // no working copy is needed. A file with no live name (deleted
-        // since) falls back to its graph position.
+        // since) is named by the path its hunk recorded: `find_path` would
+        // only yield its live ancestors. Failing both, fall back to its
+        // graph position.
         let path = {
             let txn = txn_.read();
             let chan = channel.read();
-            match pijul_core::fs::find_path(changes, &*txn, &chan, true, inode_pos) {
-                Ok(Some(fp)) if !fp.path.is_empty() => fp.path.join("/"),
+            let named = iter_adjacent(
+                &*txn,
+                txn.graph(&chan),
+                inode_pos.inode_vertex(),
+                EdgeFlags::FOLDER | EdgeFlags::PARENT,
+                EdgeFlags::all(),
+            )?
+            .any(|e| {
+                e.is_ok_and(|e| {
+                    e.flag().contains(EdgeFlags::FOLDER | EdgeFlags::PARENT)
+                        && !e.flag().contains(EdgeFlags::DELETED)
+                })
+            });
+            let recorded = hunk_paths
+                .get(&inode_pos)
+                .filter(|p| !named && !p.is_empty());
+            match (
+                recorded,
+                pijul_core::fs::find_path(changes, &*txn, &chan, true, inode_pos),
+            ) {
+                (Some(recorded), _) => recorded.clone(),
+                (None, Ok(Some(fp))) if !fp.path.is_empty() => fp.path.join("/"),
                 _ => {
                     let h: Hash = txn
                         .get_external(&inode_pos.change)
@@ -1036,6 +1063,30 @@ mod tests {
         write_file(&wc, "a.md", &edited);
         let hash = commit(&pristine, &changes, &wc, "main", "edit ends");
         (pristine, changes, dir, hash)
+    }
+
+    /// A deleted file has no live name, so it is named by the path its
+    /// deletion hunk recorded rather than by its live parent directory.
+    #[test]
+    fn deleted_file_keeps_its_full_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let changes = Changes::from_root(dir.path(), 1024);
+        let pristine = Pristine::new_anon().unwrap();
+        let wc = Memory::new();
+        wc.add_file("src/gone.md", b"bye\n".to_vec());
+        wc.add_file("src/keep.md", b"stay\n".to_vec());
+        track(&pristine, "src/gone.md");
+        track(&pristine, "src/keep.md");
+        commit(&pristine, &changes, &wc, "main", "add");
+        wc.remove_path("src/gone.md", false).unwrap();
+        let hash = commit(&pristine, &changes, &wc, "main", "delete");
+
+        let diffs = change_diff(&pristine, &changes, "main", hash).unwrap();
+        let paths: Vec<&str> = diffs.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["src/gone.md"]);
+        assert!(kinds(&diffs)
+            .iter()
+            .any(|(k, t)| *k == SegmentKind::Del && t.contains("bye")));
     }
 
     /// Above the eager threshold, unchanged vertices far from any edit
