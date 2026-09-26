@@ -1,0 +1,22 @@
+pijul-core/src/tests/rm_file.rs
+  s_7f2af0f6132dde::t_e2aec9ad56a3d5 66-110,112-133,135-150
+  s_7f2af0f6132dde::t_87b5d63ba17bd2 3,111,134
+pijul-core/src/record.rs
+  s_7f2af0f6132dde::t_601a6575717222 922-959
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7d796573eaf348df6e64e1bc79d8a258531d8966",
+  "prompts": {},
+  "sessions": {
+    "s_7f2af0f6132dde": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1ff93b33-c68b-4514-a58c-c01b8efd89b0",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
