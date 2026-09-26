@@ -1,0 +1,23 @@
+palimpsest/src/diff.rs
+  s_7f2af0f6132dde::t_803f26ac222a4d 327-335
+  s_7f2af0f6132dde::t_418102d1d01881 1068-1091
+  s_7f2af0f6132dde::t_b22486354fb4b6 206-208
+  s_7f2af0f6132dde::t_e8e64efad3bf45 308-310,314-326
+  s_7f2af0f6132dde::t_abedffcd6ccf37 185-186
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c2902aca244c807965a1804bb81564ebc1ca951b",
+  "prompts": {},
+  "sessions": {
+    "s_7f2af0f6132dde": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1ff93b33-c68b-4514-a58c-c01b8efd89b0",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
