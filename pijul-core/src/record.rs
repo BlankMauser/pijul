@@ -919,6 +919,44 @@ impl Builder {
         Ok(())
     }
 
+    /// Record the deletion of the tracked file or directory at `path` into
+    /// this builder, independently of [`Builder::ignore_missing`]. This lets
+    /// a caller recording from a partial working copy (with
+    /// `ignore_missing` set) still delete explicitly chosen paths in the
+    /// same change. `path` must be absent from `working_copy`; descendants
+    /// still present there are kept, as in a regular record.
+    pub fn record_deleted_path<T, W: WorkingCopyRead, C: ChangeStore>(
+        &mut self,
+        txn: &ArcTxn<T>,
+        channel: &ChannelRef<T>,
+        working_copy: &W,
+        changes: &C,
+        path: &str,
+    ) -> Result<(), RecordError<C::Error, W::Error, T>>
+    where
+        T: ChannelTxnT + TreeTxnT,
+        <W as WorkingCopyRead>::Error: 'static,
+    {
+        let txn = txn.read();
+        let channel = channel.r.read();
+        let inode = crate::fs::find_inode(&*txn, path).map_err(|e| match e {
+            crate::fs::FsError::Tree(e) => RecordError::Tree(e),
+            _ => RecordError::PathNotInRepo(path.to_string()),
+        })?;
+        let vertex = *get_inodes::<_, C, W>(&*txn, &*channel, &inode)?
+            .ok_or_else(|| RecordError::PathNotInRepo(path.to_string()))?;
+        let rec = self.recorded();
+        let mut rec = rec.lock();
+        rec.record_deleted_file(
+            &*txn,
+            txn.graph(&*channel),
+            working_copy,
+            path,
+            vertex,
+            changes,
+        )
+    }
+
     fn delete_obsolete_children<T: GraphTxnT + TreeTxnT, W: WorkingCopyRead, C: ChangeStore>(
         &mut self,
         txn: &T,
