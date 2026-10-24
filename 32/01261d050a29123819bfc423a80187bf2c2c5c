@@ -1,0 +1,63 @@
+pijul-core/src/alive/dfs.rs
+  s_f36f8f7bce4731::t_83d2a5ea103715 84
+pijul-core/src/alive/mod.rs
+  s_f36f8f7bce4731::t_fa78f3df7892f2 22-25,28-38,70,83,132-157
+pijul-core/src/alive/output.rs
+  s_f36f8f7bce4731::t_027c8c836e70ba 83,135,139,144,199-252,258,271-282,285-298,300-328,331,353-377
+pijul-core/src/alive/retrieve.rs
+  s_f36f8f7bce4731::t_a42a63f46983f8 30,91,99-100,104,118,129-140
+pijul-core/src/alive/tarjan.rs
+  s_f36f8f7bce4731::t_b9b54886642502 12-16
+pijul-core/src/apply.rs
+  s_f36f8f7bce4731::t_e746ceb57f8601 410-423,604-609,733-734,802-808,820,824-827,834-843,849,851-856,875-879,881,894-905,908-909,916-918,920,922,924-925,927-930,933-935,944-988,997-998,1007,1009,1011,1013-1018,1021-1023,1035-1037,1039-1086,1155-1221
+pijul-core/src/apply/edge.rs
+  s_f36f8f7bce4731::t_647fdc71e289df 93-110,150-153,156,170,439-444,446-450
+pijul-core/src/apply/vertex.rs
+  s_f36f8f7bce4731::t_aaedb581a1a892 35,42-44,68-74,101,142-151,200-204
+pijul-core/src/changestore/filesystem.rs
+  s_f36f8f7bce4731::t_28d03274f0ca47 291-310
+pijul-core/src/diff/delete.rs
+  s_f36f8f7bce4731::t_98948086550b33 206-210,216,220-224,337-341,343,385-391
+pijul-core/src/diff/mod.rs
+  s_f36f8f7bce4731::t_5ab9da9936e7e1 24-26,153,164-197,199-232,244-245,273-276,286-297,299-305,321-325,329
+pijul-core/src/diff/replace.rs
+  s_f36f8f7bce4731::t_dea01ce56ced0f 323-337,392-396,398-400
+pijul-core/src/output/working_copy.rs
+  s_f36f8f7bce4731::t_ae087e8ec722d8 108-111,164,222-251,672,719-724,726,728,731-739,741-749
+pijul-core/src/pristine/mod.rs
+  s_f36f8f7bce4731::t_aa8208a4c00573 1511-1582,2207-2217
+pijul-core/src/pristine/sanakirja.rs
+  s_f36f8f7bce4731::t_55e96cdceaf108 199,329,395-404,612-615,620-631,635-638,2255-2290,2634-2635
+pijul-core/src/tests/change.rs
+  s_f36f8f7bce4731::t_65608c6c604d88 210-293
+pijul-core/src/tests/conflict.rs
+  s_f36f8f7bce4731::t_3d515999e40979 3267-3502
+pijul-core/src/tests/filesystem.rs
+  s_f36f8f7bce4731::t_6ebc2614b920f2 6-55
+pijul-core/src/tests/missing_context.rs
+  s_f36f8f7bce4731::t_f4f527c15a5c6f 140-142,200-201,204
+pijul-core/src/tests/mod.rs
+  s_f36f8f7bce4731::t_b36e55be109511 25-27,48-52,129-137
+pijul-core/src/tests/unrecord.rs
+  s_f36f8f7bce4731::t_c4fb313ac78696 442,453-461,477-478,587-747,1538,1593,1703-1710,1729-1736,1738-1744,1794-1800,1859-1872,1882-1888,2138-2144,2150-2160,2239-2419,2424,3161-3199
+pijul-core/src/unrecord/mod.rs
+  s_f36f8f7bce4731::t_b690739b86d82d 321,328-337,892-893,895-904
+pijul-remote/src/lib.rs
+  s_f36f8f7bce4731::t_a5b8eaf6f9ccac 59-323,325-327,329-531,533,537,542-544,562,568,570-571,575-588,592-683,2163-2165
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3201261d050a29123819bfc423a80187bf2c2c5c",
+  "prompts": {},
+  "sessions": {
+    "s_f36f8f7bce4731": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a16d2f-82c4-7631-a77a-2ddc2b5c7556",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
