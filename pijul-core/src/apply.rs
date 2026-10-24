@@ -924,16 +924,13 @@ fn is_forward_reachable<T: GraphTxnT>(
         if budget == 0 {
             return Ok(false);
         }
->>>>>>> 1 [BU576QLH Re-record Pijul code from mixed campaign patches]
-        // Dead vertices order nothing (the alive graph does not have them):
+>>>>>>>        // Dead vertices order nothing (the alive graph does not have them):
         // a path through one does not make the reconnection redundant.
         if w != from && !is_alive(txn, channel, &w)? {
             continue;
         }
-======= 1 [UJXKHV7B repair_zombies: bound the reduction's reachability probes (fix slow apply/clone)]
-        budget -= 1;
-<<<<<<< 1
-        for e in iter_adjacent(
+=======        budget -= 1;
+<<<<<<<        for e in iter_adjacent(
             txn,
             channel,
             w,
@@ -1013,15 +1010,12 @@ fn forward_reachable_within<T: GraphTxnT>(
         if budget == 0 {
             return Ok(());
         }
->>>>>>> 2 [BU576QLH Re-record Pijul code from mixed campaign patches]
-        // As in `is_forward_reachable`, do not go through dead vertices.
+>>>>>>>        // As in `is_forward_reachable`, do not go through dead vertices.
         if v != from && !is_alive(txn, channel, &v)? {
             continue;
         }
-======= 2 [UJXKHV7B repair_zombies: bound the reduction's reachability probes (fix slow apply/clone)]
-        budget -= 1;
-<<<<<<< 2
-        for e in iter_adjacent(
+=======        budget -= 1;
+<<<<<<<        for e in iter_adjacent(
             txn,
             channel,
             v,
@@ -1036,9 +1030,7 @@ fn forward_reachable_within<T: GraphTxnT>(
                     return Ok(());
                 }
             }
->>>>>>> 3 [BU576QLH Re-record Pijul code from mixed campaign patches]
->>>>>>> 4 [BU576QLH Re-record Pijul code from mixed campaign patches]
-        }
+>>>>>>>>>>>>>>        }
     }
     Ok(())
 }
@@ -1078,13 +1070,10 @@ fn alive_exits_through_dead<T: GraphTxnT>(
                 continue;
             }
             stack.push(*txn.find_block(channel, e.dest())?);
-<<<<<<< 4
-======= 3 [UJXKHV7B repair_zombies: bound the reduction's reachability probes (fix slow apply/clone)]
-            if visited.insert(c) {
+<<<<<<<=======            if visited.insert(c) {
                 stack.push(c)
             }
-<<<<<<< 3
-        }
+<<<<<<<        }
     }
     Ok(())
 }
