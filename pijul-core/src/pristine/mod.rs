@@ -2349,11 +2349,7 @@ pub fn del_graph_with_rev<T: GraphMutTxnT>(
         flag -= EdgeFlags::PARENT
     }
     debug!("del_graph_with_rev {:?} {:?} {:?}", flag, k0, k1);
-    let v0 = SerializedEdge::new(flag, k1.change, k1.start, introduced_by);
-    let a = txn.del_graph(graph, &k0, Some(&v0))?;
-    let v1 = SerializedEdge::new(flag | EdgeFlags::PARENT, k0.change, k0.end, introduced_by);
-    let b = txn.del_graph(graph, &k1, Some(&v1))?;
-    Ok(a && b)
+>>>>>>>    Ok(a && b)
 }
 
 pub fn put_graph_with_rev<T: GraphMutTxnT>(
@@ -2611,3 +2607,8 @@ pub fn check_alive_debug<T: GraphIter + ChannelTxnT, C: crate::changestore::Chan
     }
     Ok(())
 }
+=======    let v0 = SerializedEdge::new(flag, k1.change, k1.start, introduced_by);
+    let a = txn.del_graph(graph, &k0, Some(&v0))?;
+    let v1 = SerializedEdge::new(flag | EdgeFlags::PARENT, k0.change, k0.end, introduced_by);
+    let b = txn.del_graph(graph, &k1, Some(&v1))?;
+<<<<<<<

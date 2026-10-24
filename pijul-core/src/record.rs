@@ -71,6 +71,10 @@ pub struct Builder {
     deleted_vertices: Arc<Mutex<HashSet<Position<ChangeId>>>>,
     pub force_rediff: bool,
     pub ignore_missing: bool,
+    /// Record only what the prefix names, not what is below it: for a
+    /// directory, its own name and permissions and the children removed from
+    /// the tree, but none of its descendants.
+    pub shallow: bool,
     pub contents: Arc<Mutex<Vec<u8>>>,
     new_root: Arc<Mutex<Option<NewRoot>>>,
     /// Per-inode `(mtime_ns, size, clean)` observed during this record. `clean`
@@ -182,6 +186,7 @@ impl Default for Builder {
             recorded_inodes: Arc::new(Mutex::new(HashMap::default())),
             force_rediff: false,
             ignore_missing: false,
+            shallow: false,
             deleted_vertices: Arc::new(Mutex::new(HashSet::default())),
             contents: Arc::new(Mutex::new(Vec::new())),
             new_root: Arc::new(Mutex::new(None)),
@@ -1106,6 +1111,9 @@ impl Builder {
             vertex
         };
         let comp = components.next();
+        if comp.is_none() && self.shallow {
+            return Ok(());
+        }
         let full_path = item.full_path.clone();
         let fileid = OwnedPathId {
             parent_inode: item.inode,

@@ -202,8 +202,7 @@ impl ChangeStore for FileSystem {
         key: Vertex<ChangeId>,
         buf: &mut [u8],
     ) -> Result<usize, Self::Error> {
-        debug!("get_contents {:?}", key);
-        if key.end <= key.start || key.is_root() {
+>>>>>>>        if key.end <= key.start || key.is_root() {
             debug!("return 0");
             return Ok(0);
         }
@@ -308,3 +307,5 @@ impl FileSystem {
         Ok(())
     }
 }
+=======        debug!("get_contents {:?}", key);
+<<<<<<<
