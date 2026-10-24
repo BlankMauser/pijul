@@ -20,6 +20,7 @@ include = [
     "src/pin.rs",
     "src/record.rs",
     "src/small_string.rs",
+    "src/squash.rs",
     "src/text_encoding.rs",
     "src/vector2.rs",
     "src/vertex_buffer.rs",

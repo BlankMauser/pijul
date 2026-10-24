@@ -1568,7 +1568,7 @@ const LEVEL: usize = 3;
 #[cfg(feature = "zstd")]
 const FRAME_SIZE: usize = 4096;
 #[cfg(feature = "zstd")]
-fn compress(input: &[u8], w: &mut Vec<u8>) -> Result<(), ChangeError> {
+pub(crate) fn compress(input: &[u8], w: &mut Vec<u8>) -> Result<(), ChangeError> {
     info!(
         "compressing with ZStd {}",
         zstd_seekable::version().to_str().unwrap()
@@ -1682,6 +1682,51 @@ impl Change {
         Ok(hash)
     }
 
+    /// Rebuild a serialized change (`buf`, the whole file) with its unhashed
+    /// part replaced by `unhashed`, leaving the compressed hashed and contents
+    /// sections byte-for-byte untouched.
+    ///
+    /// This is the only safe way to add data outside the hash (e.g. an author
+    /// signature) to an existing change: re-serializing the deserialized
+    /// `hashed` struct is *not* hash-preserving in general — old changes
+    /// carry a chrono-formatted timestamp with trailing fractional zeros that
+    /// jiff drops on re-encoding, and format-4 changes are converted on load —
+    /// so going through `save_change` would silently move the change to a
+    /// new hash. The file's format version is kept as it is, so a format-4
+    /// change still deserializes through the format-4 path afterwards.
+    #[cfg(feature = "zstd")]
+    pub fn replace_unhashed_in_buffer(
+        buf: &[u8],
+        unhashed: Option<&serde_json::Value>,
+    ) -> Result<Vec<u8>, ChangeError> {
+        let mut offsets: Offsets = bincode::deserialize_from(&buf[..Self::OFFSETS_SIZE as usize])?;
+        if offsets.version != VERSION && offsets.version != VERSION_NOENC {
+            return Err(ChangeError::VersionMismatch {
+                got: offsets.version,
+            });
+        }
+        let hashed_comp = &buf[Self::OFFSETS_SIZE as usize..offsets.unhashed_off as usize];
+        let contents_comp = &buf[offsets.contents_off as usize..offsets.total as usize];
+
+        let unhashed: Vec<u8> = match unhashed {
+            Some(un) => serde_json::to_string(un)?.into(),
+            None => Vec::new(),
+        };
+        let mut unhashed_comp = Vec::new();
+        compress(&unhashed, &mut unhashed_comp)?;
+
+        offsets.unhashed_len = unhashed.len() as u64;
+        offsets.contents_off = offsets.unhashed_off + unhashed_comp.len() as u64;
+        offsets.total = offsets.contents_off + contents_comp.len() as u64;
+
+        let mut out = Vec::with_capacity(offsets.total as usize);
+        bincode::serialize_into(&mut out, &offsets)?;
+        out.extend_from_slice(hashed_comp);
+        out.extend_from_slice(&unhashed_comp);
+        out.extend_from_slice(contents_comp);
+        Ok(out)
+    }
+
     /// Deserialise a change from the file given as input `file`.
     #[cfg(feature = "zstd")]
     pub fn check_from_buffer(buf: &[u8], hash: &Hash) -> Result<(), ChangeError> {
@@ -1743,15 +1788,13 @@ impl Change {
     #[cfg(feature = "zstd")]
     pub fn deserialize(file: &str, hash: Option<&Hash>) -> Result<Self, ChangeError> {
         use std::io::Read;
-        let mut r = std::fs::File::open(file)
-            .map_err(|err| {
-                if let Some(h) = hash {
-                    ChangeError::IoHash { err, hash: *h }
-                } else {
-                    ChangeError::Io(err)
-                }
-            })
-            .unwrap();
+        let mut r = std::fs::File::open(file).map_err(|err| {
+            if let Some(h) = hash {
+                ChangeError::IoHash { err, hash: *h }
+            } else {
+                ChangeError::Io(err)
+            }
+        })?;
         let mut buf = vec![0u8; Self::OFFSETS_SIZE as usize];
         r.read_exact(&mut buf)?;
         let offsets: Offsets = bincode::deserialize(&buf)?;

@@ -25,6 +25,7 @@ pub mod pin;
 pub mod pristine;
 pub mod record;
 pub mod small_string;
+pub mod squash;
 mod text_encoding;
 pub mod unrecord;
 mod vector2;
@@ -264,7 +265,39 @@ pub trait MutTxnTExt: pristine::MutTxnT {
             .ok()
             .map(|c| c.replaces_chain())
             .unwrap_or_default();
-        for parent in chain {
+        // A squash replaces several changes. Refuse before unrecording anything
+        // if a change that is not replaced depends on a replaced one: stopping
+        // halfway would leave only part of the lineage unrecorded.
+        {
+            let mut ids = Vec::with_capacity(chain.len());
+            for h in chain.iter() {
+                if let Some(&id) = self.get_internal(&h.into())? {
+                    ids.push(id)
+                }
+            }
+            let channel_ = channel.read();
+            for id in ids.iter() {
+                if self.get_changeset(self.changes(&channel_), id)?.is_none() {
+                    continue;
+                }
+                for x in self.iter_revdep(id)? {
+                    let (p, d) = x?;
+                    if p > id {
+                        break;
+                    }
+                    if !ids.contains(d) && self.get_changeset(self.changes(&channel_), d)?.is_some()
+                    {
+                        return Err(unrecord::UnrecordError::ChangeIsDependedUpon {
+                            change_id: *id,
+                            dependent: *d,
+                        });
+                    }
+                }
+            }
+        }
+        // Most recent first, since squashed changes may depend on each other
+        // (an amend chain has at most one element on a channel).
+        for parent in chain.into_iter().rev() {
             self.mark_superseded(&parent, hash)?;
             let mut touched = unrecord::TouchedInodes::default();
             // A plain unrecord: if `parent` is on the channel it leaves, and the

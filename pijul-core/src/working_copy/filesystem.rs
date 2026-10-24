@@ -397,9 +397,7 @@ impl FileSystem {
     }
 }
 
-impl WorkingCopyRead for FileSystem {
-    type Error = std::io::Error;
-    fn file_metadata(&self, file: &str) -> Result<InodeMetadata, Self::Error> {
+>>>>>>>    fn file_metadata(&self, file: &str) -> Result<InodeMetadata, Self::Error> {
         debug!("metadata {:?}", file);
         let attr = std::fs::metadata(self.path(file))?;
         let permissions = permissions(&attr).unwrap_or(0o700);
@@ -494,8 +492,7 @@ impl WorkingCopy for FileSystem {
         Ok(())
     }
     #[cfg(windows)]
-    fn set_permissions(&self, _name: &str, _permissions: u16) -> Result<(), Self::Error> {
-        Ok(())
+>>>>>>>        Ok(())
     }
 
     type Writer = std::io::BufWriter<std::fs::File>;
@@ -531,3 +528,7 @@ fn permissions(attr: &std::fs::Metadata) -> Option<usize> {
 fn permissions(_: &std::fs::Metadata) -> Option<usize> {
     None
 }
+=======    fn set_permissions(&self, _name: &str, _permissions: u16) -> Result<(), Self::Error> {
+<<<<<<<=======impl WorkingCopyRead for FileSystem {
+    type Error = std::io::Error;
+<<<<<<<

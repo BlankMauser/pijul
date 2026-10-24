@@ -87,9 +87,7 @@ pub trait ChangeStore {
         &self,
         hash: F,
         vertex: Vertex<ChangeId>,
-        buf: &'a mut [u8],
-    ) -> Result<FileMetadata<'a>, Self::Error> {
-        self.get_contents(hash, vertex, buf)?;
+>>>>>>>        self.get_contents(hash, vertex, buf)?;
         Ok(FileMetadata::read(buf))
     }
 }
@@ -142,3 +140,6 @@ impl crate::change::Atom<Option<Hash>> {
         h
     }
 }
+=======        buf: &'a mut [u8],
+    ) -> Result<FileMetadata<'a>, Self::Error> {
+<<<<<<<

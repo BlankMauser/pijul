@@ -57,9 +57,7 @@ fn add_file_test() -> Result<(), anyhow::Error> {
             }
             debug!("end path");
             true
-        })
-        .unwrap();
-
+>>>>>>>
         let mut it = crate::fs::iter_basenames(&txn, &changes, &channel, key).unwrap();
         let (_, _, name) = it.next().unwrap().unwrap();
         assert_eq!(name, "dir");
@@ -910,3 +908,6 @@ fn add_file2_test() -> Result<(), anyhow::Error> {
     assert_eq!(repo.list_files().len(), 8);
     Ok(())
 }
+=======        })
+        .unwrap();
+<<<<<<<

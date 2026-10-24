@@ -332,8 +332,7 @@ where
         if v.introduced_by() == change_id || v.dest().change.is_root() {
             continue;
         }
-        if v.introduced_by().is_root() {
-            continue;
+>>>>>>>            continue;
         }
         let mut not_del_by_change = true;
         for e in iter_adjacent(
@@ -362,3 +361,5 @@ where
     }
     Ok(false)
 }
+=======        if v.introduced_by().is_root() {
+<<<<<<<
