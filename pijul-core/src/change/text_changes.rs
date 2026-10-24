@@ -1119,7 +1119,9 @@ pub trait WriteChangeLine: std::io::Write {
 }
 
 impl WriteChangeLine for &mut Vec<u8> {}
->>>>>>>
+impl WriteChangeLine for &mut std::io::Stderr {}
+impl WriteChangeLine for &mut std::io::Stdout {}
+
 pub fn get_change_contents<C: ChangeStore>(
     changes: &C,
     change: &Atom<Option<Hash>>,
@@ -1196,6 +1198,3 @@ pub fn to_printable_pos_vec(
 ) -> Vec<PrintablePos> {
     pos.iter().map(|c| to_printable_pos(hashes, *c)).collect()
 }
-=======impl WriteChangeLine for &mut std::io::Stderr {}
-impl WriteChangeLine for &mut std::io::Stdout {}
-<<<<<<<

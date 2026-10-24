@@ -128,7 +128,21 @@ fn linear_context_repair() {
         for j in (0..n).rev() {
             writeln!(w, "{}", j).unwrap();
         }
->>>>>>>    debug!("Applying P1");
+    }
+    let p2 = record_all(&repo, &changes, &txn, &channel, "").unwrap();
+
+    {
+        let txn = txn.read();
+        let graph = &channel.read();
+        let mut f = std::fs::File::create("before0").unwrap();
+        crate::pristine::debug(&*txn, &txn.graph(&*graph), &mut f).unwrap();
+
+        let graph = &channel2.read();
+        let mut f = std::fs::File::create("before1").unwrap();
+        crate::pristine::debug(&*txn, &txn.graph(&*graph), &mut f).unwrap();
+    }
+
+    debug!("Applying P1");
     txn.write()
         .apply_change(&changes, &mut *channel.write(), &p1)
         .unwrap();
@@ -173,18 +187,3 @@ fn linear_context_repair() {
     }
     txn.commit().unwrap();
 }
-=======    }
-    let p2 = record_all(&repo, &changes, &txn, &channel, "").unwrap();
-
-    {
-        let txn = txn.read();
-        let graph = &channel.read();
-        let mut f = std::fs::File::create("before0").unwrap();
-        crate::pristine::debug(&*txn, &txn.graph(&*graph), &mut f).unwrap();
-
-        let graph = &channel2.read();
-        let mut f = std::fs::File::create("before1").unwrap();
-        crate::pristine::debug(&*txn, &txn.graph(&*graph), &mut f).unwrap();
-    }
-
-<<<<<<<

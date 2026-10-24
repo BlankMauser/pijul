@@ -193,7 +193,8 @@ fn missing_context_newnodes(alice: Option<&str>) -> Result<(), anyhow::Error> {
         1,
         0,
     )?;
->>>>>>>    repo_bob.read_file("file", &mut buf)?;
+
+    repo_bob.read_file("file", &mut buf)?;
     if alice.is_some() {
         let buf_ = re.replace_all(&buf, &[][..]);
         // The same as on Alice's side: applying the deletion after the
@@ -331,5 +332,3 @@ fn missing_context_newedges() -> Result<(), anyhow::Error> {
 
     Ok(())
 }
-=======
-<<<<<<<

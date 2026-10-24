@@ -61,7 +61,8 @@ fn rollback_conflict_resolution_simple() {
     buf.clear();
     repo.read_file("file", &mut buf).unwrap();
     debug!("{}", std::str::from_utf8(&buf).unwrap());
->>>>>>>
+    let resb = record_all(&mut repo, &changes, &mut txn, &mut channela, "").unwrap();
+
     let mut p_inv = changes.get_change(&resb).unwrap().inverse(
         &resb,
         crate::change::ChangeHeader {
@@ -150,5 +151,3 @@ fn rollback_conflict_resolution_swap() -> Result<(), anyhow::Error> {
 
     Ok(())
 }
-=======    let resb = record_all(&mut repo, &changes, &mut txn, &mut channela, "").unwrap();
-<<<<<<<

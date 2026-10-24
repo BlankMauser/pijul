@@ -196,7 +196,8 @@ impl<'a, 'b, W: std::io::Write> VertexBuffer for ConflictsWriter<'a, 'b, W> {
             changes: Vec::new(),
             id,
         });
->>>>>>>    }
+        self.output_conflict_marker::<C>(START_MARKER, id, None)
+    }
     fn conflict_next<C: ChangeStore>(
         &mut self,
         id_: usize,
@@ -343,5 +344,3 @@ impl<W: std::io::Write> VertexBuffer for Writer<W> {
         self.output_conflict_marker::<C>(START_MARKER, id, None)
     }
 }
-=======        self.output_conflict_marker::<C>(START_MARKER, id, None)
-<<<<<<<

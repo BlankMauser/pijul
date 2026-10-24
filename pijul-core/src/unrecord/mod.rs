@@ -705,67 +705,7 @@ fn collect_zombies<T: GraphTxnT>(
                 ws.stack.push(*txn.find_block(channel, e.dest())?)
             }
             if e.introduced_by() == change_id {
->>>>>>>        }
-    }
-    ws.stack.clear();
-    ws.parents.clear();
-    Ok(())
-}
-
-fn remove_leftover_markings<T: GraphMutTxnT + TreeTxnT>(
-    txn: &mut T,
-    channel: &mut T::Graph,
-    change_id: ChangeId,
-    log: &crate::apply::ZombieRepairLog,
-) -> Result<(), TxnErr<T::GraphError>> {
-    // Drop the leftover DELETED markings still owned by the unrecorded change
-    // (collected for free during `repair_zombies`' DFS — see
-    // [`crate::apply::ZombieRepairLog`]). These are down-context `zombify`
-    // markings, and the plain DELETED ordering edges `put_newedge` adds when
-    // another change re-adds an edge whose context this change deleted: the
-    // atom-anchored removal in `unapply_edges` reaches neither. Leaving them
-    // behind would keep a dangling reference to the change we just unrecorded.
-    // Only this change's edges go: the order they carry is still carried by
-    // the edge the re-adding change put, and an ordering edge of *another*
-    // change survives this unrecord even if it had a parallel edge from this
-    // one.
-    for &(v, w, flag) in log.leftover.iter() {
-        del_graph_with_rev(txn, channel, flag, v, w, change_id)?;
-    }
-    Ok(())
-}
-
-/// Same as crate::apply::collect_missing_contexts, but with the
-/// directions reversed.
-fn collect_missing_contexts<T: GraphMutTxnT + TreeTxnT>(
-    txn: &T,
-    channel: &T::Graph,
-    ws: &mut crate::apply::Workspace,
-    change: &Change,
-    change_id: ChangeId,
-    inodes: &mut HashSet<Position<ChangeId>>,
-) -> Result<(), crate::apply::LocalApplyError<T>> {
-    debug!("collect_missing_contexts");
-    inodes.extend(
-        ws.missing_context
-            .unknown_parents
-            .drain(..)
-            .map(|x| internal_pos(txn, &x.2, change_id).unwrap()),
-    );
-    for atom in change.changes.iter().flat_map(|r| r.iter()) {
-        match atom {
-            // NewVertex is already collected when applying.
-            Atom::NewVertex(_) => {}
-            Atom::EdgeMap(n) => {
-                crate::apply::has_missing_edge_context(
-                    txn, channel, change_id, change, n, inodes, true,
-                )?;
-            }
-        }
-    }
-    Ok(())
-}
-=======                ws.del_edges.push((v, *e))
+                ws.del_edges.push((v, *e))
             } else {
                 // break
             }
@@ -936,4 +876,63 @@ fn collect_zombies_up<T: GraphTxnT>(
                     ws.del_edges.push((v, *e))
                 }
             }
-<<<<<<<
+        }
+    }
+    ws.stack.clear();
+    ws.parents.clear();
+    Ok(())
+}
+
+fn remove_leftover_markings<T: GraphMutTxnT + TreeTxnT>(
+    txn: &mut T,
+    channel: &mut T::Graph,
+    change_id: ChangeId,
+    log: &crate::apply::ZombieRepairLog,
+) -> Result<(), TxnErr<T::GraphError>> {
+    // Drop the leftover DELETED markings still owned by the unrecorded change
+    // (collected for free during `repair_zombies`' DFS — see
+    // [`crate::apply::ZombieRepairLog`]). These are down-context `zombify`
+    // markings, and the plain DELETED ordering edges `put_newedge` adds when
+    // another change re-adds an edge whose context this change deleted: the
+    // atom-anchored removal in `unapply_edges` reaches neither. Leaving them
+    // behind would keep a dangling reference to the change we just unrecorded.
+    // Only this change's edges go: the order they carry is still carried by
+    // the edge the re-adding change put, and an ordering edge of *another*
+    // change survives this unrecord even if it had a parallel edge from this
+    // one.
+    for &(v, w, flag) in log.leftover.iter() {
+        del_graph_with_rev(txn, channel, flag, v, w, change_id)?;
+    }
+    Ok(())
+}
+
+/// Same as crate::apply::collect_missing_contexts, but with the
+/// directions reversed.
+fn collect_missing_contexts<T: GraphMutTxnT + TreeTxnT>(
+    txn: &T,
+    channel: &T::Graph,
+    ws: &mut crate::apply::Workspace,
+    change: &Change,
+    change_id: ChangeId,
+    inodes: &mut HashSet<Position<ChangeId>>,
+) -> Result<(), crate::apply::LocalApplyError<T>> {
+    debug!("collect_missing_contexts");
+    inodes.extend(
+        ws.missing_context
+            .unknown_parents
+            .drain(..)
+            .map(|x| internal_pos(txn, &x.2, change_id).unwrap()),
+    );
+    for atom in change.changes.iter().flat_map(|r| r.iter()) {
+        match atom {
+            // NewVertex is already collected when applying.
+            Atom::NewVertex(_) => {}
+            Atom::EdgeMap(n) => {
+                crate::apply::has_missing_edge_context(
+                    txn, channel, change_id, change, n, inodes, true,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
