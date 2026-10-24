@@ -90,6 +90,24 @@ where
             }
         }
 
+        if !n.flag.contains(EdgeFlags::DELETED) && !is_alive(txn, graph, &target)? {
+            // Removing `n.previous` took away `target`'s last alive parent: this
+            // happens when *unrecording* an edge the change had introduced alive
+            // (`previous == flag == BLOCK`, reversed to itself), whose target the
+            // unrecord does not reintroduce. `target` is now dead, so the pseudo
+            // edges still pointing at it are obsolete — collect them for
+            // `clean_obsolete_pseudo_edges`, exactly as the DELETED branch above
+            // does for a deletion. Leaving them would make `target` a
+            // "pseudo-only" vertex: dead, yet still reachable through a pseudo
+            // edge. The alive vertices below it are reconnected afterwards by
+            // `repair_zombies`, which runs on the inodes that cleanup returns.
+            debug_assert!(ws.children.is_empty());
+            debug_assert!(ws.parents.is_empty());
+            collect_pseudo_edges(txn, graph, ws, inode, target)?;
+            ws.children.clear();
+            ws.parents.clear();
+        }
+
         if target.end >= n.to.end {
             debug!("{:?} {:?}", target, n.to);
             debug_assert_eq!(target.end, n.to.end);
@@ -129,10 +147,13 @@ where
     K: FnMut(&Hash) -> bool,
 {
     // Iter through deleted parents of the edge's source. Any unknown
-    // edge points towards a zombie.
+    // edge points towards a zombie. The zombie mark is a deletion by the
+    // same change as that edge's: marking it as introduced by the parent
+    // vertex's change instead would leave it behind when unrecording that
+    // change, which never deleted anything there.
     for v in iter_deleted_parents(txn, graph, source)? {
         let v = v?;
-        let intro = v.dest().change;
+        let intro = v.introduced_by();
         if !known(&txn.get_external(&intro).optional()?.unwrap().into()) {
             zombies.push(intro)
         }
@@ -146,7 +167,7 @@ where
         }
         for v in iter_deleted_parents(txn, graph, target)? {
             let v = v?;
-            let intro = v.dest().change;
+            let intro = v.introduced_by();
             debug!("known {:?} ?", intro);
             if !known(&txn.get_external(&intro).optional()?.unwrap().into()) {
                 zombies.push(intro)
@@ -415,16 +436,18 @@ fn zombify<T: GraphMutTxnT>(
                 break;
             }
         }
-        // Zombify the first chunk of the split.
-        for parent in iter_adjacent(
-            txn,
-            channel,
-            v,
-            EdgeFlags::PARENT,
-            EdgeFlags::all() - EdgeFlags::DELETED,
-        )? {
+        // Zombify the first chunk of the split, through its deleted
+        // parents too: if another patch already deleted `v`, applying
+        // that deletion after this one would have kept our marks, so
+        // they must be there in this order as well (else unrecording
+        // the other deletion leaves `v` alive instead of a zombie).
+        for parent in iter_adjacent(txn, channel, v, EdgeFlags::PARENT, EdgeFlags::all())? {
             let parent = parent?;
-            if !parent.flag().contains(EdgeFlags::PSEUDO) {
+            // The flag range also covers DELETED child edges (DELETED > PARENT).
+            if parent.flag().contains(EdgeFlags::PARENT)
+                && !parent.flag().contains(EdgeFlags::PSEUDO)
+                && parent.introduced_by() != change_id
+            {
                 ws.parents.insert(*parent);
             }
         }

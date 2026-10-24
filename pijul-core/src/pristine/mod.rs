@@ -1508,6 +1508,78 @@ pub fn check_alive<T: ChannelTxnT + GraphIter>(
     (alive_unreachable, reachable_pseudo)
 }
 
+/// A pseudo-edge is a shortcut over a region of dead vertices: for every
+/// alive pseudo-edge `a -> b` there must be a path `a -> x1 -> … -> xk -> b`
+/// (`k >= 1`) of non-pseudo edges whose intermediate vertices `xi` are all
+/// dead. Returns the pseudo-edges that have no such path, i.e. the ones that
+/// constrain the order of the graph without any real edge to back them.
+pub fn check_pseudo_justified<T: ChannelTxnT + GraphIter>(
+    txn: &T,
+    channel: &T::Graph,
+) -> Vec<(Vertex<ChangeId>, Vertex<ChangeId>)> {
+    let mut unjustified = Vec::new();
+    let mut cursor = txn.graph_cursor(channel, None).unwrap();
+    let mut stack = Vec::new();
+    let mut visited = HashSet::default();
+    while let Some(x) = txn.next_graph(channel, &mut cursor) {
+        let (&a, &v) = x.unwrap();
+        let flag = v.flag();
+        if flag.contains(EdgeFlags::PARENT)
+            || flag.contains(EdgeFlags::FOLDER)
+            || flag.contains(EdgeFlags::DELETED)
+            || !flag.contains(EdgeFlags::PSEUDO)
+        {
+            continue;
+        }
+        let b = *txn.find_block(channel, v.dest()).unwrap();
+        if !pseudo_edge_justified(txn, channel, a, b, &mut stack, &mut visited).unwrap() {
+            unjustified.push((a, b))
+        }
+    }
+    unjustified
+}
+
+/// Is the pseudo-edge `a -> b` backed by a path of non-pseudo edges whose
+/// intermediate vertices are all dead? See [`check_pseudo_justified`].
+pub(crate) fn pseudo_edge_justified<T: GraphTxnT>(
+    txn: &T,
+    channel: &T::Graph,
+    a: Vertex<ChangeId>,
+    b: Vertex<ChangeId>,
+    stack: &mut Vec<Vertex<ChangeId>>,
+    visited: &mut HashSet<Vertex<ChangeId>>,
+) -> Result<bool, BlockError<T::GraphError>> {
+    stack.clear();
+    stack.push(a);
+    visited.clear();
+    visited.insert(a);
+    while let Some(x) = stack.pop() {
+        for e in iter_adjacent(
+            txn,
+            channel,
+            x,
+            EdgeFlags::empty(),
+            EdgeFlags::all() - EdgeFlags::PARENT,
+        )? {
+            let e = e?;
+            if e.flag().contains(EdgeFlags::PARENT)
+                || e.flag().contains(EdgeFlags::FOLDER)
+                || e.flag().contains(EdgeFlags::PSEUDO)
+            {
+                continue;
+            }
+            let c = *txn.find_block(channel, e.dest())?;
+            if c == b {
+                return Ok(true);
+            }
+            if !is_alive(txn, channel, &c)? && visited.insert(c) {
+                stack.push(c)
+            }
+        }
+    }
+    Ok(false)
+}
+
 fn find_file<T: GraphTxnT>(
     txn: &T,
     channel: &T::Graph,
@@ -2131,6 +2203,17 @@ pub trait MutTxnT:
         pred: &Hash,
         succ: &Hash,
     ) -> Result<(), TxnErr<Self::GraphError>>;
+
+    /// Set the working-copy tables (`tree`, `revtree`, `inodes`, `revinodes`)
+    /// aside and replace them with fresh, empty ones. Everything that goes
+    /// through these tables (output, record, unrecord, local apply) then acts on
+    /// a throwaway view of the repository, leaving the real working copy's
+    /// tables untouched. Used by [`crate::squash`]. Not reentrant.
+    fn begin_scratch_tree(&mut self) -> Result<(), TxnErr<Self::GraphError>>;
+
+    /// Drop the scratch tables created by [`Self::begin_scratch_tree`] and
+    /// restore the real ones. No-op if no scratch tree is active.
+    fn end_scratch_tree(&mut self) -> Result<(), TxnErr<Self::GraphError>>;
 
     /// Open a channel, creating it if it is missing. The return type
     /// is a `Rc<RefCell<…>>` in order to avoid:

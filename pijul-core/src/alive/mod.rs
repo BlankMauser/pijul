@@ -19,8 +19,23 @@ pub struct AliveVertex {
     lowlink: usize,
     pub scc: usize,
     pub extra: Vec<(Option<SerializedEdge>, VertexId)>,
+    /// The change that deleted this vertex's context, when it is a zombie: the
+    /// output groups the lines inserted next to it, by changes unaware of that
+    /// one, into a single conflict.
+    pub zombie_by: Option<ChangeId>,
 }
 
+/// A pseudo-edge the conflict DFS found redundant: another path of the alive
+/// graph already carries its order, so the rendering ignores it.
+///
+/// It is *not* deleted from the channel. Which edges land here depends on the
+/// DFS order, hence on the graph at the time of the walk, so deleting them
+/// would make a channel's graph depend on when it happened to be output rather
+/// than on its changes alone — and a shortcut dropped while an alive vertex
+/// still crossed the dead region it spans never comes back once that vertex
+/// dies. The only caller that still prunes is
+/// [`retrieve::remove_forward_edges`], which unrecord runs before taking a
+/// vertex out of the graph.
 pub struct Redundant {
     pub(crate) v: Vertex<ChangeId>,
     pub(crate) e: SerializedEdge,
@@ -52,6 +67,7 @@ impl AliveVertex {
         lowlink: 0,
         scc: 0,
         extra: Vec::new(),
+        zombie_by: None,
     };
 
     pub fn new(vertex: Vertex<ChangeId>) -> Self {
@@ -64,6 +80,7 @@ impl AliveVertex {
             lowlink: 0,
             scc: 0,
             extra: Vec::new(),
+            zombie_by: None,
         }
     }
 }
@@ -110,6 +127,32 @@ impl Graph {
         self.children[line.children..line.children + line.n_children]
             .iter()
             .chain(self[i].extra.iter())
+    }
+
+    /// Replace these edges with the terminator every vertex already has, which
+    /// leads to the dummy sink: the graph then looks like the one the pristine
+    /// will have once they are deleted from it.
+    pub(crate) fn drop_edges(&mut self, edges: &[Redundant]) {
+        let mut by_source: HashMap<Vertex<ChangeId>, HashSet<SerializedEdge>> = HashMap::default();
+        for ve in edges.iter() {
+            by_source.entry(ve.v).or_default().insert(ve.e);
+        }
+        for i in 0..self.lines.len() {
+            let Some(es) = by_source.get(&self.lines[i].vertex) else {
+                continue;
+            };
+            let (children, n_children) = (self.lines[i].children, self.lines[i].n_children);
+            for j in children..children + n_children {
+                if matches!(self.children[j].0, Some(e) if es.contains(&e)) {
+                    self.children[j] = (None, VertexId::DUMMY)
+                }
+            }
+            for c in self.lines[i].extra.iter_mut() {
+                if matches!(c.0, Some(e) if es.contains(&e)) {
+                    *c = (None, VertexId::DUMMY)
+                }
+            }
+        }
     }
 
     fn child(&self, i: VertexId, j: usize) -> &(Option<SerializedEdge>, VertexId) {

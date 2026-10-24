@@ -22,6 +22,9 @@ mod record_reads;
 mod replaces;
 mod rm_file;
 mod rollback;
+mod squash;
+mod squash_conflicts;
+mod squash_fuzz;
 mod sub_root;
 mod text;
 mod text_changes;
@@ -40,6 +43,11 @@ thread_local! {
 /// seeds are scheduled across threads.
 pub(crate) fn fuzz_clock_set(base: i64) {
     FUZZ_CLOCK.with(|c| c.set(Some(base)));
+}
+
+/// Stop using the calling thread's deterministic clock (see [`fuzz_clock_set`]).
+pub(crate) fn fuzz_clock_clear() {
+    FUZZ_CLOCK.with(|c| c.set(None));
 }
 
 fn record_all_change<
@@ -118,8 +126,15 @@ where
             // global) and reset per seed by `fuzz_clock_set`, so a *parallel*
             // fuzzer run is still reproducible per seed — thread interleaving
             // can't perturb a given seed's timestamps.
-            timestamp: if let Ok(t) = std::env::var("FUZZ_FIXED_TIME") {
-                let base: i64 = t.parse().unwrap_or(0);
+            // A clock set with `fuzz_clock_set` is used even without the variable.
+            timestamp: if let (Ok(_), _) | (_, Some(_)) = (
+                std::env::var("FUZZ_FIXED_TIME"),
+                FUZZ_CLOCK.with(|c| c.get()),
+            ) {
+                let base: i64 = std::env::var("FUZZ_FIXED_TIME")
+                    .ok()
+                    .and_then(|t| t.parse().ok())
+                    .unwrap_or(0);
                 let n = FUZZ_CLOCK.with(|c| {
                     let v = c.get().unwrap_or(base);
                     c.set(Some(v + 1));

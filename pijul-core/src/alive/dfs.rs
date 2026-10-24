@@ -81,6 +81,7 @@ fn test4165() {
                     end: ChangePosition(1u64.into())
                 },
                 flags: super::Flags::empty(),
+                zombie_by: None,
                 children: 0,
                 n_children: 0,
                 index: 0,

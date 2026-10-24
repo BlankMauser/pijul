@@ -318,13 +318,23 @@ fn unapply<
         change_id,
         &mut inodes,
     )?;
-    for i in inodes {
+    for &i in inodes.iter() {
         debug!("inodes: repair zombie {:?}", i);
         let mut log = crate::apply::ZombieRepairLog::default();
         crate::apply::repair_zombies(txn, T::graph_mut(channel), i, Some((&mut log, change_id)))?;
         remove_leftover_markings(txn, T::graph_mut(channel), change_id, &log)?;
     }
     crate::apply::repair_cyclic_paths(txn, T::graph_mut(channel), &mut ws.apply)?;
+    // Sweep every file this unrecord touched: taking edges away can leave a
+    // pseudo-edge bridging over a region that is not dead any more.
+    for (change_id_, inode) in touched_inodes.iter() {
+        if *change_id_ == change_id
+            && let Ok(i) = internal_pos(txn, inode, change_id)
+        {
+            inodes.insert(i);
+        }
+    }
+    crate::apply::clean_unjustified_pseudo_edges(txn, T::graph_mut(channel), &inodes)?;
     debug!("unapply done");
     Ok(())
 }
@@ -879,21 +889,19 @@ fn remove_leftover_markings<T: GraphMutTxnT + TreeTxnT>(
     change_id: ChangeId,
     log: &crate::apply::ZombieRepairLog,
 ) -> Result<(), TxnErr<T::GraphError>> {
-    // Drop the leftover DELETED|BLOCK markings still owned by the unrecorded
-    // change (collected for free during `repair_zombies`' DFS — see
+    // Drop the leftover DELETED markings still owned by the unrecorded change
+    // (collected for free during `repair_zombies`' DFS — see
     // [`crate::apply::ZombieRepairLog`]). These are down-context `zombify`
-    // markings the atom-anchored removal in `unapply_edges` can't reach;
-    // leaving them behind would keep a dangling reference to the change we just
-    // unrecorded.
-    for &(v, w) in log.leftover.iter() {
-        del_graph_with_rev(
-            txn,
-            channel,
-            EdgeFlags::DELETED | EdgeFlags::BLOCK,
-            v,
-            w,
-            change_id,
-        )?;
+    // markings, and the plain DELETED ordering edges `put_newedge` adds when
+    // another change re-adds an edge whose context this change deleted: the
+    // atom-anchored removal in `unapply_edges` reaches neither. Leaving them
+    // behind would keep a dangling reference to the change we just unrecorded.
+    // Only this change's edges go: the order they carry is still carried by
+    // the edge the re-adding change put, and an ordering edge of *another*
+    // change survives this unrecord even if it had a parallel edge from this
+    // one.
+    for &(v, w, flag) in log.leftover.iter() {
+        del_graph_with_rev(txn, channel, flag, v, w, change_id)?;
     }
     Ok(())
 }

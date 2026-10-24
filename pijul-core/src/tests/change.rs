@@ -207,3 +207,87 @@ fn text_test<C: ChangeStore>(c: &C, change0: &Change, h: Hash) {
     }
     assert_eq!(change0, &change1);
 }
+
+/// Replacing the unhashed section of a serialized change keeps its hash and
+/// contents intact — including when the parsed change would *not* re-encode
+/// to the same bytes (here: a chrono-style timestamp with nine fractional
+/// digits, which jiff trims on re-serialization), so `save_change` would
+/// have moved the change to a new hash.
+#[test]
+fn replace_unhashed_keeps_hash() -> Result<(), anyhow::Error> {
+    env_logger::try_init().unwrap_or(());
+    let mut change = Change::default();
+    change.hashed.header.message = "hello".to_string();
+    change.hashed.header.timestamp = jiff::Timestamp::from_second(1628083743)?;
+    change.contents = b"contents".to_vec();
+    let mut hasher = crate::pristine::Hasher::default();
+    hasher.update(&change.contents);
+    change.hashed.contents_hash = hasher.finish();
+
+    // Hand-craft the hashed bytes with the timestamp as older versions of
+    // pijul wrote it (bincode: u64 length prefix, then the string).
+    let mut hashed = bincode::serialize(&change.hashed)?;
+    let canon = change.hashed.header.timestamp.to_string();
+    assert_eq!(canon, "2021-08-04T13:29:03Z");
+    let noncanon = "2021-08-04T13:29:03.000000000Z";
+    let pos = hashed
+        .windows(canon.len())
+        .position(|w| w == canon.as_bytes())
+        .unwrap();
+    hashed.splice(pos..pos + canon.len(), noncanon.bytes());
+    hashed.splice(pos - 8..pos, (noncanon.len() as u64).to_le_bytes());
+    let mut hasher = crate::pristine::Hasher::default();
+    hasher.update(&hashed);
+    let hash = hasher.finish();
+    assert_ne!(hash, change.hash()?);
+
+    // Lay the file out as `serialize` does: offsets, then the three
+    // compressed sections.
+    let mut hashed_comp = Vec::new();
+    compress(&hashed, &mut hashed_comp)?;
+    // (an absent unhashed part is still a compressed empty section)
+    let mut unhashed_comp = Vec::new();
+    compress(&[], &mut unhashed_comp)?;
+    let mut contents_comp = Vec::new();
+    compress(&change.contents, &mut contents_comp)?;
+    let unhashed_off = Change::OFFSETS_SIZE + hashed_comp.len() as u64;
+    let contents_off = unhashed_off + unhashed_comp.len() as u64;
+    let offsets = Offsets {
+        version: VERSION,
+        hashed_len: hashed.len() as u64,
+        unhashed_off,
+        unhashed_len: 0,
+        contents_off,
+        contents_len: change.contents.len() as u64,
+        total: contents_off + contents_comp.len() as u64,
+    };
+    let mut buf = bincode::serialize(&offsets)?;
+    buf.extend_from_slice(&hashed_comp);
+    buf.extend_from_slice(&unhashed_comp);
+    buf.extend_from_slice(&contents_comp);
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("c.change");
+    let path = path.to_str().unwrap();
+    std::fs::write(path, &buf)?;
+    let back = Change::deserialize(path, Some(&hash))?;
+    assert_eq!(back.unhashed, None);
+    assert_eq!(back.hashed, change.hashed);
+    // The parsed change does not reproduce the file's hash: this is the case
+    // an in-place signature must survive.
+    assert_ne!(back.hash()?, hash);
+
+    let sig = serde_json::json!({ "signature": "sig" });
+    let signed = Change::replace_unhashed_in_buffer(&buf, Some(&sig))?;
+    Change::check_from_buffer(&signed, &hash)?;
+    std::fs::write(path, &signed)?;
+    let back = Change::deserialize(path, Some(&hash))?;
+    assert_eq!(back.unhashed, Some(sig));
+    assert_eq!(back.hashed, change.hashed);
+    assert_eq!(back.contents, change.contents);
+
+    // Removing it again restores the original bytes exactly.
+    let unsigned = Change::replace_unhashed_in_buffer(&signed, None)?;
+    assert_eq!(unsigned, buf);
+    Ok(())
+}

@@ -21,6 +21,9 @@ pub static DEFAULT_SEPARATOR: LazyLock<regex::bytes::Regex> =
 #[derive(Clone, Copy)]
 struct Line<'a> {
     l: &'a [u8],
+    /// Only set on old lines: lines of a cyclic conflict, and conflict markers
+    /// that must not be matched (see [`incoherent_markers`]). Such a line never
+    /// equals a new line.
     cyclic: bool,
     before_end_marker: bool,
     last: bool,
@@ -147,6 +150,7 @@ fn compute_diff_lines<'a>(
     b: &'a [u8],
     encoding: &Option<Encoding>,
     separator: &'a regex::bytes::Regex,
+    unmatchable: &[usize],
 ) -> (Vec<Line<'a>>, Vec<Line<'a>>) {
     // TODO pass through both encodings and use that to decide
     if encoding.is_none() {
@@ -157,8 +161,75 @@ fn compute_diff_lines<'a>(
         debug!("bb = {:?}", bb);
         (old, new)
     } else {
-        (make_old_lines(d, separator), make_new_lines(b, separator))
+        let mut old = make_old_lines(d, separator);
+        for &i in unmatchable {
+            old[i].cyclic = true
+        }
+        (old, make_new_lines(b, separator))
     }
+}
+
+/// The conflict markers of the old lines: `(line, whether it is the first or
+/// last marker of its conflict, conflict)`.
+fn marker_lines(d: &vertex_buffer::Diff, lines_a: &[Line]) -> Vec<(usize, bool, usize)> {
+    if d.marker.is_empty() || lines_a.is_empty() {
+        return Vec::new();
+    }
+    let start = lines_a[0].l.as_ptr() as usize;
+    let mut markers: Vec<(usize, bool, usize)> = Vec::new();
+    for v in d.pos_a.iter() {
+        // Several vertices may share a position (empty vertices, the root
+        // before a first marker): the marker is the last root there.
+        let Some(marker) = d.marker.get(&v.pos) else {
+            continue;
+        };
+        if !v.vertex.is_root() {
+            continue;
+        }
+        let Ok(line) = lines_a.binary_search_by(|l| (l.l.as_ptr() as usize - start).cmp(&v.pos))
+        else {
+            continue;
+        };
+        let is_end_or_begin = *marker != vertex_buffer::ConflictMarker::Next;
+        match markers.last_mut() {
+            Some(last) if last.0 == line => *last = (line, is_end_or_begin, v.conflict),
+            _ => markers.push((line, is_end_or_begin, v.conflict)),
+        }
+    }
+    markers
+}
+
+/// Conflict markers matched by `dd` although their conflict is not kept: a
+/// conflict stays in the new version only if both its first and last markers
+/// are matched. A line of the new version equal to a single marker of a
+/// conflict that is otherwise gone is content, not that marker: recording it as
+/// the marker would drop it. Adds these lines to `unmatchable`, returns whether
+/// there were any.
+fn incoherent_markers(
+    markers: &[(usize, bool, usize)],
+    dd: &algorithm::D,
+    unmatchable: &mut Vec<usize>,
+) -> bool {
+    let is_matched = |line: usize| {
+        // `dd` is sorted by `old`.
+        let i = dd.r.partition_point(|r| r.old + r.old_len <= line);
+        i >= dd.r.len() || dd.r[i].old > line || dd.r[i].old_len == 0
+    };
+    let mut kept: crate::HashMap<usize, bool> = crate::HashMap::default();
+    for &(line, is_end_or_begin, conflict) in markers {
+        if is_end_or_begin {
+            let k = kept.entry(conflict).or_insert(true);
+            *k = *k && is_matched(line)
+        }
+    }
+    let n = unmatchable.len();
+    for &(line, _, conflict) in markers {
+        if !kept.get(&conflict).unwrap_or(&true) && is_matched(line) && !unmatchable.contains(&line)
+        {
+            unmatchable.push(line)
+        }
+    }
+    unmatchable.len() > n
 }
 
 /// The read-only result of [`Recorded::diff_prepare`]: everything needed to
@@ -170,6 +241,8 @@ pub(crate) struct DiffPlan {
     dd: algorithm::D,
     b: Vec<u8>,
     encoding: Option<Encoding>,
+    /// Old lines that must not be matched, see [`incoherent_markers`].
+    unmatchable: Vec<usize>,
 }
 
 impl Recorded {
@@ -197,8 +270,10 @@ impl Recorded {
         self.largest_file = self.largest_file.max(b.len() as u64);
         let mut d = vertex_buffer::Diff::new(inode, path, a);
         output_graph(changes, txn, channel, &mut d, a, &mut self.redundant)?;
-        let dd = {
-            let (lines_a, lines_b) = compute_diff_lines(&d, &b, &encoding, separator);
+        let mut unmatchable = Vec::new();
+        let mut markers = None;
+        let dd = loop {
+            let (lines_a, lines_b) = compute_diff_lines(&d, &b, &encoding, separator, &unmatchable);
             trace!("pos = {:?}", d.pos_a);
             if log::log_enabled!(log::Level::Trace) {
                 for l in lines_a.iter() {
@@ -208,9 +283,26 @@ impl Recorded {
                     trace!("b: {:?}", l)
                 }
             }
-            algorithm::diff(&lines_a, &lines_b, algorithm, stop_early)
+            let dd = algorithm::diff(&lines_a, &lines_b, algorithm, stop_early);
+            // With `stop_early`, `dd` is incomplete, but only tells whether the
+            // file changed, which unmatching markers does not change.
+            if stop_early || encoding.is_none() {
+                break dd;
+            }
+            let markers = markers.get_or_insert_with(|| marker_lines(&d, &lines_a));
+            // Each round unmatches at least one more marker.
+            if !incoherent_markers(markers, &dd, &mut unmatchable) {
+                break dd;
+            }
+            debug!("unmatchable markers: {:?}", unmatchable);
         };
-        Ok(DiffPlan { d, dd, b, encoding })
+        Ok(DiffPlan {
+            d,
+            dd,
+            b,
+            encoding,
+            unmatchable,
+        })
     }
 
     /// Write-only half of [`Recorded::diff`]: replay a [`DiffPlan`] (from
@@ -226,11 +318,15 @@ impl Recorded {
         separator: &regex::bytes::Regex,
     ) -> Result<(), DiffError<P::Error, T>> {
         let DiffPlan {
-            d, dd, b, encoding, ..
+            d,
+            dd,
+            b,
+            encoding,
+            unmatchable,
         } = plan;
         let txn = txn.read();
         let channel = channel.read();
-        let (lines_a, lines_b) = compute_diff_lines(d, b, encoding, separator);
+        let (lines_a, lines_b) = compute_diff_lines(d, b, encoding, separator, unmatchable);
         let mut conflict_contexts = replace::ConflictContexts::new();
         for r in 0..dd.len() {
             if dd[r].old_len > 0 {

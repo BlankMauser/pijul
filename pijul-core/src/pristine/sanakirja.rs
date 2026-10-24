@@ -196,6 +196,7 @@ impl Pristine {
                 remotes: txn.root_db(Root::Remotes as usize)?,
                 // Absent on a pre-feature pristine: `None`, not an error.
                 superseded: txn.root_db(Root::Superseded as usize),
+                scratch_tree: None,
                 open_channels: Mutex::new(HashMap::default()),
                 open_remotes: Mutex::new(HashMap::default()),
                 txn,
@@ -325,6 +326,7 @@ impl Pristine {
                 // Created lazily by `mark_superseded`, so a repo that never amends
                 // never grows the table.
                 superseded: txn.root_db(Root::Superseded as usize),
+                scratch_tree: None,
                 open_channels: Mutex::new(HashMap::default()),
                 open_remotes: Mutex::new(HashMap::default()),
                 txn,
@@ -389,6 +391,16 @@ pub struct GenericTxn<T: ::sanakirja::LoadPage<Error = ::sanakirja::Error> + ::s
     // Obsolescence markers: superseded change -> its amend. `None` when the repo
     // predates the feature; created lazily by the first `mark_superseded`.
     superseded: Option<UDb<SerializedHash, SerializedHash>>,
+
+    // The real working-copy tables, set aside while a scratch tree is active
+    // (see `MutTxnT::begin_scratch_tree`).
+    #[allow(clippy::type_complexity)]
+    scratch_tree: Option<(
+        UDb<PathId, Inode>,
+        UDb<Inode, PathId>,
+        Db<Inode, SerializedInode>,
+        Db<Position<ChangeId>, Inode>,
+    )>,
 
     pub(crate) open_channels: Mutex<HashMap<SmallString, ChannelRef<Self>>>,
     open_remotes: Mutex<HashMap<RemoteId, RemoteRef<Self>>>,
@@ -597,24 +609,32 @@ impl std::convert::From<BlockError<::sanakirja::Error>> for BlockError<Sanakirja
 }
 
 #[doc(hidden)]
-pub fn next_adj<'a, T>(txn: &'a T, a: &mut Adj) -> Option<Result<&'a SerializedEdge, T::Error>>
+pub fn next_adj<'a, T: ::sanakirja::LoadPage>(
+    txn: &'a T,
+    a: &mut Adj,
+) -> Option<Result<&'a SerializedEdge, T::Error>>
 where
-    T: sanakirja::LoadPage,
     T::Error: std::error::Error,
 {
     loop {
-        match a.cursor.next(txn).transpose()? {
-            Err(error) => return Some(Err(error)),
-            Ok((vertex, edge)) => {
-                if *vertex == a.key && edge.flag() >= a.min_flag && edge.flag() <= a.max_flag {
-                    return Some(Ok(edge));
-                }
-                if *vertex == a.key && edge.flag() >= a.min_flag && edge.flag() > a.max_flag {
+        let x: Result<Option<(&Vertex<ChangeId>, &SerializedEdge)>, _> = a.cursor.next(txn);
+        match x {
+            Ok(Some((v, e))) => {
+                if *v == a.key {
+                    if e.flag() >= a.min_flag {
+                        if e.flag() <= a.max_flag {
+                            return Some(Ok(e));
+                        } else {
+                            return None;
+                        }
+                    }
+                } else if *v > a.key {
                     return None;
                 }
-                if *vertex > a.key {
-                    return None;
-                }
+            }
+            Err(e) => return Some(Err(e)),
+            Ok(None) => {
+                return None;
             }
         }
     }
@@ -2232,6 +2252,42 @@ impl<T: RawMutTxnT> MutTxnT for MutTxn<T> {
         Ok(())
     }
 
+    fn begin_scratch_tree(&mut self) -> Result<(), TxnErr<Self::GraphError>> {
+        assert!(self.scratch_tree.is_none(), "scratch tree already active");
+        let (tree, revtree, inodes, revinodes) = unsafe {
+            (
+                btree::create_db_(&mut self.txn)?,
+                btree::create_db_(&mut self.txn)?,
+                btree::create_db_(&mut self.txn)?,
+                btree::create_db_(&mut self.txn)?,
+            )
+        };
+        self.scratch_tree = Some((
+            std::mem::replace(&mut self.tree, tree),
+            std::mem::replace(&mut self.revtree, revtree),
+            std::mem::replace(&mut self.inodes, inodes),
+            std::mem::replace(&mut self.revinodes, revinodes),
+        ));
+        Ok(())
+    }
+
+    fn end_scratch_tree(&mut self) -> Result<(), TxnErr<Self::GraphError>> {
+        if let Some((tree, revtree, inodes, revinodes)) = self.scratch_tree.take() {
+            let tree = std::mem::replace(&mut self.tree, tree);
+            let revtree = std::mem::replace(&mut self.revtree, revtree);
+            let inodes = std::mem::replace(&mut self.inodes, inodes);
+            let revinodes = std::mem::replace(&mut self.revinodes, revinodes);
+            // The scratch tables are only referenced from here.
+            unsafe {
+                btree::drop(&mut self.txn, tree)?;
+                btree::drop(&mut self.txn, revtree)?;
+                btree::drop(&mut self.txn, inodes)?;
+                btree::drop(&mut self.txn, revinodes)?;
+            }
+        }
+        Ok(())
+    }
+
     fn put_remote(
         &mut self,
         remote: &mut RemoteRef<Self>,
@@ -2575,6 +2631,8 @@ impl<T: RawMutTxnT> MutTxnT for MutTxn<T> {
 
     fn commit(mut self) -> Result<(), Self::GraphError> {
         use std::ops::DerefMut;
+        // Never persist a scratch tree in place of the real one.
+        self.end_scratch_tree().map_err(|e| e.0)?;
         {
             let open_channels = std::mem::take(self.open_channels.lock().deref_mut());
             for (name, channel) in open_channels {
