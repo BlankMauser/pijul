@@ -291,6 +291,10 @@ enum State {
         final_path: PathBuf,
         hashes: Vec<CS>,
         current: usize,
+        /// No more hashes will be requested. Until then, having received
+        /// every requested change doesn't mean we're done: a missing
+        /// dependency of the last one may still be asked for.
+        closed: bool,
     },
     Changelist {
         sender: tokio::sync::mpsc::Sender<Option<super::ListLine>>,
@@ -476,6 +480,7 @@ impl thrussh::client::Handler for SshClient {
                     ref mut final_path,
                     ref hashes,
                     ref mut current,
+                    closed,
                 } => {
                     trace!("state changes");
                     let mut p = 0;
@@ -525,15 +530,15 @@ impl thrussh::client::Handler for SshClient {
                             }
                             debug!("sent");
                             *current += 1;
-                            if *current < hashes.len() {
-                                // If we're still waiting for another
-                                // change.
-                                *file = std::fs::File::create(&path)?;
-                            } else {
-                                // Else, just finish.
+                            if *current >= hashes.len() && closed {
+                                // Nothing more will be asked, just finish.
                                 debug!("dropping channel");
                                 std::mem::drop(sender.take());
                                 break;
+                            } else {
+                                // We're still waiting for another
+                                // change, or might be asked for one.
+                                *file = std::fs::File::create(&path)?;
                             }
                         } else {
                             // not enough data, we need more.
@@ -1026,6 +1031,7 @@ impl Ssh {
             file,
             hashes: Vec::new(),
             current: 0,
+            closed: false,
         };
         self.run_protocol().await?;
         let mut sender = sender.map(|x| x.clone());
@@ -1066,7 +1072,19 @@ impl Ssh {
         }
         if !received {
             *self.state.lock().await = State::None;
-        };
+        } else if let State::Changes {
+            ref mut sender,
+            ref hashes,
+            current,
+            ref mut closed,
+            ..
+        } = *self.state.lock().await
+        {
+            *closed = true;
+            if current >= hashes.len() {
+                std::mem::drop(sender.take());
+            }
+        }
         t.await?;
         debug!("done downloading {:?}", changes_dir);
         Ok(())

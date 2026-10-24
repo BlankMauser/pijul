@@ -5,6 +5,7 @@ use crate::{InteractionError, InteractiveContext};
 
 pub trait ProgressBarTrait: Send {
     fn inc(&self, delta: u64);
+    fn inc_length(&self, delta: u64);
     fn finish(&self);
     fn boxed_clone(&self) -> Box<dyn ProgressBarTrait>;
 }
@@ -14,6 +15,7 @@ struct HiddenProgressBar;
 
 impl ProgressBarTrait for HiddenProgressBar {
     fn inc(&self, _delta: u64) {}
+    fn inc_length(&self, _delta: u64) {}
     fn finish(&self) {}
     fn boxed_clone(&self) -> Box<dyn ProgressBarTrait> {
         Box::new(HiddenProgressBar)
@@ -50,6 +52,10 @@ impl ProgressBar {
 
     pub fn inc(&self, delta: u64) {
         self.0.inc(delta);
+    }
+
+    pub fn inc_length(&self, delta: u64) {
+        self.0.inc_length(delta);
     }
 
     fn finish(&self) {

@@ -2,13 +2,44 @@
 
 ## Unreleased
 
+### Added
+
+- `pijul squash <change>...` replaces several changes of a channel by a
+  single, re-recorded change, without touching the working copy (unrecorded
+  changes stay unrecorded). The message is written in the editor, as for
+  `pijul record`, or given with the same `-m`/`--description`/`--author`
+  options. The new change lists the squashed changes in its `replaces`
+  lineage, so applying it elsewhere unrecords them — or fails before
+  unrecording anything if a local change depends on them. A squash is
+  refused when its changes leave an unresolved conflict in the files they
+  touch, when one of them adds a root, when it spans several independent
+  roots (unless `--force`), or when the new change would not give back
+  exactly the same files. The core operation (`pijul_core::squash`) needs no
+  working copy at all.
+
 ### Fixed
 
+- `pijul unrecord` and `pijul fork --change` no longer panic when a change
+  listed in the channel is missing from `.pijul/changes`: the missing file
+  is reported as an error naming the change.
 - Correct handling of mtime when unrecording and when recording
   partial changes.
+- `pijul apply` of a change adding or deleting files no longer refuses to
+  apply because of unrelated unrecorded changes, and now outputs the added
+  files and the deletions. It no longer untracks files added and never
+  recorded.
 
 ### Changed
 
+- `pijul pull`, pushing into a local repository and `pijul unrecord --reset`
+  no longer diff the whole working copy to protect unrecorded changes: only
+  the paths the changes touch are recorded (against the channel as it was
+  before modifying it), and nothing at all when there is nothing to pull.
+- `pijul push` now signs, on the fly, any pushed change that carries no
+  author signature when the author's key is one of ours. The signature
+  lives outside the hash, so the change is rewritten in place under the
+  same hash. Changes recorded by a tool whose signing was best-effort
+  (no reachable SSH agent) are no longer refused by the Nest.
 - Upgraded cryptography stack: `ed25519-dalek` 2.x (fixes RUSTSEC-2022-0093
   timing vulnerability in batch verification), `sha2`/`hmac`/`pbkdf2`/`getrandom`
   to current versions.
