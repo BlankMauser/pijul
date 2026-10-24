@@ -2273,7 +2273,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pijul"
-version = "1.0.0-beta.22"
+version = "1.0.0-beta.24"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -2323,7 +2323,7 @@ dependencies = [
 
 [[package]]
 name = "pijul-config"
-version = "1.0.0-beta.22"
+version = "1.0.0-beta.24"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2341,7 +2341,7 @@ dependencies = [
 
 [[package]]
 name = "pijul-core"
-version = "1.0.0-beta.22"
+version = "1.0.0-beta.24"
 dependencies = [
  "adler32",
  "anyhow",
@@ -2387,7 +2387,7 @@ dependencies = [
 
 [[package]]
 name = "pijul-identity"
-version = "1.0.0-beta.22"
+version = "1.0.0-beta.24"
 dependencies = [
  "dirs-next",
  "jiff",
@@ -2403,7 +2403,7 @@ dependencies = [
 
 [[package]]
 name = "pijul-interaction"
-version = "1.0.0-beta.22"
+version = "1.0.0-beta.24"
 dependencies = [
  "indicatif",
  "thiserror 2.0.20",
@@ -2411,7 +2411,7 @@ dependencies = [
 
 [[package]]
 name = "pijul-macros"
-version = "1.0.0-beta.22"
+version = "1.0.0-beta.24"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2420,7 +2420,7 @@ dependencies = [
 
 [[package]]
 name = "pijul-remote"
-version = "1.0.0-beta.22"
+version = "1.0.0-beta.24"
 dependencies = [
  "byteorder",
  "bytes",
@@ -2449,7 +2449,7 @@ dependencies = [
 
 [[package]]
 name = "pijul-repository"
-version = "1.0.0-beta.22"
+version = "1.0.0-beta.24"
 dependencies = [
  "log",
  "pijul-config",

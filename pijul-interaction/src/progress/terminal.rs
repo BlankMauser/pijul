@@ -214,6 +214,10 @@ impl ProgressBarTrait for Arc<ProgressBar> {
         self.as_ref().inc(delta);
     }
 
+    fn inc_length(&self, delta: u64) {
+        self.as_ref().inc_length(delta);
+    }
+
     fn finish(&self) {
         if Arc::strong_count(self) == 1 {
             self.as_ref().finish();

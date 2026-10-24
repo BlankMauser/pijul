@@ -91,10 +91,30 @@ impl Unrecord {
         }
         debug!("changes: {:?}", changes);
         std::mem::drop(channel_);
-        let pending_hash = if self.reset {
-            pijul_remote::pending(txn.clone(), &channel, &repo.working_copy, &repo.changes)?
+        let reset = self.reset && is_current_channel;
+        // What unrecording the changes touches, while they are on the channel.
+        let touched_by = if reset {
+            let unrecorded: Vec<_> = changes.iter().map(|(h, _, _)| CS::Change(*h)).collect();
+            Some(pijul_remote::touched_inodes(
+                &*txn.read(),
+                &channel,
+                &unrecorded,
+            )?)
         } else {
             None
+        };
+        let (pending_hash, covered) = if let Some(ref touched_by) = touched_by {
+            pijul_remote::pending_touched(
+                txn.clone(),
+                None,
+                &channel,
+                &repo.working_copy,
+                &repo.changes,
+                touched_by,
+                &Default::default(),
+            )?
+        } else {
+            (None, Default::default())
         };
         changes.sort_by(|a, b| b.2.cmp(&a.2));
         let mut touched = HashSet::new();
@@ -130,17 +150,15 @@ impl Unrecord {
                 .unrecord(&repo.changes, &channel, &hash, 0, &mut touched)?;
         }
 
-        if self.reset && is_current_channel {
-            pijul_core::output::output_repository_no_pending_current(
+        if let Some(ref touched_by) = touched_by {
+            pijul_remote::output_touched(
                 &repo.working_copy,
                 &repo.changes,
                 &txn,
                 &channel,
-                "",
-                true,
-                None,
-                std::thread::available_parallelism()?.get(),
-                0,
+                touched_by,
+                &Default::default(),
+                &covered,
                 true,
             )?;
         }

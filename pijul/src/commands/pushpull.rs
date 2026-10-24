@@ -431,6 +431,10 @@ pub struct Push {
     /// Push to this remote channel instead of the remote's default channel
     #[clap(long = "to-channel")]
     to_channel: Option<String>,
+    /// Print the hashes of the changes that would be pushed, one per line in
+    /// application order, instead of pushing them
+    #[clap(long = "dry-run", conflicts_with = "changes")]
+    dry_run: bool,
     /// Push only these changes
     #[clap(last = true)]
     changes: Vec<String>,
@@ -467,6 +471,10 @@ pub struct Pull {
     /// Pull from this remote channel
     #[clap(long = "from-channel")]
     from_channel: Option<String>,
+    /// Print the hashes of the changes that would be pulled, one per line in
+    /// application order, instead of pulling them
+    #[clap(long = "dry-run", conflicts_with = "changes")]
+    dry_run: bool,
     /// Pull changes from the local repository, not necessarily from a channel
     #[clap(last = true)]
     changes: Vec<String>, // For local changes only, can't be symmetric.
@@ -474,48 +482,63 @@ pub struct Pull {
 
 static CHANNEL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"([^:]*)(:(.*))?"#).unwrap());
 
-impl Push {
-    /// Gets the `to_upload` vector while trying to auto-update
-    /// the local cache if possible. Also calculates whether the remote
-    /// has any changes we don't know about.
-    async fn to_upload<T: RawMutTxnT + 'static>(
-        &self,
-        txn: &ArcTxn<MutTxn<T>>,
-        channel: &mut ChannelRef<MutTxn<T>>,
-        repo: &Repository,
-        remote: &mut RemoteRepo,
-    ) -> Result<PushDelta, anyhow::Error> {
-        let remote_delta = remote
-            .update_changelist_pushpull(
-                txn,
-                &self.path,
-                channel,
-                None,
-                repo,
-                self.changes.as_slice(),
-                false,
-            )
-            .await?;
-        Ok(
-            if let &mut RemoteRepo::LocalChannel(ref remote_channel) = remote {
-                remote_delta.to_local_channel_push(
-                    txn,
-                    remote_channel,
-                    self.path.as_slice(),
-                    channel,
-                    repo,
-                )?
-            } else {
-                remote_delta.to_remote_push(
-                    &mut *txn.write(),
-                    self.path.as_slice(),
-                    channel,
-                    repo,
-                )?
-            },
-        )
-    }
+/// What pushing `channel` to `remote` would upload, pinned changes (and
+/// implicitly-pinned ones above the watermark) excluded, while trying to
+/// auto-update the local cache of the remote. Also calculates whether the
+/// remote has any changes we don't know about.
+pub(crate) async fn outgoing<T: RawMutTxnT + 'static>(
+    config: &pijul_config::Config,
+    txn: &ArcTxn<MutTxn<T>>,
+    channel: &ChannelRef<MutTxn<T>>,
+    repo: &Repository,
+    remote: &mut RemoteRepo,
+    path: &[String],
+    changes: &[String],
+) -> Result<PushDelta, anyhow::Error> {
+    let remote_delta = remote
+        .update_changelist_pushpull(txn, path, channel, None, repo, changes, false)
+        .await?;
+    let mut delta = if let &mut RemoteRepo::LocalChannel(ref remote_channel) = remote {
+        remote_delta.to_local_channel_push(txn, remote_channel, path, channel, repo)?
+    } else {
+        remote_delta.to_remote_push(&mut *txn.write(), path, channel, repo)?
+    };
+    debug!("to_upload = {:?}", delta.to_upload);
 
+    if !config.pins.is_empty() {
+        let txn_r = txn.read();
+        let ch_r = channel.read();
+        let pins = config.pins.clone();
+        let is_pinned = |h: pijul_core::Hash| pins.iter().any(|p| *p == h.to_base32());
+        let watermark = pijul_core::pin::pinned_watermark(&*txn_r, &*ch_r, is_pinned)?;
+        drop(ch_r);
+        if let Some(wm) = watermark {
+            delta.to_upload = std::mem::take(&mut delta.to_upload)
+                .into_iter()
+                .filter(|cs| match cs {
+                    CS::Change(h) => txn_r
+                        .get_revchanges(channel, h)
+                        .ok()
+                        .flatten()
+                        .map(|pos| u64::from(pos) < wm)
+                        .unwrap_or(true),
+                    CS::State(s) => {
+                        let ch_r2 = channel.read();
+                        txn_r
+                            .channel_has_state(txn_r.states(&*ch_r2), &(*s).into())
+                            .ok()
+                            .flatten()
+                            .map(|pos| u64::from(pos) < wm)
+                            .unwrap_or(true)
+                    }
+                })
+                .collect()
+        }
+    }
+    Ok(delta)
+}
+
+impl Push {
     pub fn repository_path(&mut self) -> Option<&Path> {
         self.base.repo_path()
     }
@@ -560,7 +583,7 @@ impl Push {
         .await?;
 
         let channel_sm: pijul_core::small_string::SmallString = channel_name.parse()?;
-        let mut channel = txn.write().open_or_create_channel(&channel_sm)?;
+        let channel = txn.write().open_or_create_channel(&channel_sm)?;
 
         let PushDelta {
             to_upload,
@@ -568,51 +591,34 @@ impl Push {
             unknown_changes,
             remote_state,
             ..
-        } = self
-            .to_upload(&txn, &mut channel, &repo, &mut remote)
-            .await?;
-
-        debug!("to_upload = {:?}", to_upload);
-
-        // Filter out pinned patches (and implicitly-pinned ones above the watermark).
-        let to_upload = if !config.pins.is_empty() {
-            let txn_r = txn.read();
-            let ch_r = channel.read();
-            let pins = config.pins.clone();
-            let is_pinned = |h: pijul_core::Hash| pins.iter().any(|p| *p == h.to_base32());
-            let watermark = pijul_core::pin::pinned_watermark(&*txn_r, &*ch_r, is_pinned)?;
-            drop(ch_r);
-            if let Some(wm) = watermark {
-                to_upload
-                    .into_iter()
-                    .filter(|cs| match cs {
-                        CS::Change(h) => txn_r
-                            .get_revchanges(&channel, h)
-                            .ok()
-                            .flatten()
-                            .map(|pos| u64::from(pos) < wm)
-                            .unwrap_or(true),
-                        CS::State(s) => {
-                            let ch_r2 = channel.read();
-                            txn_r
-                                .channel_has_state(txn_r.states(&*ch_r2), &(*s).into())
-                                .ok()
-                                .flatten()
-                                .map(|pos| u64::from(pos) < wm)
-                                .unwrap_or(true)
-                        }
-                    })
-                    .collect()
-            } else {
-                to_upload
-            }
-        } else {
-            to_upload
-        };
+        } = outgoing(
+            config,
+            &txn,
+            &channel,
+            &repo,
+            &mut remote,
+            &self.path,
+            &self.changes,
+        )
+        .await?;
 
         if to_upload.is_empty() {
             writeln!(stderr, "Nothing to push")?;
             txn.commit()?;
+            return Ok(());
+        }
+
+        if self.dry_run {
+            // Tags are not listed: the output is meant to be passed to
+            // commands taking change hashes.
+            let mut stdout = std::io::stdout();
+            for c in to_upload.iter() {
+                if let CS::Change(h) = c {
+                    writeln!(stdout, "{}", h.to_base32())?;
+                }
+            }
+            txn.commit()?;
+            remote.finish().await?;
             return Ok(());
         }
 
@@ -685,6 +691,16 @@ impl Push {
             writeln!(stderr, "Nothing to push")?;
             txn.commit()?;
             return Ok(());
+        }
+
+        // Unsigned changes (recorded by a tool whose signing was best-effort,
+        // e.g. with no reachable SSH agent) are refused by a Nest. The author
+        // signature lives in `unhashed`, outside the hash, so when we hold the
+        // author's key we can add it now without touching the hash or history.
+        // Best-effort as well: a change we cannot sign is pushed as it is.
+        if let Err(e) = sign_unsigned_changes(config, &repo.changes, &to_upload, &mut stderr).await
+        {
+            writeln!(stderr, "Warning: could not sign unsigned changes: {}", e)?;
         }
 
         // Push signatures: sign (remote head, patch, now) for each change and
@@ -769,6 +785,139 @@ async fn send_push_signatures(
     Ok(())
 }
 
+/// Add the missing author signature (SSHSIG, namespace `pijul`, over the change
+/// hash) to every change in `to_upload` that has none, provided one of our
+/// identities holds the key named in the change's first author. Root changes
+/// (a single `AddRoot` hunk) are graph scaffolding and are never signed. The
+/// signature lives in `unhashed`, so only that section of the change file is
+/// rewritten: the hashed bytes are copied verbatim, never re-serialized
+/// (re-encoding the parsed change is not hash-preserving for older changes —
+/// see `Change::replace_unhashed_in_buffer`). Skipped silently when no
+/// identity is configured, so a push never triggers interactive identity
+/// setup. A change that cannot be signed is reported and pushed as it is;
+/// only a failure that would affect every change (no usable key, no agent)
+/// aborts the pass.
+async fn sign_unsigned_changes(
+    config: &pijul_config::Config,
+    changes: &pijul_core::changestore::filesystem::FileSystem,
+    to_upload: &[CS],
+    stderr: &mut std::io::Stderr,
+) -> Result<(), anyhow::Error> {
+    use pijul_core::change::Hunk;
+
+    let identities = match pijul_identity::Complete::load_all() {
+        Ok(v) if !v.is_empty() => v,
+        other => {
+            // Nothing to sign with. Say so when it matters (an unsigned change
+            // is about to be pushed), so the silence is never mistaken for
+            // "everything was already signed".
+            let mut unsigned = 0;
+            for c in to_upload {
+                let CS::Change(hash) = c else { continue };
+                if let Ok(change) = changes.get_change(hash)
+                    && change
+                        .unhashed
+                        .as_ref()
+                        .and_then(|u| u.get("signature"))
+                        .is_none()
+                    && !matches!(change.hashed.changes.as_slice(), [Hunk::AddRoot { .. }])
+                {
+                    unsigned += 1;
+                }
+            }
+            if unsigned > 0 {
+                let why = match other {
+                    Ok(_) => format!(
+                        "no identity in {}",
+                        pijul_config::global_config_directory()
+                            .map(|d| d.join("identities").display().to_string())
+                            .unwrap_or_else(|_| "the config directory".to_string())
+                    ),
+                    Err(e) => format!("could not load identities: {}", e),
+                };
+                writeln!(
+                    stderr,
+                    "Warning: {} unsigned change(s) to push, not signing them: {}",
+                    unsigned, why
+                )?;
+            }
+            return Ok(());
+        }
+    };
+    // The identity selected by config (`signing_key`, `pijul.toml`), resolved
+    // lazily and once: it may hold a key none of the identity files lists.
+    let mut configured: Option<pijul_identity::Complete> = None;
+
+    for c in to_upload {
+        let CS::Change(hash) = c else { continue };
+        let change = match changes.get_change(hash) {
+            Ok(c) => c,
+            Err(e) => {
+                writeln!(
+                    stderr,
+                    "Warning: could not read {} to sign it: {}",
+                    hash.to_base32(),
+                    e
+                )?;
+                continue;
+            }
+        };
+        let signed = change
+            .unhashed
+            .as_ref()
+            .and_then(|u| u.get("signature"))
+            .is_some();
+        if signed || matches!(change.hashed.changes.as_slice(), [Hunk::AddRoot { .. }]) {
+            continue;
+        }
+        let Some(author_key) = change
+            .hashed
+            .header
+            .authors
+            .first()
+            .and_then(|a| a.0.get("key"))
+            .cloned()
+        else {
+            continue;
+        };
+        let mut holder = identities
+            .iter()
+            .find(|id| id.public_key.key == author_key)
+            .cloned();
+        if holder.is_none() {
+            if configured.is_none() {
+                let name = pijul_identity::choose_identity_name(config).await?;
+                configured = Some(pijul_identity::Complete::load(&name)?);
+            }
+            holder = configured
+                .as_ref()
+                .filter(|id| id.public_key.key == author_key)
+                .cloned();
+        }
+        let Some(holder) = holder else {
+            writeln!(
+                stderr,
+                "Warning: {} is unsigned and its author's key is not ours; pushing it unsigned",
+                hash.to_base32()
+            )?;
+            continue;
+        };
+        let sig = pijul_identity::sign_pem(&holder.skey(), &hash.to_bytes()).await?;
+        let unhashed = serde_json::json!({ "signature": sig });
+        if let Err(e) = changes.set_unhashed(hash, Some(&unhashed)) {
+            writeln!(
+                stderr,
+                "Warning: could not store the signature of {}: {}; pushing it unsigned",
+                hash.to_base32(),
+                e
+            )?;
+            continue;
+        }
+        writeln!(stderr, "Signed {}", hash.to_base32())?;
+    }
+    Ok(())
+}
+
 impl Pull {
     /// Gets the `to_download` vec and calculates any remote unrecords.
     /// If the local remote cache can be auto-updated, it will be.
@@ -790,6 +939,10 @@ impl Pull {
                 true,
             )
             .await?;
+        if self.dry_run && self.path.is_empty() {
+            // Downloading is only needed to filter the changes by path.
+            return Ok(delta);
+        }
         let to_download = remote
             .pull(
                 repo,
@@ -858,7 +1011,25 @@ impl Pull {
             .to_download(&txn, &mut channel, &mut repo, &mut remote)
             .await?;
 
-        let hash = remote::pending(txn.clone(), &channel, &repo.working_copy, &repo.changes)?;
+        if self.dry_run {
+            // Changes a local amend already superseded are not pulled (see
+            // below). Tags are not listed: the output is meant to be passed to
+            // commands taking change hashes.
+            let txnr = txn.read();
+            let mut stdout = std::io::stdout();
+            for c in to_download.iter().rev() {
+                if let CS::Change(h) = c {
+                    if !txnr.is_superseded(h).unwrap_or(false) {
+                        writeln!(stdout, "{}", h.to_base32())?;
+                    }
+                }
+            }
+            drop(txnr);
+            // The remote cache was refreshed.
+            txn.commit()?;
+            remote.finish().await?;
+            return Ok(());
+        }
 
         if let Some(ref r) = remote_ref {
             remote.update_identities(&mut repo, r).await?;
@@ -871,10 +1042,6 @@ impl Pull {
         if to_download.is_empty() {
             let mut stderr = std::io::stderr();
             writeln!(stderr, "Nothing to pull")?;
-            if let Some(ref h) = hash {
-                txn.write()
-                    .unrecord(&repo.changes, &mut channel, h, 0, &mut touched_inodes)?;
-            }
             txn.commit()?;
             return Ok(());
         }
@@ -908,17 +1075,20 @@ impl Pull {
             });
         }
 
+        // The working copy reflects the channel as it is now: once the changes
+        // are applied, the pending patch is recorded against this fork of it.
+        let base = if is_current_channel {
+            Some(remote::fork_pending_base(&mut *txn.write(), &channel)?)
+        } else {
+            None
+        };
+
         // Honor `replaces`: before applying, supersede any amended predecessor
         // that a downloaded change replaces (mirrors `pijul apply`; without this,
-        // an amend pulled in would stack on its predecessor and conflict).
-        {
-            let mut txnw = txn.write();
-            for h in to_download.iter() {
-                if let CS::Change(h) = h {
-                    txnw.unrecord_superseded(&repo.changes, &channel, h)?;
-                }
-            }
-        }
+        // an amend pulled in would stack on its predecessor and conflict). The
+        // paths those predecessors touched are output below with the rest.
+        let replaced =
+            remote::unrecord_superseded(&mut *txn.write(), &repo.changes, &channel, &to_download)?;
 
         {
             // Now that .pull is always given `false` for `do_apply`...
@@ -1001,114 +1171,66 @@ impl Pull {
 
         debug!("inodes = {:?}", inodes);
         debug!("to_download: {:?}", to_download.len());
-        let mut touched = HashSet::new();
-        let txn_ = txn.read();
-        for d in to_download.iter() {
-            debug!("to_download {:?}", d);
-            match d {
-                CS::Change(d) => {
-                    if let Some(int) = txn_.get_internal(&d.into())? {
-                        for inode in txn_.iter_rev_touched(int)? {
-                            let (int_, inode) = inode?;
-                            if int_ < int {
-                                continue;
-                            } else if int_ > int {
-                                break;
-                            }
-                            let ext = pijul_core::pristine::Position {
-                                change: txn_
-                                    .get_external(&inode.change)
-                                    .optional()?
-                                    .unwrap()
-                                    .into(),
-                                pos: inode.pos,
-                            };
-                            if inodes.is_empty() || inodes.contains(&ext) {
-                                touched.insert(*inode);
-                            }
-                        }
-                    }
-                }
-                CS::State(_) => {
-                    // No need to do anything for now here, we don't
-                    // output after downloading a tag.
-                }
-            }
+        let mut touched = remote::touched_inodes(&*txn.read(), &channel, &to_download)?;
+        if !inodes.is_empty() {
+            let txn_ = txn.read();
+            touched.retain(|inode| {
+                txn_.get_external(&inode.change)
+                    .optional()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|h| {
+                        inodes.contains(&pijul_core::pristine::Position {
+                            change: h.into(),
+                            pos: inode.pos,
+                        })
+                    })
+            });
         }
-        std::mem::drop(txn_);
-        if is_current_channel {
-            let mut touched_paths = BTreeSet::new();
-            {
-                let txn_ = txn.read();
-                for &i in touched.iter() {
-                    if let Some(pijul_core::fs::FindPath { path, .. }) = pijul_core::fs::find_path(
-                        &repo.changes,
-                        &*txn_,
-                        &*channel.read(),
-                        false,
-                        i,
-                    )? {
-                        touched_paths.insert(path.join("/"));
-                    } else {
-                        // In this case, the change does touch paths,
-                        // but we can't find the corresponding path
-                        // name in the graph. This shouldn't happen,
-                        // but if it does, re-outputting the entire
-                        // repo is the right call.
-                        touched_paths.clear();
-                        touched_paths.insert(String::from(""));
-                        break;
-                    }
-                }
-            }
-            let mut last: Option<&str> = None;
-            let mut conflicts = Vec::new();
-            let _output_spinner = Spinner::new(OUTPUT_MESSAGE);
-
-            for path in touched_paths.iter() {
-                match last {
-                    Some(last_path) => {
-                        // If `last_path` is a prefix (in the path sense) of `path`, skip.
-                        if last_path.len() < path.len() {
-                            let (pre_last, post_last) = path.split_at(last_path.len());
-                            if pre_last == last_path && post_last.starts_with("/") {
-                                continue;
-                            }
-                        }
-                    }
-                    _ => (),
-                }
-                debug!("path = {:?}", path);
-                conflicts.extend(
-                    pijul_core::output::output_repository_no_pending_current(
-                        &repo.working_copy,
-                        &repo.changes,
-                        &txn,
-                        &channel,
-                        path,
-                        true,
-                        None,
-                        std::thread::available_parallelism()?.get(),
-                        0,
-                        // Guarded by `is_current_channel` above.
-                        true,
-                    )?
-                    .into_iter(),
-                );
-                last = Some(path)
-            }
-
+        if let Some(base) = base {
+            // Record the unrecorded changes only where the output below can
+            // overwrite them, instead of diffing the whole working copy.
+            let (hash, covered) = remote::pending_touched(
+                txn.clone(),
+                Some(base),
+                &channel,
+                &repo.working_copy,
+                &repo.changes,
+                &touched,
+                &replaced,
+            )?;
+            let conflicts = {
+                let _output_spinner = Spinner::new(OUTPUT_MESSAGE);
+                remote::output_touched(
+                    &repo.working_copy,
+                    &repo.changes,
+                    &txn,
+                    &channel,
+                    &touched,
+                    &replaced,
+                    &covered,
+                    // `base` is only forked for the current channel.
+                    true,
+                )?
+            };
             if self.json {
                 super::print_conflicts_json(&conflicts)?;
             } else {
                 super::print_conflicts(&conflicts)?;
             }
-        }
-        if let Some(h) = hash {
-            txn.write()
-                .unrecord(&repo.changes, &mut channel, &h, 0, &mut touched_inodes)?;
-            // The pending patch is ephemeral: drop its change file.
-            repo.changes.del_change(&h)?;
+            if let Some(h) = hash {
+                txn.write()
+                    .unrecord(&repo.changes, &mut channel, &h, 0, &mut touched_inodes)?;
+                // The pending patch is ephemeral: drop its change file.
+                repo.changes.del_change(&h)?;
+                // The output above ran with the pending patch applied and stamped
+                // the merged files into record's stat cache as clean. Now that the
+                // pending patch is unrecorded again those files are dirty: bump
+                // their mtime so `record`/`diff` re-read them. Otherwise they report
+                // nothing, touch the channel, and `reset` then skips these files.
+                txn.write()
+                    .touch_inodes(&repo.working_copy, &touched_inodes)?;
+            }
         }
 
         txn.commit()?;

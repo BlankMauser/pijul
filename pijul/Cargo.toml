@@ -14,6 +14,7 @@ include = [
     "src/commands/apply.rs",
     "src/commands/archive.rs",
     "src/commands/change.rs",
+    "src/commands/change_opts.rs",
     "src/commands/channel.rs",
     "src/commands/client.html",
     "src/commands/client.rs",
@@ -40,6 +41,7 @@ include = [
     "src/commands/replay.rs",
     "src/commands/reset.rs",
     "src/commands/status.rs",
+    "src/commands/squash.rs",
     "src/commands/unrecord.rs",
     "src/commands/upgrade.rs",
 ]

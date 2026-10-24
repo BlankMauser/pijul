@@ -13,7 +13,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "1.0.0-beta.22"
+version = "1.0.0-beta.24"
 authors = ["Pierre-Étienne Meunier <pe@pijul.org>"]
 edition = "2024"
 repository = "https://nest.pijul.com/pijul/pijul"
@@ -21,13 +21,13 @@ license = "GPL-2.0"
 readme = "README.md"
 
 [workspace.dependencies]
-pijul-core = { path = "pijul-core", version = "1.0.0-beta.22" }
-pijul-config = { path = "pijul-config", version = "1.0.0-beta.22" }
-pijul-identity = { path = "pijul-identity", version = "1.0.0-beta.22" }
-pijul-interaction = { path = "pijul-interaction", version = "1.0.0-beta.15" }
+pijul-core = { path = "pijul-core", version = "1.0.0-beta.24" }
+pijul-config = { path = "pijul-config", version = "1.0.0-beta.24" }
+pijul-identity = { path = "pijul-identity", version = "1.0.0-beta.23" }
+pijul-interaction = { path = "pijul-interaction", version = "1.0.0-beta.24" }
 pijul-macros = { path = "pijul-macros", version = "1.0.0-beta.13" }
-pijul-remote = { path = "pijul-remote", version = "1.0.0-beta.22" }
-pijul-repository = { path = "pijul-repository", version = "1.0.0-beta.15" }
+pijul-remote = { path = "pijul-remote", version = "1.0.0-beta.24" }
+pijul-repository = { path = "pijul-repository", version = "1.0.0-beta.23" }
 palimpsest = { path = "./palimpsest", version = "0.3.0" }
 
 adler32 = "1.2"

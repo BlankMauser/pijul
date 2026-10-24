@@ -111,6 +111,20 @@ pub enum SubCommand {
     /// with the latter taking precedence.
     Unrecord(Unrecord),
 
+    /// Replaces several changes of a channel by a single change.
+    ///
+    /// The new change has the same effect as the squashed changes, which it
+    /// replaces (like an amend): applying it elsewhere unrecords them.
+    /// Unrecorded changes in the working copy are left alone. The squash is
+    /// refused if a change that is not squashed depends on a squashed one, or
+    /// if the squashed changes leave a conflict that is not resolved by one
+    /// of them.
+    ///
+    /// With `--remote`, the squashed changes are the ones that are not on the
+    /// remote channel, i.e. those `pijul push` would upload (see also
+    /// `pijul push --dry-run`, which lists them).
+    Squash(Squash),
+
     /// Applies changes to a channel
     Apply(Apply),
 
@@ -264,6 +278,7 @@ async fn run(mut opts: Opts) -> Result<(), anyhow::Error> {
         SubCommand::Debug(debug) => debug.repository_path(),
         SubCommand::Fork(fork) => fork.repository_path(),
         SubCommand::Unrecord(unrecord) => unrecord.repository_path(),
+        SubCommand::Squash(squash) => squash.repository_path(),
         SubCommand::Apply(apply) => apply.repository_path(),
         SubCommand::Remote(remote) => remote.repository_path(),
         SubCommand::Archive(archive) => archive.repository_path(),
@@ -304,6 +319,7 @@ async fn run(mut opts: Opts) -> Result<(), anyhow::Error> {
         SubCommand::Debug(debug) => debug.run(),
         SubCommand::Fork(fork) => fork.run(),
         SubCommand::Unrecord(unrecord) => unrecord.run(&config),
+        SubCommand::Squash(squash) => squash.run(&config).await,
         SubCommand::Apply(apply) => apply.run(),
         SubCommand::Remote(remote) => remote.run(&config),
         SubCommand::Archive(archive) => archive.run(&config).await,

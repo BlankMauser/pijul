@@ -15,6 +15,7 @@ use pijul_core::{
 };
 use pijul_core::{HashMap, HashSet};
 
+use crate::commands::change_opts::{HeaderOpts, edit_change, sign_and_save, sub_root_names};
 use crate::commands::common_opts::{DiffAlgorithm, RepoAndChannel};
 use crate::commands::load_channel;
 
@@ -39,27 +40,14 @@ pub struct Record {
     /// text.
     #[clap(long = "accept-conflict-markers")]
     pub accept_conflict_markers: bool,
-    /// Set the change message
-    #[clap(short = 'm', long = "message")]
-    pub message: Option<String>,
-    /// Set the description field.
-    #[clap(long = "description")]
-    pub description: Option<String>,
-    /// Set the author field
-    #[clap(long = "author")]
-    pub author: Option<String>,
-    /// Set the timestamp field
-    #[clap(long = "timestamp")]
-    pub timestamp: Option<Timestamp>,
+    #[clap(flatten)]
+    pub header: HeaderOpts,
     /// Amend this change instead of creating a new change
     #[clap(long = "amend")]
     #[allow(clippy::option_option)]
     pub amend: Option<Option<String>>,
     /// Paths in which to record the changes
     pub prefixes: Vec<PathBuf>,
-    /// Identity to sign changes with
-    #[clap(long = "identity")]
-    pub identity: Option<String>,
     /// Diff algorithm to use (default: myers)
     #[clap(long = "algorithm", value_enum)]
     pub algorithm: Option<DiffAlgorithm>,
@@ -69,18 +57,6 @@ pub struct Record {
     /// record the remainder non-interactively.
     #[clap(long = "from-change", value_name = "FILE", conflicts_with = "all")]
     pub from_change: Option<PathBuf>,
-}
-
-/// Split a Git-style "subject\n\nbody" message into (subject, Some(body)).
-/// Without a blank-line separator the whole string is the subject (no body).
-fn split_message(msg: &str) -> (String, Option<String>) {
-    match msg.split_once("\n\n") {
-        Some((subject, body)) if !body.trim().is_empty() => (
-            subject.trim_end().to_string(),
-            Some(body.trim().to_string()),
-        ),
-        _ => (msg.to_string(), None),
-    }
 }
 
 impl Record {
@@ -176,7 +152,7 @@ impl Record {
                 }
             };
             amend_of = Some(h);
-            let header = if let Some(message) = self.message.clone() {
+            let header = if let Some(message) = self.header.message.clone() {
                 ChangeHeader {
                     message,
                     ..repo.changes.get_header(&h)?
@@ -185,7 +161,7 @@ impl Record {
                 repo.changes.get_header(&h)?
             };
 
-            let salt = self.timestamp.map(Timestamp::as_second).unwrap_or(0) as u64;
+            let salt = self.header.timestamp.map(Timestamp::as_second).unwrap_or(0) as u64;
             let mut txn = txn.write();
             // Drop the amended predecessor from the channel. This also drops the
             // markers it owned, but that is harmless: the new amend, recorded
@@ -196,7 +172,7 @@ impl Record {
             txn.touch_inodes(&mut repo.working_copy, &mut touched_inodes)?;
             header
         } else {
-            self.header(config).await?
+            self.header.header(config).await?
         };
         let no_prefixes = self.prefixes.is_empty();
         let split_per_root = self.split_per_root;
@@ -237,36 +213,11 @@ impl Record {
                     )?
                 };
                 if groups.len() > 1 && !split_per_root && !force {
-                    let mut names = String::new();
-                    {
-                        let txn_ = txn.read();
-                        let channel_ = channel.read();
-                        for (sr, _) in groups.iter() {
-                            match sr {
-                                pijul_core::record::SubRoot::Existing(pos) => {
-                                    let relocated = pijul_core::pristine::is_relocated_sub_root(
-                                        &*txn_,
-                                        txn_.graph(&*channel_),
-                                        *pos,
-                                    )
-                                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-                                    let path = pijul_core::pristine::path_of_sub_root(&*txn_, *pos)
-                                        .map_err(|e| anyhow::anyhow!("{}", e))?
-                                        .filter(|p| !p.is_empty());
-                                    match (relocated, path) {
-                                        (true, Some(p)) => names
-                                            .push_str(&format!("\n  - {} (imported project)", p)),
-                                        (true, None) => names.push_str("\n  - (imported project)"),
-                                        (false, Some(p)) => names.push_str(&format!("\n  - {}", p)),
-                                        (false, None) => names.push_str("\n  - . (main project)"),
-                                    }
-                                }
-                                pijul_core::record::SubRoot::New => {
-                                    names.push_str("\n  - (new project)")
-                                }
-                            }
-                        }
-                    }
+                    let names = sub_root_names(
+                        &*txn.read(),
+                        &*channel.read(),
+                        groups.iter().map(|(sr, _)| *sr),
+                    )?;
                     bail!(
                         "This record touches {} independent roots:{}\n\
                          A single change may not commute across projects.\n\
@@ -330,13 +281,7 @@ impl Record {
                         if c.hashed.header.message.is_empty() {
                             continue;
                         }
-                        let hash_for_sig = c.hash()?;
-                        let sig_pem =
-                            pijul_identity::sign_pem(&secret, &hash_for_sig.to_bytes()).await?;
-                        c.unhashed = Some(serde_json::json!({ "signature": sig_pem }));
-                        let hash = repo
-                            .changes
-                            .save_change(&mut c, |_, _| Ok::<_, anyhow::Error>(()))?;
+                        let hash = sign_and_save(&mut c, &secret, &repo.changes).await?;
                         txn_.apply_local_change(&mut channel, &c, &hash, &ups)?;
                         writeln!(stdout, "Hash: {}", hash.to_base32())?;
                     }
@@ -415,12 +360,7 @@ impl Record {
                     chain.push(replaced);
                     change.hashed.set_change_metadata(&chain);
                 }
-                let hash_for_sig = change.hash()?;
-                let sig_pem = pijul_identity::sign_pem(&secret, &hash_for_sig.to_bytes()).await?;
-                change.unhashed = Some(serde_json::json!({ "signature": sig_pem }));
-                let hash = repo
-                    .changes
-                    .save_change(&mut change, |_, _| Ok::<_, anyhow::Error>(()))?;
+                let hash = sign_and_save(&mut change, &secret, &repo.changes).await?;
 
                 let mut txn_ = txn.write();
                 if !change.hashed.header.message.is_empty() {
@@ -533,65 +473,6 @@ impl Record {
         Ok(())
     }
 
-    async fn header(&self, config: &pijul_config::Config) -> Result<ChangeHeader, anyhow::Error> {
-        let mut authors = Vec::new();
-        let mut b = std::collections::BTreeMap::new();
-        if let Some(ref a) = self.author {
-            b.insert("name".to_string(), a.clone());
-        } else {
-            let identity_name = self
-                .identity
-                .clone()
-                .unwrap_or(pijul_identity::choose_identity_name(config).await?);
-
-            let public_key = pijul_identity::public_key(&identity_name);
-            b.insert("key".to_string(), public_key?.key);
-        }
-
-        authors.push(Author(b));
-        let templates = config.template.as_ref();
-        let message = if let Some(message) = &self.message {
-            message.clone()
-        } else if let Some(message_file) = templates.and_then(|t| t.message.as_ref()) {
-            match std::fs::read_to_string(message_file) {
-                Ok(m) => m,
-                Err(e) => bail!("Could not read message template: {:?}: {}", message_file, e),
-            }
-        } else {
-            String::new()
-        };
-        let description = if let Some(description) = &self.description {
-            Some(description.clone())
-        } else if let Some(descr_file) = templates.and_then(|t| t.description.as_ref()) {
-            match std::fs::read_to_string(descr_file) {
-                Ok(d) => Some(d),
-                Err(e) => bail!(
-                    "Could not read description template: {:?}: {}",
-                    descr_file,
-                    e
-                ),
-            }
-        } else {
-            None
-        };
-        // Git-style convenience: a "subject\n\nbody" message with no explicit
-        // --description splits into message (subject) + description (body).
-        // Mirrors `git commit -m` and how agents tend to write messages.
-        // NOTE: this changes `-m` semantics for multi-paragraph messages.
-        let (message, description) = if description.is_none() {
-            split_message(&message)
-        } else {
-            (message, description)
-        };
-        let header = ChangeHeader {
-            message,
-            authors,
-            description,
-            timestamp: self.timestamp.unwrap_or_else(Timestamp::now),
-        };
-        Ok(header)
-    }
-
     fn fill_relative_prefixes(&mut self) -> Result<(), anyhow::Error> {
         let cwd = std::env::current_dir()?;
         for p in self.prefixes.iter_mut() {
@@ -603,8 +484,9 @@ impl Record {
     }
 
     /// Read-only pass over the working copy returning the repo-relative paths
-    /// of files with unrecorded changes (adds, edits, moves, restores — not
-    /// deletes, whose file is gone). Feeds per-file `$FILE` hooks; deliberately
+    /// of existing files with unrecorded changes (adds, edits, restores — not
+    /// deletes, nor the old name of a move, nor directories). Feeds per-file
+    /// `$FILE` hooks; deliberately
     /// does not apply or cache anything.
     fn changed_files(
         &mut self,
@@ -678,6 +560,12 @@ impl Record {
                 | Hunk::FileMove { path, .. } => path,
                 _ => continue,
             };
+            // Only hand hooks files that are actually there: a `FileMove`
+            // carries the *old* path (gone from disk), and added or moved
+            // directories are not files a formatter can process.
+            if !repo.path.join(path).is_file() {
+                continue;
+            }
             if seen.insert(path.clone()) {
                 files.push(path.clone());
             }
@@ -750,7 +638,7 @@ impl Record {
                 &self.prefixes,
                 false,
                 std::thread::available_parallelism()?.get(),
-                self.timestamp.map(Timestamp::as_second).unwrap_or(0) as u64,
+                self.header.timestamp.map(Timestamp::as_second).unwrap_or(0) as u64,
             )?;
         }
 
@@ -880,50 +768,15 @@ impl Record {
             // identity is authoritative. Keep the message/description the caller
             // wrote in the file (e.g. edited it), but let -m / --description win.
             change.hashed.header.authors = header.authors;
-            if let Some(ref m) = self.message {
+            if let Some(ref m) = self.header.message {
                 change.hashed.header.message = m.clone();
             }
-            if let Some(ref d) = self.description {
+            if let Some(ref d) = self.header.description {
                 change.hashed.header.description = Some(d.clone());
             }
             change
         } else {
-            let mut o = Vec::new();
-            debug!("write change");
-            change.write(changes, None, true, &mut o)?;
-            debug!("write change done");
-
-            let mut with_errors: Option<Vec<u8>> = None;
-            let change = loop {
-                let mut bytes = if let Some(ref o) = with_errors {
-                    edit::edit_bytes_with_builder(
-                        &o[..],
-                        tempfile::Builder::new().suffix(".pijul-commit"),
-                    )?
-                } else {
-                    edit::edit_bytes_with_builder(
-                        &o[..],
-                        tempfile::Builder::new().suffix(".pijul-commit"),
-                    )?
-                };
-                if bytes.iter().all(|c| (*c as char).is_whitespace()) {
-                    bail!("Empty change")
-                }
-                let mut change = std::io::BufReader::new(std::io::Cursor::new(&bytes));
-                if let Ok(change) =
-                    Change::read_and_deps(&mut change, &mut rec.updatables, &*txn_, &channel)
-                {
-                    break change;
-                }
-
-                let mut err = SYNTAX_ERROR.as_bytes().to_vec();
-                err.append(&mut bytes);
-                with_errors = Some(err)
-            };
-            if change.changes.is_empty() {
-                bail!("Cannot parse change")
-            }
-            change
+            edit_change(&change, changes, &*txn_, &channel, &mut rec.updatables, "")?
         };
 
         let mut actions_after_edit = HashMap::new();
@@ -964,8 +817,3 @@ impl Record {
         ))
     }
 }
-
-const SYNTAX_ERROR: &str = "# Syntax errors, please try again.
-# Alternatively, you may delete the entire file (including this
-# comment) to abort.
-";

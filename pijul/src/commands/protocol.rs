@@ -225,16 +225,29 @@ impl Protocol {
                 std::fs::write(&path, &buf2)?;
                 pijul_core::change::Change::deserialize(&path.to_string_lossy(), Some(&h))?;
                 let channel = load_channel_exact(&cap[1], &*txn.read())?;
-                {
-                    let mut channel_ = channel.write();
-                    txn.write()
-                        .apply_change_ws(&repo.changes, &mut channel_, &h, &mut ws)?;
+                // Honor `replaces`, as `pijul pull` and `pijul apply` do: skip a
+                // change a local amend already superseded, and unrecord the
+                // predecessors a pushed amend replaces instead of stacking it on
+                // top of them.
+                let incoming = [pijul_remote::CS::Change(h)];
+                if !pijul_remote::drop_superseded(&*txn.read(), &incoming).is_empty() {
+                    let replaced = pijul_remote::unrecord_superseded(
+                        &mut *txn.write(),
+                        &repo.changes,
+                        &channel,
+                        &incoming,
+                    )?;
+                    {
+                        let mut channel_ = channel.write();
+                        txn.write()
+                            .apply_change_ws(&repo.changes, &mut channel_, &h, &mut ws)?;
+                    }
+                    let entry = applied.entry(cap[1].to_string()).or_insert_with(|| {
+                        (channel, Vec::new(), std::collections::BTreeSet::new())
+                    });
+                    entry.1.push(h);
+                    entry.2.extend(replaced);
                 }
-                applied
-                    .entry(cap[1].to_string())
-                    .or_insert_with(|| (channel, Vec::new()))
-                    .1
-                    .push(h);
             } else if let Some(cap) = ARCHIVE.captures(&buf) {
                 let mut w = Vec::new();
                 let mut tarball = pijul_core::output::Tarball::new(
@@ -315,7 +328,7 @@ impl Protocol {
             buf.clear();
         }
         let applied_nonempty = !applied.is_empty();
-        for (_, (channel, hashes)) in applied {
+        for (_, (channel, hashes, replaced)) in applied {
             // Output only the files touched by the applied changes. Rewriting
             // the whole working copy (prefix "", `if_modified_since` None) bumps
             // every file's mtime, which invalidates `record`'s stat cache and
@@ -355,6 +368,7 @@ impl Protocol {
                     }
                 }
             }
+            touched_paths.extend(replaced);
             let mut last: Option<String> = None;
             for path in touched_paths {
                 if let Some(last_path) = &last {

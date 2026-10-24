@@ -14,6 +14,8 @@ pub use pushpull::*;
 mod log;
 pub use self::log::Log;
 
+mod change_opts;
+
 mod record;
 pub use record::Record;
 
@@ -51,6 +53,9 @@ pub use fork::*;
 
 mod unrecord;
 pub use unrecord::*;
+
+mod squash;
+pub use squash::*;
 
 mod file_operations;
 pub use file_operations::*;

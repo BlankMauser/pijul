@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::bail;
 use clap::Parser;
@@ -6,9 +6,9 @@ use log::*;
 
 use crate::commands::common_opts::RepoAndChannel;
 use crate::commands::load_channel;
+use pijul_core::HashMap;
 use pijul_core::changestore::ChangeStore;
-use pijul_core::{DepsTxnT, GraphTxnT, MutTxnTExt, TxnT};
-use pijul_core::{HashMap, HashSet};
+use pijul_core::{MutTxnTExt, TxnT};
 use pijul_interaction::{OUTPUT_MESSAGE, Spinner};
 
 #[derive(Parser, Debug)]
@@ -45,19 +45,13 @@ impl Apply {
             )
         }
 
-        use pijul_core::MutTxnT;
-        use rand::RngExt;
-        // Forked channel before the apply, in order to check whether
-        // we are overwriting a path.
-        let forked = if is_current_channel {
-            let forked_s: pijul_core::small_string::SmallString = rand::rng()
-                .sample_iter(&rand::distr::Alphanumeric)
-                .take(20)
-                .map(char::from)
-                .collect::<String>()
-                .parse()?;
-            let forked = txn.write().fork(&channel, &forked_s)?;
-            Some((forked_s, forked))
+        // The working copy reflects the channel as it is now: once the changes
+        // are applied, unrecorded changes are recorded against this fork of it.
+        let base = if is_current_channel {
+            Some(pijul_remote::fork_pending_base(
+                &mut *txn.write(),
+                &channel,
+            )?)
         } else {
             None
         };
@@ -106,74 +100,32 @@ impl Apply {
             }
         }
 
-        let mut touched = HashSet::default();
-        let txn_ = txn.read();
-        for d in hashes.iter() {
-            if let Some(int) = txn_.get_internal(&d.into())? {
-                debug!("int = {:?}", int);
-                for inode in txn_.iter_rev_touched(int)? {
-                    debug!("{:?}", inode);
-                    let (int_, inode) = inode?;
-                    if int_ < int {
-                        continue;
-                    } else if int_ > int {
-                        break;
-                    }
-                    touched.insert(*inode);
-                }
-            }
-        }
-        std::mem::drop(txn_);
-
-        if let Some((_, ref forked)) = forked {
-            let mut touched_files = Vec::with_capacity(touched.len());
-            let txn_ = txn.read();
-            for i in touched {
-                if let Some(pijul_core::fs::FindPath { path, .. }) =
-                    pijul_core::fs::find_path(&repo.changes, &*txn_, &*forked.read(), false, i)?
-                {
-                    if !path.is_empty() {
-                        touched_files.push(path.join("/"));
-                        continue;
-                    }
-                }
-                touched_files.clear();
-                break;
-            }
-            debug!("touched files {:?}", touched_files);
-            std::mem::drop(txn_);
+        if let Some(base) = base {
+            let applied: Vec<_> = hashes
+                .iter()
+                .map(|h| pijul_remote::CS::Change(*h))
+                .collect();
+            let touched = pijul_remote::touched_inodes(&*txn.read(), &channel, &applied)?;
+            // Where the output can overwrite unrecorded changes, as the working
+            // copy still is: the files these changes create have no such place.
+            let prefixes = pijul_remote::touched_prefixes(
+                &*txn.read(),
+                &repo.changes,
+                base.channel(),
+                &touched,
+            )?;
+            debug!("touched prefixes {:?}", prefixes);
             let _output_spinner = Spinner::new(OUTPUT_MESSAGE)?;
 
             {
                 let mut state = pijul_core::RecordBuilder::new();
-                if touched_files.is_empty() {
-                    state.record(
-                        txn.clone(),
-                        pijul_core::Algorithm::default(),
-                        false,
-                        &pijul_core::DEFAULT_SEPARATOR,
-                        forked.clone(),
-                        &repo.working_copy,
-                        &repo.changes,
-                        "",
-                        std::thread::available_parallelism()?.get(),
-                    )?
-                } else {
-                    use canonical_path::CanonicalPathBuf;
-                    fill_relative_prefixes(&mut touched_files)?;
-                    repo.working_copy.record_prefixes(
-                        txn.clone(),
-                        pijul_core::Algorithm::default(),
-                        forked.clone(),
-                        &repo.changes,
-                        &mut state,
-                        CanonicalPathBuf::canonicalize(&repo.path)?,
-                        &touched_files,
-                        false,
-                        std::thread::available_parallelism()?.get(),
-                        0,
-                    )?;
-                }
+                prefixes.record(
+                    &mut state,
+                    &txn,
+                    base.channel(),
+                    &repo.working_copy,
+                    &repo.changes,
+                )?;
                 let rec = state.finish();
                 if !rec.actions.is_empty() {
                     debug!("actions {:#?}", rec.actions);
@@ -181,42 +133,40 @@ impl Apply {
                 }
             }
 
-            let mut conflicts = Vec::new();
-            for path in touched_files.iter() {
-                conflicts.extend(
-                    pijul_core::output::output_repository_no_pending_current(
-                        &repo.working_copy,
-                        &repo.changes,
-                        &txn,
-                        &channel,
-                        &path,
-                        true,
-                        None,
-                        std::thread::available_parallelism()?.get(),
-                        0,
-                        is_current_channel,
-                    )?
-                    .into_iter(),
-                );
-            }
+            // Nothing is unrecorded there, but any output drops the files added
+            // and never recorded from the tree, unless a pending patch holds them.
+            let (hash, mut covered) = pijul_remote::pending_touched(
+                txn.clone(),
+                Some(base),
+                &channel,
+                &repo.working_copy,
+                &repo.changes,
+                &Default::default(),
+                &Default::default(),
+            )?;
+            covered.extend(prefixes);
+            let conflicts = pijul_remote::output_touched(
+                &repo.working_copy,
+                &repo.changes,
+                &txn,
+                &channel,
+                &touched,
+                &Default::default(),
+                &covered,
+                true,
+            )?;
             super::print_conflicts(&conflicts)?;
-        }
-        if let Some((forked_s, forked)) = forked {
-            std::mem::drop(forked);
-            txn.write().drop_channel(&forked_s)?;
+            if let Some(h) = hash {
+                let mut touched_inodes = pijul_core::unrecord::TouchedInodes::new();
+                txn.write()
+                    .unrecord(&repo.changes, &channel, &h, 0, &mut touched_inodes)?;
+                // The pending patch is ephemeral: drop its change file.
+                repo.changes.del_change(&h)?;
+                txn.write()
+                    .touch_inodes(&repo.working_copy, &touched_inodes)?;
+            }
         }
         txn.commit()?;
         Ok(())
     }
-}
-
-fn fill_relative_prefixes(prefixes: &mut [String]) -> Result<Vec<PathBuf>, anyhow::Error> {
-    let cwd = std::env::current_dir()?;
-    let mut pref = Vec::new();
-    for p in prefixes.iter_mut() {
-        if std::path::Path::new(p).is_relative() {
-            pref.push(cwd.join(&p));
-        }
-    }
-    Ok(pref)
 }

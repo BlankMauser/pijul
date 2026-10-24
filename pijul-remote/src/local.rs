@@ -267,14 +267,22 @@ impl Local {
         let repo = pijul_core::working_copy::filesystem::FileSystem::from_root(&self.root);
 
         // Protect the remote's pending patch (its unrecorded working-copy
-        // changes): record it *before* applying the incoming changes so the
-        // `output` below merges them with the pending patch (conflict markers if
-        // needed) instead of overwriting it, then unrecord it afterwards. This
-        // mirrors `pijul pull`, which does the same for the puller's working
-        // copy; without it a push silently clobbers unrecorded work in the
-        // remote's working copy (`output_repository_no_pending` cancels any
-        // unrecorded change).
-        let pending = crate::pending(txn.clone(), &channel, &repo, &store)?;
+        // changes): once the incoming changes are applied, record it against
+        // this fork of the channel as it is now, restricted to what they touch,
+        // so the `output` below merges them with it (conflict markers if needed)
+        // instead of overwriting it, then unrecord it afterwards. This mirrors
+        // `pijul pull`, which does the same for the puller's working copy;
+        // without it a push silently clobbers unrecorded work in the remote's
+        // working copy (output cancels any unrecorded change).
+        let base = crate::fork_pending_base(&mut *txn.write(), &channel)?;
+
+        // Honor `replaces`, as `pijul pull` does: skip a change a local amend
+        // already superseded, and unrecord the predecessors a pushed amend
+        // replaces. Without this the amend stacked on its predecessor.
+        let kept = crate::drop_superseded(&*txn.read(), changes);
+        let changes = &kept[..];
+        let replaced = crate::unrecord_superseded(&mut *txn.write(), &store, &channel, changes)
+            .map_err(|e| RemoteError::RemoteError(e.to_string()))?;
 
         {
             let mut ws = pijul_core::ApplyWorkspace::new();
@@ -302,74 +310,21 @@ impl Local {
         // Output only the files touched by the applied changes. Rewriting the
         // whole working copy (prefix "", `if_modified_since` None) bumps every
         // file's mtime, which invalidates `record`'s stat cache and makes the
-        // remote's next `pijul record` re-diff the entire tree. Mirrors the
-        // touched-files logic of `pijul pull` (see pushpull.rs).
-        let mut touched = HashSet::new();
-        {
-            let txn_ = txn.read();
-            for c in changes {
-                let h = match c {
-                    CS::Change(h) => h,
-                    CS::State(_) => continue,
-                };
-                if let Some(int) = txn_.get_internal(&h.into())? {
-                    for inode in txn_.iter_rev_touched(int)? {
-                        let (int_, inode) = inode?;
-                        if int_ < int {
-                            continue;
-                        } else if int_ > int {
-                            break;
-                        }
-                        touched.insert(*inode);
-                    }
-                }
-            }
-        }
-        let mut touched_paths = std::collections::BTreeSet::new();
-        {
-            let txn_ = txn.read();
-            let channel_ = channel.read();
-            for i in touched {
-                match pijul_core::fs::find_path(&store, &*txn_, &*channel_, false, i)
-                    .map_err(find_path_err)?
-                {
-                    Some(pijul_core::fs::FindPath { path, .. }) => {
-                        touched_paths.insert(path.join("/"));
-                    }
-                    None => {
-                        // Path unresolved: fall back to a full re-output.
-                        touched_paths.clear();
-                        touched_paths.insert(String::new());
-                        break;
-                    }
-                }
-            }
-        }
-        let mut last: Option<String> = None;
-        for path in touched_paths {
-            if let Some(last_path) = &last {
-                // Skip paths already covered by a previous prefix output.
-                if last_path.len() < path.len() {
-                    let (pre, post) = path.split_at(last_path.len());
-                    if pre == last_path.as_str() && post.starts_with('/') {
-                        continue;
-                    }
-                }
-            }
-            pijul_core::output::output_repository_no_pending(
-                &repo,
-                &store,
-                &txn,
-                &channel,
-                &path,
-                true,
-                None,
-                std::thread::available_parallelism()?.get(),
-                0,
-            )
-            .map_err(output_err)?;
-            last = Some(path);
-        }
+        // remote's next `pijul record` re-diff the entire tree. Mirrors
+        // `pijul pull` (see pushpull.rs).
+        let touched = crate::touched_inodes(&*txn.read(), &channel, changes)?;
+        let (pending, covered) = crate::pending_touched(
+            txn.clone(),
+            Some(base),
+            &channel,
+            &repo,
+            &store,
+            &touched,
+            &replaced,
+        )?;
+        crate::output_touched(
+            &repo, &store, &txn, &channel, &touched, &replaced, &covered, false,
+        )?;
 
         // Restore the remote's pending patch to unrecorded state: unrecord it
         // (the working copy keeps the merged content output above) and drop its
@@ -472,41 +427,6 @@ impl Local {
 pub type LocalTxn =
     pijul_core::pristine::sanakirja::GenericTxn<sanakirja::MutTxn<Arc<sanakirja::Env>>>;
 
-/// Map an `output_repository_no_pending` error to a `RemoteError`.
-fn output_err(
-    e: pijul_core::output::OutputError<
-        pijul_core::changestore::filesystem::Error,
-        LocalTxn,
-        std::io::Error,
-    >,
-) -> RemoteError {
-    match e {
-        pijul_core::output::OutputError::WorkingCopy(e) => RemoteError::Io(e),
-        pijul_core::output::OutputError::SmallString(e) => RemoteError::SmallString(e),
-        pijul_core::output::OutputError::Pristine(e) => match e {
-            pijul_core::output::PristineOutputError::Channel(e) => RemoteError::TxnSanakirja(e),
-            pijul_core::output::PristineOutputError::Tree(e) => RemoteError::TreeSanakirja(e),
-            pijul_core::output::PristineOutputError::Changestore(e) => RemoteError::Filesystem(e),
-            pijul_core::output::PristineOutputError::Io(e) => RemoteError::Io(e),
-            pijul_core::output::PristineOutputError::Fs(e) => match e {
-                pijul_core::FsError::Tree(e) => RemoteError::TreeSanakirja(e),
-                pijul_core::FsError::SmallString(e) => RemoteError::SmallString(e),
-                _ => RemoteError::Corruption,
-            },
-        },
-    }
-}
-
-/// Map a `find_path` error to a `RemoteError`.
-fn find_path_err(
-    e: pijul_core::output::FileError<pijul_core::changestore::filesystem::Error, LocalTxn>,
-) -> RemoteError {
-    match e {
-        pijul_core::output::FileError::Changestore(e) => RemoteError::Filesystem(e),
-        pijul_core::output::FileError::Txn(e) => RemoteError::TxnSanakirja(e),
-        pijul_core::output::FileError::Io(e) => RemoteError::Io(e),
-    }
-}
 /*
 pub enum LocalError {
     Remote(crate::error::RemoteError),
@@ -532,9 +452,13 @@ pub fn upload_changes<T: MutTxnTExt>(
     channel: &pijul_core::pristine::ChannelRef<T>,
     changes: &[CS],
 ) -> Result<(), crate::error::Error<T>> {
+    // Honor `replaces` (see `Local::upload_changes`). No working copy to output.
+    let kept = crate::drop_superseded(&*txn, changes);
+    crate::unrecord_superseded(txn, store, channel, &kept)
+        .map_err(|e| RemoteError::RemoteError(e.to_string()))?;
     let mut ws = pijul_core::ApplyWorkspace::new();
     let mut channel = channel.write();
-    for c in changes {
+    for c in kept.iter() {
         match c {
             CS::Change(c) => {
                 txn.apply_change_ws(store, &mut *channel, c, &mut ws)
