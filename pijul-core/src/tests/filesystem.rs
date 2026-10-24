@@ -3,6 +3,56 @@ use std::io::Write;
 
 const MAX_FILES: usize = 10;
 
+/// `reset` outputs with `if_modified_since` = the channel's last modification.
+/// An edit whose mtime predates that (restored by `cp -p`, `tar`, `rsync -a`…)
+/// must still be reverted, not skipped on the strength of its old mtime.
+#[test]
+fn output_if_modified_since_old_mtime_edit() -> Result<(), anyhow::Error> {
+    env_logger::try_init().unwrap_or(());
+
+    let r = tempfile::tempdir()?;
+    let repo = working_copy::filesystem::FileSystem::from_root(r.path());
+    let f = tempfile::tempdir()?;
+    let changes = changestore::filesystem::FileSystem::from_root(f.path(), MAX_FILES);
+
+    repo.write_file("file", Inode::ROOT)
+        .unwrap()
+        .write_all(&b"a\n"[..])
+        .unwrap();
+
+    let f = tempfile::tempdir()?;
+    let env = pristine::sanakirja::Pristine::new(f.path().join("pristine"))?;
+    let txn = env.arc_txn_begin().unwrap();
+    txn.write().add_file("file", 0).unwrap();
+    let channel = txn
+        .write()
+        .open_or_create_channel(&SmallString::from_str("main"))
+        .unwrap();
+    record_all(&repo, &changes, &txn, &channel, "").unwrap();
+
+    // Same size, but an mtime well before the channel's last modification.
+    let path = r.path().join("file");
+    std::fs::write(&path, b"z\n")?;
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::open(&path)?.set_times(std::fs::FileTimes::new().set_modified(old))?;
+
+    let since = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    output::output_repository_no_pending(
+        &repo,
+        &changes,
+        &txn,
+        &channel,
+        "",
+        true,
+        Some(since),
+        1,
+        0,
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(&path)?, b"a\n");
+    Ok(())
+}
+
 #[test]
 fn filesystem() -> Result<(), anyhow::Error> {
     env_logger::try_init().unwrap_or(());

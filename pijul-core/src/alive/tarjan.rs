@@ -9,6 +9,11 @@ impl Graph {
             sccs.push_to_last(VertexId(0));
             return sccs;
         }
+        // This may be a second pass, after the redundant edges of the first one
+        // were dropped.
+        for l in self.lines.iter_mut() {
+            l.flags.remove(Flags::VISITED | Flags::ONSTACK);
+        }
         let mut call_stack = vec![(VertexId(1), 0, true)];
 
         let mut index = 0;

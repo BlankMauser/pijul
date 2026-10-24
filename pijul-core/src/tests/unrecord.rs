@@ -439,7 +439,7 @@ fn zombie_(file: Option<&[u8]>, order: bool) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-fn check_unrec<T: crate::pristine::GraphIter + crate::pristine::ChannelTxnT>(
+pub(super) fn check_unrec<T: crate::pristine::GraphIter + crate::pristine::ChannelTxnT>(
     txn: &T,
     channel: &T::Channel,
     h: Hash,
@@ -450,9 +450,15 @@ fn check_unrec<T: crate::pristine::GraphIter + crate::pristine::ChannelTxnT>(
         let (v, e) = c.unwrap();
         debug!("{:?} {:?}", v, e);
         if let Some(h) = h {
-            assert!(v.change != *h);
-            assert!(e.dest().change != *h);
-            assert!(e.introduced_by() != *h);
+            assert!(v.change != *h, "{:?} {:?}", v, e);
+            assert!(e.dest().change != *h, "{:?} {:?}", v, e);
+            assert!(
+                e.introduced_by() != *h,
+                "{:?} {:?}, unrecorded {:?}",
+                v,
+                e,
+                h
+            );
         } else {
             // Every referenced change must still resolve (external + changeset).
             if !v.change.is_root() {
@@ -468,7 +474,8 @@ fn check_unrec<T: crate::pristine::GraphIter + crate::pristine::ChannelTxnT>(
                     .unwrap();
             }
             if !e.introduced_by().is_root() {
-                txn.get_external(&e.introduced_by()).unwrap();
+                txn.get_external(&e.introduced_by())
+                    .unwrap_or_else(|_| panic!("unknown introducer: {:?} {:?}", v, e));
                 txn.get_changeset(txn.changes(channel), &e.introduced_by())
                     .unwrap()
                     .unwrap();
@@ -574,6 +581,167 @@ fn zombie_unrec() -> Result<(), anyhow::Error> {
         &*channel.read(),
         std::fs::File::create("alice-unrec.dot").unwrap(),
     )?;
+    Ok(())
+}
+
+/// A zombie conflict resolved by keeping only the end of a zombie block. The
+/// resolution must not move the block's context edge (from a concurrent
+/// insertion) onto the start of the part it keeps: unrecording the resolution
+/// would put that edge back in the graph, introduced by the insertion, whose
+/// atoms never mention it, so that unrecording the insertion leaves it there.
+#[test]
+fn zombie_partial_resurrection_unrec() -> Result<(), anyhow::Error> {
+    env_logger::try_init().unwrap_or(());
+
+    let changes = changestore::memory::Memory::new();
+    let env = pristine::sanakirja::Pristine::new_anon()?;
+    let txn = env.arc_txn_begin().unwrap();
+    txn.write().add_file("file", 0)?;
+
+    let base = working_copy::memory::Memory::new();
+    base.add_file("file", b"u\na\nb\nv\n".to_vec());
+    let c0 = txn
+        .write()
+        .open_or_create_channel(&SmallString::from_str("c0"))?;
+    let h0 = record_all(&base, &changes, &txn, &c0, "")?;
+    let c1 = txn.write().fork(&c0, &SmallString::from_str("c1"))?;
+
+    // c0 deletes the context of a block that c1 inserts, then splits with
+    // another insertion.
+    let wc0 = working_copy::memory::Memory::new();
+    output::output_repository_no_pending(&wc0, &changes, &txn, &c0, "", true, None, 1, 0)?;
+    wc0.write_file("file", Inode::ROOT)?.write_all(b"u\nv\n")?;
+    let del = record_all(&wc0, &changes, &txn, &c0, "")?;
+
+    let wc1 = working_copy::memory::Memory::new();
+    output::output_repository_no_pending(&wc1, &changes, &txn, &c1, "", true, None, 1, 0)?;
+    wc1.write_file("file", Inode::ROOT)?
+        .write_all(b"u\na\nz1\nz2\nz3\nb\nv\n")?;
+    let z = record_all(&wc1, &changes, &txn, &c1, "")?;
+    wc1.write_file("file", Inode::ROOT)?
+        .write_all(b"u\na\nz1\nw\nz2\nz3\nb\nv\n")?;
+    let w = record_all(&wc1, &changes, &txn, &c1, "")?;
+
+    // The block is a zombie on c1: drop the start of the vertex following
+    // `w`, keep its end.
+    apply::apply_change_arc(&changes, &txn, &c1, &del)?;
+    output::output_repository_no_pending(&wc1, &changes, &txn, &c1, "", true, None, 1, 0)?;
+    let mut buf = Vec::new();
+    wc1.read_file("file", &mut buf)?;
+    assert!(
+        buf.windows(3).any(|l| l == b"z3\n") && buf.windows(7).any(|l| l == b">>>>>>>"),
+        "{:?}",
+        std::str::from_utf8(&buf)
+    );
+    wc1.write_file("file", Inode::ROOT)?
+        .write_all(b"u\nz1\nw\nz3\nv\n")?;
+    let resolution = record_all(&wc1, &changes, &txn, &c1, "")?;
+    output::output_repository_no_pending(&wc1, &changes, &txn, &c1, "", true, None, 1, 0)?;
+    buf.clear();
+    wc1.read_file("file", &mut buf)?;
+    assert_eq!(std::str::from_utf8(&buf), Ok("u\nz1\nw\nz3\nv\n"));
+
+    for h in [resolution, w] {
+        crate::unrecord::unrecord(
+            &mut *txn.write(),
+            &c1,
+            &changes,
+            &h,
+            0,
+            &mut Default::default(),
+        )?;
+        check_unrec(&*txn.read(), &*c1.read(), h);
+    }
+
+    // Same file as the remaining changes applied on a fresh channel.
+    let fresh = txn
+        .write()
+        .open_or_create_channel(&SmallString::from_str("fresh"))?;
+    for h in [h0, z, del] {
+        apply::apply_change_arc(&changes, &txn, &fresh, &h)?;
+    }
+    let render = |c: &ChannelRef<_>| -> Result<Vec<u8>, anyhow::Error> {
+        let wc = working_copy::memory::Memory::new();
+        output::output_repository_no_pending(&wc, &changes, &txn, c, "", true, None, 1, 0)?;
+        let mut buf = Vec::new();
+        wc.read_file("file", &mut buf)?;
+        Ok(buf)
+    };
+    assert_eq!(render(&c1)?, render(&fresh)?);
+    Ok(())
+}
+
+/// An insertion X is deleted by Z (which knows it), and its down context is
+/// deleted by D (which does not). Applied before Z, D marks X's line as a
+/// zombie; applied after Z, it must leave the same marks on the already
+/// deleted line, or unrecording Z leaves that line plainly alive where
+/// replaying X and D gives a zombie conflict (and a change recorded over it
+/// does not replay).
+#[test]
+fn zombie_context_deleted_twice_unrec() -> Result<(), anyhow::Error> {
+    env_logger::try_init().unwrap_or(());
+
+    let changes = changestore::memory::Memory::new();
+    let env = pristine::sanakirja::Pristine::new_anon()?;
+    let txn = env.arc_txn_begin().unwrap();
+    txn.write().add_file("file", 0)?;
+
+    let base = working_copy::memory::Memory::new();
+    base.add_file("file", b"u\na\nv\n".to_vec());
+    let c0 = txn
+        .write()
+        .open_or_create_channel(&SmallString::from_str("c0"))?;
+    let h0 = record_all(&base, &changes, &txn, &c0, "")?;
+    let c1 = txn.write().fork(&c0, &SmallString::from_str("c1"))?;
+
+    let wc0 = working_copy::memory::Memory::new();
+    output::output_repository_no_pending(&wc0, &changes, &txn, &c0, "", true, None, 1, 0)?;
+    wc0.write_file("file", Inode::ROOT)?.write_all(b"u\nv\n")?;
+    let d = record_all(&wc0, &changes, &txn, &c0, "")?;
+
+    let wc1 = working_copy::memory::Memory::new();
+    output::output_repository_no_pending(&wc1, &changes, &txn, &c1, "", true, None, 1, 0)?;
+    wc1.write_file("file", Inode::ROOT)?
+        .write_all(b"u\nx\na\nv\n")?;
+    let x = record_all(&wc1, &changes, &txn, &c1, "")?;
+    wc1.write_file("file", Inode::ROOT)?
+        .write_all(b"u\na\nv\n")?;
+    let z = record_all(&wc1, &changes, &txn, &c1, "")?;
+
+    apply::apply_change_arc(&changes, &txn, &c1, &d)?;
+    crate::unrecord::unrecord(
+        &mut *txn.write(),
+        &c1,
+        &changes,
+        &z,
+        0,
+        &mut Default::default(),
+    )?;
+    check_unrec(&*txn.read(), &*c1.read(), z);
+
+    let fresh = txn
+        .write()
+        .open_or_create_channel(&SmallString::from_str("fresh"))?;
+    for h in [h0, x, d] {
+        apply::apply_change_arc(&changes, &txn, &fresh, &h)?;
+    }
+    let render = |c: &ChannelRef<_>| -> Result<Vec<u8>, anyhow::Error> {
+        let wc = working_copy::memory::Memory::new();
+        output::output_repository_no_pending(&wc, &changes, &txn, c, "", true, None, 1, 0)?;
+        let mut buf = Vec::new();
+        wc.read_file("file", &mut buf)?;
+        Ok(buf)
+    };
+    let replayed = render(&fresh)?;
+    assert!(
+        replayed.windows(7).any(|l| l == b">>>>>>>"),
+        "{:?}",
+        std::str::from_utf8(&replayed)
+    );
+    assert_eq!(
+        std::str::from_utf8(&render(&c1)?),
+        std::str::from_utf8(&replayed)
+    );
     Ok(())
 }
 
@@ -1367,7 +1535,7 @@ fn fuzz_has_dependent(changes: &changestore::memory::Memory, applied: &[Hash], c
 
 /// A valid (dependency-respecting) apply order for `subset`. `reverse` picks the
 /// highest-index applicable change each step (a different valid order).
-fn fuzz_valid_order(
+pub(super) fn fuzz_valid_order(
     changes: &changestore::memory::Memory,
     subset: &[Hash],
     reverse: bool,
@@ -1422,7 +1590,7 @@ where
 }
 
 /// Apply a few random line-level edits to `content`.
-fn fuzz_mutate(content: &[u8], rng: &mut ChaCha20Rng) -> Vec<u8> {
+pub(super) fn fuzz_mutate(content: &[u8], rng: &mut ChaCha20Rng) -> Vec<u8> {
     let mut lines: Vec<Vec<u8>> = content.split(|&b| b == b'\n').map(|s| s.to_vec()).collect();
     // `split` on a trailing '\n' leaves a final empty element; drop it.
     if lines.last().map_or(false, |l| l.is_empty()) {
@@ -1532,6 +1700,14 @@ fn fuzz_seed(seed: u64, nsteps: usize, verbose: bool) -> Result<(), anyhow::Erro
                         h.to_base32(),
                         String::from_utf8_lossy(&newc)
                     );
+                    if std::env::var("FUZZ_PRINT_CHANGES").is_ok() {
+                        changes.get_change(&h)?.write(
+                            &changes,
+                            Some(h),
+                            true,
+                            &mut std::io::stderr(),
+                        )?;
+                    }
                 }
             }
             // ---- APPLY an existing change to a channel -----------------
@@ -1550,7 +1726,22 @@ fn fuzz_seed(seed: u64, nsteps: usize, verbose: bool) -> Result<(), anyhow::Erro
                 let c = all[rng.random_range(0..all.len())];
                 let ci = rng.random_range(0..chans.len());
                 if fuzz_deps_satisfied(&changes, &chans[ci].applied, &c) {
+                    let dump = std::env::var("FUZZ_DUMP").is_ok();
+                    if dump {
+                        crate::pristine::debug(
+                            &*txn.read(),
+                            &*chans[ci].channel.read(),
+                            std::fs::File::create("ap-before.dot").unwrap(),
+                        )?;
+                    }
                     apply::apply_change_arc(&changes, &txn, &chans[ci].channel, &c)?;
+                    if dump {
+                        crate::pristine::debug(
+                            &*txn.read(),
+                            &*chans[ci].channel.read(),
+                            std::fs::File::create("ap-after.dot").unwrap(),
+                        )?;
+                    }
                     chans[ci].applied.push(c);
                     if verbose {
                         eprintln!("[{step}] APPLY {} to c{ci}", c.to_base32());
@@ -1600,6 +1791,13 @@ fn fuzz_seed(seed: u64, nsteps: usize, verbose: bool) -> Result<(), anyhow::Erro
                     0,
                     &mut Default::default(),
                 )?;
+                if dump {
+                    crate::pristine::debug(
+                        &*txn.read(),
+                        &*chans[ci].channel.read(),
+                        std::fs::File::create("rt-after.dot").unwrap(),
+                    )?;
+                }
                 let after = fuzz_render(&changes, &txn, &chans[ci].channel)?;
                 // Round-trip `apply(C)` then `unrecord(C)` must restore the file
                 // PROJECTION, but (per the author) may leave benign graph residue
@@ -1658,6 +1856,20 @@ fn fuzz_seed(seed: u64, nsteps: usize, verbose: bool) -> Result<(), anyhow::Erro
                     continue;
                 }
                 let c = cand[rng.random_range(0..cand.len())];
+                if verbose {
+                    eprintln!("[{step}] DEEP unrecord {} on c{ci} start", c.to_base32());
+                }
+                let deep_dump = std::env::var("FUZZ_DUMP_STEP")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    == Some(step);
+                if deep_dump {
+                    crate::pristine::debug(
+                        &*txn.read(),
+                        &*chans[ci].channel.read(),
+                        std::fs::File::create("deep-before.dot").unwrap(),
+                    )?;
+                }
                 crate::unrecord::unrecord(
                     &mut *txn.write(),
                     &chans[ci].channel,
@@ -1667,6 +1879,13 @@ fn fuzz_seed(seed: u64, nsteps: usize, verbose: bool) -> Result<(), anyhow::Erro
                     &mut Default::default(),
                 )?;
                 chans[ci].applied.retain(|x| *x != c);
+                if deep_dump {
+                    crate::pristine::debug(
+                        &*txn.read(),
+                        &*chans[ci].channel.read(),
+                        std::fs::File::create("deep-after.dot").unwrap(),
+                    )?;
+                }
 
                 // Dangling-reference invariant: after unrecording `c`, no edge in
                 // the channel may still reference it. The content oracle can't
@@ -1916,9 +2135,27 @@ fn fuzz_seed(seed: u64, nsteps: usize, verbose: bool) -> Result<(), anyhow::Erro
                 );
             }
             if !pseudo.is_empty() {
+                if std::env::var("FUZZ_DUMP").is_ok() {
+                    crate::pristine::debug(
+                        &*txn.read(),
+                        &*c.channel.read(),
+                        std::fs::File::create(format!("pseudo-only-c{ci}.dot")).unwrap(),
+                    )?;
+                }
                 anyhow::bail!(
                     "seed {seed} step {step}: pseudo-only vertices on c{ci}: {:?}",
                     pseudo
+                );
+            }
+            // A pseudo-edge is a shortcut over a region of dead vertices: one
+            // with no path to back it orders the graph on its own, and that
+            // order depends on when each change was applied.
+            let unjustified =
+                crate::pristine::check_pseudo_justified(&*txn.read(), &c.channel.read());
+            if !unjustified.is_empty() {
+                anyhow::bail!(
+                    "seed {seed} step {step}: unjustified pseudo-edges on c{ci}: {:?}",
+                    unjustified
                 );
             }
         }
@@ -1999,10 +2236,192 @@ fn fuzz_unrecord_smoke() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Re-adding an edge whose source was deleted by a change unknown to the
+/// applied one also puts that edge deleted by it, without BLOCK: an ordering
+/// edge, not a zombie marking. Unrecording the deleting change used to remove
+/// only its DELETED|BLOCK markings, leaving that one behind (`check_unrec`,
+/// unknown introducer).
+#[test]
+fn fuzz_unrecord_ordering_edge() -> Result<(), anyhow::Error> {
+    env_logger::try_init().unwrap_or(());
+    struct Clock;
+    impl Drop for Clock {
+        fn drop(&mut self) {
+            crate::tests::fuzz_clock_clear()
+        }
+    }
+    crate::tests::fuzz_clock_set(1_700_000_000_000_000_000);
+    let _clock = Clock;
+    fuzz_seed(5030709, 36, false)
+}
+
+/// A pseudo-edge bridges a region of dead vertices. Nothing used to remove one
+/// when that region came back to life — a vertex revived by an unrecord, an
+/// edge taken away, a block split — so the shortcut stayed, backed by no path
+/// at all, and went on ordering the graph by itself: the channel then rendered
+/// differently from a fresh replay of its own changes. `apply` and `unrecord`
+/// now sweep the files they touch (`clean_unjustified_pseudo_edges`).
+#[test]
+fn fuzz_unrecord_unjustified_pseudo_edge() -> Result<(), anyhow::Error> {
+    env_logger::try_init().unwrap_or(());
+    struct Clock;
+    impl Drop for Clock {
+        fn drop(&mut self) {
+            crate::tests::fuzz_clock_clear()
+        }
+    }
+    crate::tests::fuzz_clock_set(1_700_000_000_000_000_000 + 40 * 10_000_000);
+    let _clock = Clock;
+    fuzz_seed(40, 39, false)
+}
+
+/// Unrecording an edge the change had introduced *alive* (`previous == flag ==
+/// BLOCK`) can take away the target's last alive parent when the unrecord does
+/// not reintroduce it. `put_newedge` only maintained the pseudo edges around a
+/// DELETED atom, so the vertex was left dead but still reachable through a
+/// pseudo edge inherited from an earlier reconnection (`check_alive`,
+/// "pseudo-only vertices").
+#[test]
+fn fuzz_unrecord_pseudo_only_vertex() -> Result<(), anyhow::Error> {
+    env_logger::try_init().unwrap_or(());
+    struct Clock;
+    impl Drop for Clock {
+        fn drop(&mut self) {
+            crate::tests::fuzz_clock_clear()
+        }
+    }
+    crate::tests::fuzz_clock_set(1_700_000_000_000_000_000);
+    let _clock = Clock;
+    fuzz_seed(5019856, 40, false)
+}
+
+fn record_content<T>(
+    txn: &ArcTxn<T>,
+    changes: &changestore::memory::Memory,
+    channel: &ChannelRef<T>,
+    content: &[u8],
+) -> Result<Hash, anyhow::Error>
+where
+    T: MutTxnT + crate::pristine::GraphIter + Send + Sync + 'static,
+    T::Channel: Send + Sync,
+{
+    let wc = working_copy::memory::Memory::new();
+    output::output_repository_no_pending(&wc, changes, txn, channel, "", true, None, 1, 0)?;
+    wc.write_file("file", Inode::ROOT)?.write_all(content)?;
+    Ok(record_all(&wc, changes, txn, channel, "")?)
+}
+
+/// D deletes B; X, unaware of D, inserts x right above B, which makes x a
+/// zombie; R, aware of both, resurrects x; I, recorded after R, inserts y below
+/// x. Applying I before or after R must give the same file.
+#[test]
+fn zombie_resolution_commutes_with_insertion_below() -> Result<(), anyhow::Error> {
+    env_logger::try_init().unwrap_or(());
+    let changes = changestore::memory::Memory::new();
+    let env = pristine::sanakirja::Pristine::new_anon()?;
+    let txn = env.arc_txn_begin().unwrap();
+    let base = working_copy::memory::Memory::new();
+    base.add_file("file", b"A\nB\nC\n".to_vec());
+    txn.write().add_file("file", 0)?;
+    let c0 = txn
+        .write()
+        .open_or_create_channel(&SmallString::from_str("c0"))?;
+    let h0 = record_all(&base, &changes, &txn, &c0, "")?;
+    let cd = txn.write().fork(&c0, &SmallString::from_str("d"))?;
+    let cx = txn.write().fork(&c0, &SmallString::from_str("x"))?;
+    let d = record_content(&txn, &changes, &cd, b"A\nC\n")?;
+    let x = record_content(&txn, &changes, &cx, b"A\nx\nB\nC\n")?;
+
+    let cr = txn.write().fork(&c0, &SmallString::from_str("r"))?;
+    apply::apply_change_arc(&changes, &txn, &cr, &d)?;
+    apply::apply_change_arc(&changes, &txn, &cr, &x)?;
+    let zombie = fuzz_render(&changes, &txn, &cr)?;
+    debug!("zombie: {:?}", String::from_utf8_lossy(&zombie.0));
+    assert!(zombie.1 > 0);
+    let r = record_content(&txn, &changes, &cr, b"A\nx\nC\n")?;
+    assert_eq!(
+        fuzz_render(&changes, &txn, &cr)?,
+        (b"A\nx\nC\n".to_vec(), 0)
+    );
+    let i = record_content(&txn, &changes, &cr, b"A\nx\ny\nC\n")?;
+    if std::env::var("FUZZ_PRINT_CHANGES").is_ok() {
+        for (name, h) in [("D", d), ("X", x), ("R", r), ("I", i)] {
+            eprintln!("===== {name} = {}", h.to_base32());
+            changes
+                .get_change(&h)?
+                .write(&changes, Some(h), true, &mut std::io::stderr())?;
+        }
+    }
+
+    let mut got = Vec::new();
+    for (name, order) in [("o1", [h0, d, x, r, i]), ("o2", [h0, d, x, i, r])] {
+        let ch = txn
+            .write()
+            .open_or_create_channel(&SmallString::from_str(name))?;
+        for h in order.iter() {
+            apply::apply_change_arc(&changes, &txn, &ch, h)?;
+        }
+        if let Ok(dir) = std::env::var("FUZZ_DOT") {
+            crate::pristine::debug_to_file(&*txn.read(), &ch, format!("{dir}/{name}.dot"))?;
+        }
+        got.push(fuzz_render(&changes, &txn, &ch)?);
+    }
+    assert_eq!(
+        (String::from_utf8_lossy(&got[0].0), got[0].1),
+        (String::from_utf8_lossy(&got[1].0), got[1].1)
+    );
+    assert_eq!(got[0], (b"A\nx\ny\nC\n".to_vec(), 0));
+    Ok(())
+}
+
+/// X inserts x below B, Y (aware of X) inserts y below x, and D, unaware of
+/// both, deletes B. Applying D before or after X and Y must give the same file:
+/// after, `put_newvertex` marks y because its context x is a zombie; before,
+/// the deletion must mark it too.
+#[test]
+fn zombie_deletion_commutes_with_insertion_chain() -> Result<(), anyhow::Error> {
+    env_logger::try_init().unwrap_or(());
+    let changes = changestore::memory::Memory::new();
+    let env = pristine::sanakirja::Pristine::new_anon()?;
+    let txn = env.arc_txn_begin().unwrap();
+    let base = working_copy::memory::Memory::new();
+    base.add_file("file", b"A\nB\nC\n".to_vec());
+    txn.write().add_file("file", 0)?;
+    let c0 = txn
+        .write()
+        .open_or_create_channel(&SmallString::from_str("c0"))?;
+    let h0 = record_all(&base, &changes, &txn, &c0, "")?;
+    let cd = txn.write().fork(&c0, &SmallString::from_str("d"))?;
+    let cx = txn.write().fork(&c0, &SmallString::from_str("x"))?;
+    let d = record_content(&txn, &changes, &cd, b"A\nC\n")?;
+    let x = record_content(&txn, &changes, &cx, b"A\nB\nx\nC\n")?;
+    let y = record_content(&txn, &changes, &cx, b"A\nB\nx\ny\nC\n")?;
+
+    let mut got = Vec::new();
+    for (name, order) in [("o1", [h0, x, y, d]), ("o2", [h0, d, x, y])] {
+        let ch = txn
+            .write()
+            .open_or_create_channel(&SmallString::from_str(name))?;
+        for h in order.iter() {
+            apply::apply_change_arc(&changes, &txn, &ch, h)?;
+        }
+        if let Ok(dir) = std::env::var("FUZZ_DOT") {
+            crate::pristine::debug_to_file(&*txn.read(), &ch, format!("{dir}/{name}.dot"))?;
+        }
+        got.push(fuzz_render(&changes, &txn, &ch)?);
+    }
+    assert_eq!(
+        (String::from_utf8_lossy(&got[0].0), got[0].1),
+        (String::from_utf8_lossy(&got[1].0), got[1].1)
+    );
+    Ok(())
+}
+
 /// Long-running, multi-threaded search. Ignored by default; run explicitly.
 #[test]
 #[ignore]
 fn fuzz_unrecord_zombies() {
+    env_logger::try_init().unwrap_or(());
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
     use std::sync::{Arc, Mutex};
 
@@ -2737,5 +3156,44 @@ fn unrecord_zombie_marking_57() -> Result<(), anyhow::Error> {
         String::from_utf8_lossy(&unrec),
         String::from_utf8_lossy(&rep),
     );
+    Ok(())
+}
+
+/// A change whose file has vanished from the changestore must make
+/// `unrecord` return an error, not panic (`Change::deserialize` used to
+/// `unwrap()` the `File::open` result).
+#[test]
+fn missing_change_file_is_an_error() -> Result<(), anyhow::Error> {
+    env_logger::try_init().unwrap_or(());
+
+    let dir = tempfile::tempdir()?;
+    let changes = changestore::filesystem::FileSystem::from_changes(dir.path().to_path_buf(), 100);
+    let repo = working_copy::memory::Memory::new();
+    repo.add_file("file", b"a\nb\n".to_vec());
+
+    let env = pristine::sanakirja::Pristine::new_anon()?;
+    let txn = env.arc_txn_begin().unwrap();
+    txn.write().add_file("file", 0)?;
+    let channel = txn
+        .write()
+        .open_or_create_channel(&SmallString::from_str("main"))?;
+    let h = record_all(&repo, &changes, &txn, &channel, "")?;
+
+    std::fs::remove_file(changes.filename(&h))?;
+
+    let res = crate::unrecord::unrecord(
+        &mut *txn.write(),
+        &channel,
+        &changes,
+        &h,
+        0,
+        &mut Default::default(),
+    );
+    match res {
+        Err(crate::unrecord::UnrecordError::Changestore(e)) => {
+            assert!(e.to_string().contains(&h.to_base32()), "{}", e);
+        }
+        other => panic!("expected a changestore error, got {:?}", other.map(|_| ())),
+    }
     Ok(())
 }

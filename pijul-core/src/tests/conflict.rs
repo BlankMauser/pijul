@@ -3264,3 +3264,239 @@ fn record_new_file_conflict_markers() -> Result<(), anyhow::Error> {
     );
     Ok(())
 }
+
+// Two inverse resolutions of the same order conflict make a cycle `x <-> u` of
+// alive vertices, both sitting right above `b`. Alice, who knows both edges
+// into `b`, deletes `b` and `b2`; Dave, who knows only the initial file,
+// inserts `y` after `b2`. Applying both leaves a dead region `b b2` with `x`
+// and `u` as its alive ancestors and `y` as an alive descendant that only the
+// dead region leads to, which is the missing context `repair_zombies`
+// reconnects. Since `x` and `u` reach each other, neither is maximal in the
+// alive order, so the transitive reduction of the reconnection must not drop
+// them both: `x` and `u` must keep reaching `y` over alive edges.
+#[test]
+fn cyclic_entering_zombie() -> Result<(), anyhow::Error> {
+    env_logger::try_init().unwrap_or(());
+
+    let contents = b"a\nb\nb2\nc\n";
+    let alice = b"a\nx\nb\nb2\nc\n";
+    let bob = b"a\nu\nb\nb2\nc\n";
+    let alice_resolution = b"a\nx\nu\nb\nb2\nc\n";
+    let bob_resolution = b"a\nu\nx\nb\nb2\nc\n";
+    let alice_deletion = b"a\nx\nu\nc\n";
+    let dave = b"a\nb\nb2\ny\nc\n";
+
+    let repo_alice = working_copy::memory::Memory::new();
+    let changes = changestore::memory::Memory::new();
+    repo_alice.add_file("file", contents.to_vec());
+
+    let env = pristine::sanakirja::Pristine::new_anon()?;
+    let txn = env.arc_txn_begin().unwrap();
+    let channel_alice = txn
+        .write()
+        .open_or_create_channel(&SmallString::from_str("alice"))?;
+    txn.write().add_file("file", 0)?;
+    let init_h = record_all(&repo_alice, &changes, &txn, &channel_alice, "")?;
+
+    // Bob and Dave clone.
+    let repo_bob = working_copy::memory::Memory::new();
+    let channel_bob = txn
+        .write()
+        .open_or_create_channel(&SmallString::from_str("bob"))?;
+    apply::apply_change_arc(&changes, &txn, &channel_bob, &init_h)?;
+    output::output_repository_no_pending(
+        &repo_bob,
+        &changes,
+        &txn,
+        &channel_bob,
+        "",
+        true,
+        None,
+        1,
+        0,
+    )?;
+    let repo_dave = working_copy::memory::Memory::new();
+    let channel_dave = txn
+        .write()
+        .open_or_create_channel(&SmallString::from_str("dave"))?;
+    apply::apply_change_arc(&changes, &txn, &channel_dave, &init_h)?;
+    output::output_repository_no_pending(
+        &repo_dave,
+        &changes,
+        &txn,
+        &channel_dave,
+        "",
+        true,
+        None,
+        1,
+        0,
+    )?;
+
+    // Alice and Bob each insert a line before `b`; Dave inserts one after it.
+    repo_alice
+        .write_file("file", Inode::ROOT)
+        .unwrap()
+        .write_all(alice)
+        .unwrap();
+    let alice_h = record_all(&repo_alice, &changes, &txn, &channel_alice, "")?;
+    repo_bob
+        .write_file("file", Inode::ROOT)
+        .unwrap()
+        .write_all(bob)
+        .unwrap();
+    let bob_h = record_all(&repo_bob, &changes, &txn, &channel_bob, "")?;
+    repo_dave
+        .write_file("file", Inode::ROOT)
+        .unwrap()
+        .write_all(dave)
+        .unwrap();
+    let dave_h = record_all(&repo_dave, &changes, &txn, &channel_dave, "")?;
+
+    // Alice and Bob each apply the other's change and resolve the order
+    // conflict the opposite way: x < u for Alice, u < x for Bob.
+    apply::apply_change_arc(&changes, &txn, &channel_alice, &bob_h)?;
+    output::output_repository_no_pending(
+        &repo_alice,
+        &changes,
+        &txn,
+        &channel_alice,
+        "",
+        true,
+        None,
+        1,
+        0,
+    )?;
+    repo_alice
+        .write_file("file", Inode::ROOT)
+        .unwrap()
+        .write_all(alice_resolution)
+        .unwrap();
+    let alice_resolution_h = record_all(&repo_alice, &changes, &txn, &channel_alice, "")?;
+
+    apply::apply_change_arc(&changes, &txn, &channel_bob, &alice_h)?;
+    output::output_repository_no_pending(
+        &repo_bob,
+        &changes,
+        &txn,
+        &channel_bob,
+        "",
+        true,
+        None,
+        1,
+        0,
+    )?;
+    repo_bob
+        .write_file("file", Inode::ROOT)
+        .unwrap()
+        .write_all(bob_resolution)
+        .unwrap();
+    let bob_resolution_h = record_all(&repo_bob, &changes, &txn, &channel_bob, "")?;
+
+    // Alice, who knows both edges into `b`, deletes it.
+    repo_alice
+        .write_file("file", Inode::ROOT)
+        .unwrap()
+        .write_all(alice_deletion)
+        .unwrap();
+    let alice_deletion_h = record_all(&repo_alice, &changes, &txn, &channel_alice, "")?;
+
+    // Charlie gets everything: the cycle x <-> u, the dead region `b b2` below
+    // it, and `y` hanging off that dead region.
+    let repo_charlie = working_copy::memory::Memory::new();
+    let channel_charlie = txn
+        .write()
+        .open_or_create_channel(&SmallString::from_str("charlie"))?;
+    for h in [
+        &init_h,
+        &alice_h,
+        &bob_h,
+        &alice_resolution_h,
+        &bob_resolution_h,
+        &dave_h,
+        &alice_deletion_h,
+    ] {
+        apply::apply_change_arc(&changes, &txn, &channel_charlie, h)?;
+    }
+    let (alive, reachable) = check_alive(&*txn.read(), &channel_charlie.read());
+    assert!(alive.is_empty(), "alive but unreachable: {:?}", alive);
+    assert!(reachable.is_empty(), "reachable but dead: {:?}", reachable);
+
+    output::output_repository_no_pending(
+        &repo_charlie,
+        &changes,
+        &txn,
+        &channel_charlie,
+        "",
+        true,
+        None,
+        1,
+        0,
+    )?;
+    let mut buf = Vec::new();
+    repo_charlie.read_file("file", &mut buf)?;
+    let text = std::str::from_utf8(&buf)?;
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|l| !l.starts_with(['>', '<', '=']))
+        .collect();
+    let pos = |s: &str| lines.iter().position(|l| *l == s);
+    assert_eq!(pos("a"), Some(0), "{:?}", text);
+    assert_eq!(pos("c"), Some(lines.len() - 1), "{:?}", text);
+    let (x, u, y) = (pos("x"), pos("u"), pos("y"));
+    assert!(x.is_some() && u.is_some() && y.is_some(), "{:?}", text);
+    assert!(
+        y > x && y > u,
+        "`y` must stay after the whole cycle: {:?}",
+        text
+    );
+
+    // The invariant the reconnection must keep: every alive ancestor of the
+    // dead `b` still reaches, over alive edges, every alive descendant of it.
+    {
+        let txn = txn.read();
+        let graph = channel_charlie.read();
+        let graph = txn.graph(&*graph);
+        // Each of these changes inserts exactly one two-byte line, so its only
+        // vertex is [0;2[.
+        let vertex = |h: &Hash| -> Vertex<ChangeId> {
+            let change = *txn.get_internal(&h.into()).unwrap().unwrap();
+            let v = Vertex {
+                change,
+                start: ChangePosition(L64(0)),
+                end: ChangePosition(L64(2)),
+            };
+            // Guard the assumption above, so that a wrong vertex fails here
+            // rather than as a bogus unreachability.
+            assert_eq!(*txn.find_block(graph, v.start_pos()).unwrap(), v);
+            v
+        };
+        let reaches = |from: Vertex<ChangeId>, to: Vertex<ChangeId>| -> bool {
+            let mut stack = vec![from];
+            let mut seen = HashSet::default();
+            while let Some(v) = stack.pop() {
+                if v == to {
+                    return true;
+                }
+                if !seen.insert(v) {
+                    continue;
+                }
+                for e in iter_adjacent(
+                    &*txn,
+                    graph,
+                    v,
+                    EdgeFlags::empty(),
+                    EdgeFlags::all() - EdgeFlags::DELETED - EdgeFlags::PARENT,
+                )
+                .unwrap()
+                {
+                    stack.push(*txn.find_block(graph, e.unwrap().dest()).unwrap());
+                }
+            }
+            false
+        };
+        let (xv, uv, yv) = (vertex(&alice_h), vertex(&bob_h), vertex(&dave_h));
+        assert!(reaches(xv, yv), "`x` must reach `y` over alive edges");
+        assert!(reaches(uv, yv), "`u` must reach `y` over alive edges");
+    }
+    Ok(())
+}

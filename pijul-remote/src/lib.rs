@@ -56,37 +56,492 @@ fn change_titles<S: pijul_core::changestore::ChangeStore>(
         .collect()
 }
 
-/// Record the working copy's pending (unrecorded) changes as an ephemeral patch
-/// on `channel`, returning its hash — or `None` if the working copy is clean.
+/// `changes` without those an amend already applied on this side supersedes (the
+/// obsolescence markers `record --amend` and an applied amend write): applying
+/// one would stack the predecessor back under its amend and conflict with it —
+/// the amend-after-push trap. Tags are kept.
+pub fn drop_superseded<T: TxnT>(txn: &T, changes: &[CS]) -> Vec<CS> {
+    changes
+        .iter()
+        .filter(|c| match c {
+            CS::Change(h) => !txn.is_superseded(h).unwrap_or(false),
+            CS::State(_) => true,
+        })
+        .copied()
+        .collect()
+}
+
+/// Honor the `replaces` lineage of `changes` about to be applied to `channel`:
+/// [`MutTxnTExt::unrecord_superseded`] for each, so an amend replaces its
+/// predecessor instead of stacking on top of it. Shared by every path that
+/// applies received changes (pull, a push into a local repository, the SSH
+/// server side), like `pijul apply`.
 ///
-/// Shared by every operation that must apply changes on top of an unrecorded
-/// working copy without destroying it: `pull` and `unrecord --reset` (the local
-/// side), and a push into a local repository (`Local::upload_changes`, the
-/// remote side). The caller records this patch, applies/outputs the incoming
-/// changes on top so `output` merges them with it instead of overwriting, then
-/// unrecords it to restore the working copy's changes to their unrecorded state.
-pub fn pending<T: MutTxnTExt + TxnT + Send + Sync + 'static>(
+/// Returns the paths touched by the predecessors this unrecorded from `channel`.
+/// The caller outputs them with the applied changes' own: a file only the
+/// predecessor edited would otherwise keep its content in the working copy. A
+/// file only the predecessor added stays on disk, untracked, as after `pijul
+/// unrecord`. Must be called with no write guard held on `channel`.
+pub fn unrecord_superseded<T: MutTxnTExt, C: pijul_core::changestore::ChangeStore>(
+    txn: &mut T,
+    store: &C,
+    channel: &ChannelRef<T>,
+    changes: &[CS],
+) -> Result<std::collections::BTreeSet<String>, pijul_core::unrecord::UnrecordError<C::Error, T>> {
+    let mut paths = std::collections::BTreeSet::new();
+    for c in changes {
+        let CS::Change(h) = c else { continue };
+        let Ok(change) = store.get_change(h) else {
+            continue;
+        };
+        for pred in change.replaces_chain() {
+            let on_channel = match txn.get_internal(&(&pred).into())? {
+                Some(id) => txn
+                    .get_changeset(txn.changes(&*channel.read()), id)?
+                    .is_some(),
+                None => false,
+            };
+            if !on_channel {
+                continue;
+            }
+            if let Ok(pred) = store.get_change(&pred) {
+                paths.extend(
+                    pred.changes
+                        .iter()
+                        .map(|hunk| hunk.path())
+                        .filter(|p| !p.is_empty())
+                        .map(str::to_owned),
+                );
+            }
+        }
+        txn.unrecord_superseded(store, channel, h)?;
+    }
+    Ok(paths)
+}
+
+fn other<E: std::fmt::Display>(e: E) -> RemoteError {
+    RemoteError::RemoteError(e.to_string())
+}
+
+/// A fork of a channel taken before incoming changes are applied to it, i.e. of
+/// the state the working copy reflects: [`pending_touched`] records the pending
+/// patch against it.
+pub struct PendingBase<T: MutTxnT> {
+    name: pijul_core::small_string::SmallString,
+    channel: ChannelRef<T>,
+}
+
+impl<T: MutTxnT> PendingBase<T> {
+    pub fn channel(&self) -> &ChannelRef<T> {
+        &self.channel
+    }
+}
+
+/// Fork `channel` into a [`PendingBase`]. Call before modifying `channel`.
+pub fn fork_pending_base<T: MutTxnT>(
+    txn: &mut T,
+    channel: &ChannelRef<T>,
+) -> Result<PendingBase<T>, RemoteError> {
+    for i in 0.. {
+        let name: pijul_core::small_string::SmallString = format!("pending-base-{}", i).parse()?;
+        match txn.fork(channel, &name) {
+            Ok(channel) => return Ok(PendingBase { name, channel }),
+            Err(pijul_core::pristine::ForkError::ChannelNameExists(_)) => continue,
+            Err(e) => return Err(other(e)),
+        }
+    }
+    unreachable!()
+}
+
+/// What changes applied to a channel touched.
+#[derive(Debug, Default)]
+pub struct Touched {
+    /// The files whose contents changed, the directories whose children
+    /// changed, and the new inodes.
+    pub inodes: HashSet<Position<ChangeId>>,
+    /// The inodes added to, deleted from, or moved into or out of the
+    /// directories of `inodes`.
+    pub children: HashSet<Position<ChangeId>>,
+}
+
+impl Touched {
+    pub fn retain<F: FnMut(&Position<ChangeId>) -> bool>(&mut self, mut f: F) {
+        self.inodes.retain(&mut f);
+        self.children.retain(f);
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Position<ChangeId>> {
+        self.inodes.iter().chain(self.children.iter())
+    }
+}
+
+/// What `changes`, applied to `channel`, touched.
+pub fn touched_inodes<T: TxnT>(
+    txn: &T,
+    channel: &ChannelRef<T>,
+    changes: &[CS],
+) -> Result<Touched, RemoteError> {
+    use pijul_core::pristine::{EdgeFlags, iter_adjacent};
+    let mut touched = Touched::default();
+    let mut ids = HashSet::new();
+    for c in changes {
+        let CS::Change(h) = c else { continue };
+        if let Some(int) = txn.get_internal(&h.into()).map_err(other)? {
+            ids.insert(*int);
+            for inode in txn.iter_rev_touched(int).map_err(other)? {
+                let (int_, inode) = inode.map_err(other)?;
+                if int_ < int {
+                    continue;
+                } else if int_ > int {
+                    break;
+                }
+                touched.inodes.insert(*inode);
+            }
+        }
+    }
+    // Adding, deleting or moving a file touches its directory, not the file:
+    // find the children of these directories whose name these changes edited.
+    let channel = channel.read();
+    let graph = txn.graph(&*channel);
+    let is_child_edge =
+        |f: EdgeFlags| f.contains(EdgeFlags::FOLDER) && !f.contains(EdgeFlags::PARENT);
+    for dir in touched.inodes.iter() {
+        for name in iter_adjacent(
+            txn,
+            graph,
+            dir.inode_vertex(),
+            EdgeFlags::FOLDER,
+            EdgeFlags::all(),
+        )
+        .map_err(other)?
+        {
+            let name = name.map_err(other)?;
+            if !is_child_edge(name.flag()) {
+                continue;
+            }
+            let Ok(&name_vertex) = txn.find_block(graph, name.dest()) else {
+                continue;
+            };
+            for child in iter_adjacent(txn, graph, name_vertex, EdgeFlags::FOLDER, EdgeFlags::all())
+                .map_err(other)?
+            {
+                let child = child.map_err(other)?;
+                if is_child_edge(child.flag())
+                    && (ids.contains(&name.introduced_by()) || ids.contains(&child.introduced_by()))
+                {
+                    touched.children.insert(child.dest());
+                }
+            }
+        }
+    }
+    Ok(touched)
+}
+
+/// Where outputting changes can overwrite unrecorded changes.
+#[derive(Debug, Default)]
+pub struct TouchedPaths {
+    /// Paths that may be rendered again, with everything below them.
+    pub deep: Vec<String>,
+    /// Directories of which only the entries may change: their children that
+    /// change are in `deep`, or new.
+    pub shallow: Vec<String>,
+    /// The touched inodes that had a path in the working copy then.
+    pub inodes: HashSet<Position<ChangeId>>,
+}
+
+impl TouchedPaths {
+    fn new(
+        deep: HashSet<String>,
+        shallow: HashSet<String>,
+        inodes: HashSet<Position<ChangeId>>,
+    ) -> Self {
+        let deep = minimal_prefixes(deep);
+        let mut shallow: Vec<String> = shallow
+            .into_iter()
+            .filter(|s| !deep.iter().any(|d| is_below(s, d)))
+            .collect();
+        shallow.sort();
+        TouchedPaths {
+            deep,
+            shallow,
+            inodes,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.deep.is_empty() && self.shallow.is_empty()
+    }
+
+    pub fn extend(&mut self, other: TouchedPaths) {
+        let deep = std::mem::take(&mut self.deep);
+        self.deep = minimal_prefixes(deep.into_iter().chain(other.deep));
+        self.shallow.extend(other.shallow);
+        self.inodes.extend(other.inodes);
+    }
+
+    /// Record the working copy at these paths against `channel`.
+    pub fn record<T>(
+        &self,
+        builder: &mut pijul_core::record::Builder,
+        txn: &ArcTxn<T>,
+        channel: &ChannelRef<T>,
+        working_copy: &pijul_core::working_copy::filesystem::FileSystem,
+        changes: &pijul_core::changestore::filesystem::FileSystem,
+    ) -> Result<
+        (),
+        pijul_core::record::RecordError<
+            pijul_core::changestore::filesystem::Error,
+            std::io::Error,
+            T,
+        >,
+    >
+    where
+        T: pijul_core::ChannelMutTxnT + TreeTxnT + Send + Sync + 'static,
+        T::Channel: Send + Sync,
+    {
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        for (paths, shallow) in [(&self.deep, false), (&self.shallow, true)] {
+            builder.shallow = shallow;
+            for path in paths {
+                builder.record(
+                    txn.clone(),
+                    pijul_core::Algorithm::default(),
+                    false,
+                    &pijul_core::DEFAULT_SEPARATOR,
+                    channel.clone(),
+                    working_copy,
+                    changes,
+                    path,
+                    threads,
+                )?;
+            }
+        }
+        builder.shallow = false;
+        Ok(())
+    }
+}
+
+/// Record the working copy's pending (unrecorded) changes as an ephemeral patch
+/// on `channel`, returning its hash — or `None` if there are none — but only
+/// where outputting `channel` can overwrite them, instead of diffing the whole
+/// working copy.
+///
+/// Shared by the operations that must change the channel under an unrecorded
+/// working copy without destroying it (pull, a push into a local repository,
+/// apply, `unrecord --reset`): the caller records this patch, outputs so that
+/// `output` merges the changes with it instead of overwriting, then unrecords it
+/// to restore the working copy's changes to their unrecorded state.
+///
+/// The paths are those the working copy has *now*: of the `touched` inodes, of
+/// the tracked `paths` (e.g. those of the predecessors [`unrecord_superseded`]
+/// removed), and of the files added but never recorded, which any output would
+/// drop from the tree. The patch is recorded against `base`, the state the
+/// working copy reflects if `channel` was modified since, or else against
+/// `channel`, and applied to `channel`. Also returns these paths, for
+/// [`output_touched`].
+pub fn pending_touched<T: MutTxnTExt + TxnT + Send + Sync + 'static>(
     txn: ArcTxn<T>,
+    base: Option<PendingBase<T>>,
     channel: &ChannelRef<T>,
     working_copy: &pijul_core::working_copy::filesystem::FileSystem,
     changes: &pijul_core::changestore::filesystem::FileSystem,
+    touched: &Touched,
+    paths: &std::collections::BTreeSet<String>,
+) -> Result<(Option<Hash>, TouchedPaths), RemoteError> {
+    let (hash, prefixes) = {
+        let base_channel = base.as_ref().map_or(channel, |b| &b.channel);
+        let prefixes = pending_prefixes(&*txn.read(), changes, base_channel, touched, paths)?;
+        debug!("pending prefixes {:?}", prefixes);
+        let hash = if prefixes.is_empty() {
+            None
+        } else {
+            record_pending(
+                txn.clone(),
+                base_channel,
+                channel,
+                working_copy,
+                changes,
+                &prefixes,
+            )?
+        };
+        (hash, prefixes)
+    };
+    if let Some(PendingBase {
+        name,
+        channel: base,
+    }) = base
+    {
+        std::mem::drop(base);
+        txn.write().drop_channel(&name).map_err(other)?;
+    }
+    Ok((hash, prefixes))
+}
+
+fn pending_prefixes<T: MutTxnTExt + TxnT, C: pijul_core::changestore::ChangeStore>(
+    txn: &T,
+    changes: &C,
+    base: &ChannelRef<T>,
+    touched: &Touched,
+    paths: &std::collections::BTreeSet<String>,
+) -> Result<TouchedPaths, RemoteError> {
+    use pijul_core::fs::{inode_filename, is_tracked};
+    use pijul_core::pristine::{Inode, OwnedPathId};
+    let mut prefixes = HashSet::new();
+    let mut shallow = HashSet::new();
+    let mut inodes = HashSet::new();
+    insert_touched_paths(
+        txn,
+        changes,
+        base,
+        touched,
+        &mut prefixes,
+        &mut shallow,
+        &mut inodes,
+    )?;
+    for p in paths {
+        if !p.is_empty() && is_tracked(txn, p).map_err(other)? {
+            prefixes.insert(p.clone());
+        }
+    }
+    let root = OwnedPathId {
+        parent_inode: Inode::ROOT,
+        basename: pijul_core::small_string::SmallString::new(),
+    };
+    for x in txn.iter_tree(&root, None).map_err(other)? {
+        let (id, inode) = x.map_err(other)?;
+        if !id.basename.is_empty()
+            && txn.get_inodes(inode, None).map_err(other)?.is_none()
+            && let Some(p) = inode_filename(txn, *inode).map_err(other)?
+        {
+            prefixes.insert(p);
+        }
+    }
+    Ok(TouchedPaths::new(prefixes, shallow, inodes))
+}
+
+/// The working-copy paths of the `touched` inodes that `base` has: where
+/// applying changes that touched them can overwrite unrecorded changes. The
+/// inodes these changes created have none.
+pub fn touched_prefixes<T: MutTxnTExt + TxnT, C: pijul_core::changestore::ChangeStore>(
+    txn: &T,
+    changes: &C,
+    base: &ChannelRef<T>,
+    touched: &Touched,
+) -> Result<TouchedPaths, RemoteError> {
+    let mut deep = HashSet::new();
+    let mut shallow = HashSet::new();
+    let mut inodes = HashSet::new();
+    insert_touched_paths(
+        txn,
+        changes,
+        base,
+        touched,
+        &mut deep,
+        &mut shallow,
+        &mut inodes,
+    )?;
+    Ok(TouchedPaths::new(deep, shallow, inodes))
+}
+
+/// The inode of `t` in the working copy, and its path there.
+fn tree_path<T: TreeTxnT>(
+    txn: &T,
+    t: &Position<ChangeId>,
+) -> Result<Option<(pijul_core::pristine::Inode, String)>, RemoteError> {
+    use pijul_core::pristine::Inode;
+    let Some(&inode) = txn.get_revinodes(t, None).map_err(other)? else {
+        return Ok(None);
+    };
+    if inode == Inode::ROOT {
+        return Ok(Some((inode, String::new())));
+    }
+    Ok(pijul_core::fs::inode_filename(txn, inode)
+        .map_err(other)?
+        .map(|p| (inode, p)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_touched_paths<T: MutTxnTExt + TxnT, C: pijul_core::changestore::ChangeStore>(
+    txn: &T,
+    changes: &C,
+    base: &ChannelRef<T>,
+    touched: &Touched,
+    deep: &mut HashSet<String>,
+    shallow: &mut HashSet<String>,
+    inodes: &mut HashSet<Position<ChangeId>>,
+) -> Result<(), RemoteError> {
+    use pijul_core::fs::{FindPath, find_path, is_directory, is_tracked};
+    let base = base.read();
+    for t in touched.iter() {
+        if let Some((inode, p)) = tree_path(txn, t)? {
+            inodes.insert(*t);
+            // A directory is touched when its children are added, deleted or
+            // moved, and these children are touched themselves.
+            if !touched.children.contains(t) && is_directory(txn, inode).map_err(other)? {
+                shallow.insert(p);
+            } else {
+                deep.insert(p);
+            }
+        } else if let Some(FindPath {
+            mut path,
+            all_alive: true,
+        }) = find_path(changes, txn, &*base, false, *t).map_err(other)?
+        {
+            // Alive but not in the tree (`pijul rm`): the removal is recorded
+            // from the closest tracked ancestor.
+            loop {
+                let p = path.join("/");
+                if p.is_empty() || is_tracked(txn, &p).map_err(other)? {
+                    shallow.insert(p);
+                    break;
+                }
+                path.pop();
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `path` is `prefix` or below it.
+fn is_below(path: &str, prefix: &str) -> bool {
+    prefix.is_empty()
+        || path == prefix
+        || (path.len() > prefix.len()
+            && path.starts_with(prefix)
+            && path.as_bytes()[prefix.len()] == b'/')
+}
+
+/// The paths of `paths` that are not below another one.
+fn minimal_prefixes<I: IntoIterator<Item = String>>(paths: I) -> Vec<String> {
+    let mut sorted: Vec<String> = paths.into_iter().collect();
+    // Component-wise, so that a path's descendants come right after it.
+    sorted.sort_by(|a, b| a.split('/').cmp(b.split('/')));
+    let mut result: Vec<String> = Vec::new();
+    for p in sorted {
+        if let Some(last) = result.last()
+            && is_below(&p, last)
+        {
+            continue;
+        }
+        result.push(p)
+    }
+    result
+}
+
+fn record_pending<T: MutTxnTExt + TxnT + Send + Sync + 'static>(
+    txn: ArcTxn<T>,
+    base: &ChannelRef<T>,
+    channel: &ChannelRef<T>,
+    working_copy: &pijul_core::working_copy::filesystem::FileSystem,
+    changes: &pijul_core::changestore::filesystem::FileSystem,
+    paths: &TouchedPaths,
 ) -> Result<Option<Hash>, RemoteError> {
     use pijul_core::changestore::ChangeStore;
 
     let mut builder = pijul_core::record::Builder::new();
-    builder
-        .record(
-            txn.clone(),
-            pijul_core::Algorithm::default(),
-            false,
-            &pijul_core::DEFAULT_SEPARATOR,
-            channel.clone(),
-            working_copy,
-            changes,
-            "",
-            std::thread::available_parallelism()?.get(),
-        )
-        .map_err(|e| RemoteError::RemoteError(e.to_string()))?;
+    paths
+        .record(&mut builder, &txn, base, working_copy, changes)
+        .map_err(other)?;
     let recorded = builder.finish();
     if recorded.actions.is_empty() {
         return Ok(None);
@@ -104,22 +559,126 @@ pub fn pending<T: MutTxnTExt + TxnT + Send + Sync + 'static>(
     };
     let mut pending_change = pijul_core::change::Change::make_change(
         &*txn,
-        channel,
+        base,
         actions,
         contents,
         pijul_core::change::ChangeHeader::default(),
         Vec::new(),
     )
-    .map_err(|e| RemoteError::RemoteError(e.to_string()))?;
+    .map_err(other)?;
     let (dependencies, extra_known) =
-        pijul_core::change::dependencies(&*txn, &*channel.read(), pending_change.changes.iter())
-            .map_err(|e| RemoteError::RemoteError(e.to_string()))?;
+        pijul_core::change::dependencies(&*txn, &*base.read(), pending_change.changes.iter())
+            .map_err(other)?;
     pending_change.dependencies = dependencies;
     pending_change.extra_known = extra_known;
     let hash = changes.save_change(&mut pending_change, |_, _| Ok::<_, RemoteError>(()))?;
-    txn.apply_local_change(channel, &pending_change, &hash, &recorded.updatables)
-        .map_err(|e| RemoteError::RemoteError(e.to_string()))?;
+    if let Err(e) = txn.apply_local_change(channel, &pending_change, &hash, &recorded.updatables) {
+        changes.del_change(&hash)?;
+        return Err(match e {
+            // `base` has changes that `channel` lost: the predecessors of the
+            // incoming changes.
+            pijul_core::apply::LocalApplyError::DependencyMissing { hash } => {
+                RemoteError::RemoteError(format!(
+                    "Unrecorded changes depend on change {}, which the incoming changes replace",
+                    hash.to_base32()
+                ))
+            }
+            e => other(e),
+        });
+    }
     Ok(Some(hash))
+}
+
+/// Output to `working_copy` what applying the changes that touched `touched`,
+/// and unrecording the predecessors that touched `paths`, changed on `channel`.
+///
+/// Rendering a tracked path overwrites the unrecorded changes below it, so the
+/// only paths output are those below the deep prefixes of `covered` (from
+/// [`pending_touched`]), those not tracked, and those of inodes that had no path
+/// when `covered` was computed (put back in the tree by unrecording their
+/// deletion). The others are the directories of deleted files, or paths that
+/// could not be found: dead files are then removed without re-rendering anything.
+#[allow(clippy::too_many_arguments)]
+pub fn output_touched<T>(
+    working_copy: &pijul_core::working_copy::filesystem::FileSystem,
+    changes: &pijul_core::changestore::filesystem::FileSystem,
+    txn: &ArcTxn<T>,
+    channel: &ChannelRef<T>,
+    touched: &Touched,
+    paths: &std::collections::BTreeSet<String>,
+    covered: &TouchedPaths,
+    update_stat_cache: bool,
+) -> Result<Vec<pijul_core::output::Conflict>, RemoteError>
+where
+    T: pijul_core::ChannelMutTxnT
+        + pijul_core::pristine::TreeMutTxnT<TreeError = <T as GraphTxnT>::GraphError>
+        + Send
+        + Sync
+        + 'static,
+    T::Channel: Send + Sync + 'static,
+{
+    let mut skipped = false;
+    let mut output = Vec::new();
+    {
+        let txn_ = txn.read();
+        let channel_ = channel.read();
+        let mut candidates: Vec<(String, Option<&Position<ChangeId>>)> =
+            paths.iter().map(|p| (p.clone(), None)).collect();
+        for t in touched.iter() {
+            match pijul_core::fs::find_path(changes, &*txn_, &*channel_, false, *t)
+                .map_err(other)?
+            {
+                Some(pijul_core::fs::FindPath { path, .. }) => {
+                    candidates.push((path.join("/"), Some(t)));
+                }
+                None => skipped = true,
+            }
+        }
+        for (p, t) in candidates {
+            let new_in_tree = match t {
+                Some(t) if !covered.inodes.contains(t) => {
+                    tree_path(&*txn_, t)?.is_some_and(|(_, tp)| tp == p)
+                }
+                _ => false,
+            };
+            if covered.deep.iter().any(|c| is_below(&p, c))
+                || new_in_tree
+                || !pijul_core::fs::is_tracked(&*txn_, &p).map_err(other)?
+            {
+                output.push(p)
+            } else {
+                debug!("not outputting {:?}, outside the pending patch", p);
+                skipped = true
+            }
+        }
+    }
+    let mut conflicts = Vec::new();
+    for path in minimal_prefixes(output) {
+        conflicts.extend(
+            pijul_core::output::output_repository_no_pending_current(
+                working_copy,
+                changes,
+                txn,
+                channel,
+                &path,
+                true,
+                None,
+                std::thread::available_parallelism()?.get(),
+                0,
+                update_stat_cache,
+            )
+            .map_err(other)?,
+        );
+    }
+    if skipped {
+        pijul_core::output::output_deletions::<_, _, pijul_core::changestore::filesystem::FileSystem>(
+            working_copy,
+            txn,
+            channel,
+        )
+        .map_err(other)?;
+    }
+    Ok(conflicts)
 }
 
 pub enum RemoteRepo {
@@ -1601,7 +2160,9 @@ impl RemoteRepo {
                             if !has_dep {
                                 needs_dep = true;
                                 if asked.insert(CS::Change(dep)) {
-                                    progress_bar.inc(1);
+                                    // One more change to download: it is
+                                    // counted as done when it arrives.
+                                    progress_bar.inc_length(1);
                                     send_hash
                                         .send(CS::Change(dep))
                                         .map_err(|_| RemoteError::ChannelClosed)?;

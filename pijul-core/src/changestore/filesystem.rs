@@ -288,3 +288,23 @@ impl ChangeStore for FileSystem {
         Ok(Change::deserialize(file_name, Some(h))?)
     }
 }
+
+impl FileSystem {
+    /// Replace the unhashed part of the stored change `hash` (e.g. to add an
+    /// author signature after the fact), keeping the hashed bytes verbatim so
+    /// the hash — and the file name — cannot change. Atomic: written to a
+    /// temporary file in the changes directory and renamed over the original.
+    pub fn set_unhashed(
+        &self,
+        hash: &Hash,
+        unhashed: Option<&serde_json::Value>,
+    ) -> Result<(), Error> {
+        let file_name = self.filename(hash);
+        let buf = std::fs::read(&file_name)?;
+        let out = Change::replace_unhashed_in_buffer(&buf, unhashed)?;
+        let mut f = tempfile::NamedTempFile::new_in(&self.changes_dir)?;
+        std::io::Write::write_all(&mut f, &out)?;
+        f.persist(file_name)?;
+        Ok(())
+    }
+}

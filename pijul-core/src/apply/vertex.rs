@@ -32,13 +32,16 @@ pub fn put_newvertex<T: GraphMutTxnT + TreeTxnT, F: FnMut(&Hash) -> bool>(
         vertex, n.up_context, n.down_context, n.flag, change
     );
     assert!(ws.deleted_by.is_empty());
+    let mut up_deleted = Vec::new();
     for up in n.up_context.iter() {
         let up = internal_pos(txn, up, change)?;
         // Collect the vertices in the up context (we only have their
         // end positions at this point), also collecting the deleted
         // ones (they're part of a conflict if they're unknown to the
         // patch we're applying).
-        if put_up_context(txn, graph, changes, ws, up)? && n.flag.contains(EdgeFlags::FOLDER) {
+        if put_up_context(txn, graph, changes, ws, up, &mut up_deleted)?
+            && n.flag.contains(EdgeFlags::FOLDER)
+        {
             return Err(LocalApplyError::InvalidChange);
         }
     }
@@ -61,6 +64,13 @@ pub fn put_newvertex<T: GraphMutTxnT + TreeTxnT, F: FnMut(&Hash) -> bool>(
             // Mark the delete/insert conflict, if any.
             for change in ws.deleted_by.iter() {
                 put_graph_with_rev(txn, graph, up_flag, up, vertex, *change)?;
+            }
+            // Only the edge coming from the dead context is marked, as
+            // `zombify_down` does when the deletion is applied afterwards.
+            for &(u, change) in up_deleted.iter() {
+                if u == up {
+                    put_graph_with_rev(txn, graph, up_flag, up, vertex, change)?;
+                }
             }
         }
         // And put the edge into the graph.
@@ -88,6 +98,7 @@ fn put_up_context<T: GraphMutTxnT + TreeTxnT, F: FnMut(&Hash) -> bool>(
     knows: &mut F,
     ws: &mut Workspace,
     up: Position<ChangeId>,
+    up_deleted: &mut Vec<(Vertex<ChangeId>, ChangeId)>,
 ) -> Result<bool, LocalApplyError<T>> {
     let up_vertex = if up.change.is_root() {
         Vertex::ROOT
@@ -128,8 +139,16 @@ fn put_up_context<T: GraphMutTxnT + TreeTxnT, F: FnMut(&Hash) -> bool>(
                     error!("Corruption error in {} at line {}", file!(), line!());
                     return Err(LocalApplyError::Corruption);
                 };
-            if !knows(&introduced_by) {
-                ws.deleted_by.insert(parent.introduced_by());
+            // A *dead* up context makes this vertex a zombie, through that
+            // context's own edge. A zombie (alive) one is not inherited: how
+            // far the conflict extends is not knowable here, since a change
+            // only knows its immediate neighbours — the output groups the
+            // block of new lines instead (`alive::output`).
+            if !knows(&introduced_by)
+                && !up_vertex.change.is_root()
+                && !is_alive(txn, graph, &up_vertex)?
+            {
+                up_deleted.push((up_vertex, parent.introduced_by()));
             }
         }
     }
@@ -178,6 +197,11 @@ fn put_down_context<T: GraphMutTxnT + TreeTxnT>(
                     error!("Corruption error in {} at line {}", file!(), line!());
                     return Err(LocalApplyError::Corruption);
                 };
+            // A down context only gives an order, so a zombie (alive) one is
+            // not inherited either; a dead one still marks this vertex.
+            if is_alive(txn, graph, &down_vertex)? {
+                continue;
+            }
             if !ch.knows(&introduced_by) {
                 ws.deleted_by.insert(parent.introduced_by());
             }

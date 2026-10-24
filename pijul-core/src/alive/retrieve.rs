@@ -27,6 +27,7 @@ pub fn retrieve<T: GraphTxnT>(
         lowlink: 0,
         scc: 0,
         extra: Vec::new(),
+        zombie_by: None,
     });
     cache.insert(pos0, VertexId(1));
 
@@ -87,6 +88,7 @@ fn new_vertex<T: GraphTxnT>(
         return Ok(None);
     }
     let mut flags = Flags::empty();
+    let mut zombie_by = None;
     for e in crate::pristine::iter_adjacent(
         txn,
         graph,
@@ -94,11 +96,12 @@ fn new_vertex<T: GraphTxnT>(
         EdgeFlags::PARENT | EdgeFlags::DELETED | EdgeFlags::BLOCK,
         EdgeFlags::all(),
     )? {
-        if e?
-            .flag()
+        let e = e?;
+        if e.flag()
             .contains(EdgeFlags::PARENT | EdgeFlags::DELETED | EdgeFlags::BLOCK)
         {
             flags = Flags::ZOMBIE;
+            zombie_by = Some(e.introduced_by());
             break;
         }
     }
@@ -112,6 +115,7 @@ fn new_vertex<T: GraphTxnT>(
         lowlink: 0,
         scc: 0,
         extra: Vec::new(),
+        zombie_by,
     }))
 }
 
@@ -121,10 +125,19 @@ pub(crate) fn remove_forward_edges<T: GraphMutTxnT>(
     pos: Position<ChangeId>,
 ) -> Result<(), TxnErr<T::GraphError>> {
     let mut graph = retrieve(txn, channel, pos, false)?;
-    let scc = graph.tarjan(); // SCCs are given here in reverse order.
-    let (_, forward_scc) = graph.dfs(&scc);
     let mut forward = Vec::new();
-    graph.collect_forward_edges(txn, channel, &scc, &forward_scc, &mut forward)?;
+    // Dropping the edges of a pass may make others redundant: iterate, as the
+    // output does, so that the graph left behind is the reduced one.
+    loop {
+        let scc = graph.tarjan(); // SCCs are given here in reverse order.
+        let (_, forward_scc) = graph.dfs(&scc);
+        let n = forward.len();
+        graph.collect_forward_edges(txn, channel, &scc, &forward_scc, &mut forward)?;
+        if forward.len() == n {
+            break;
+        }
+        graph.drop_edges(&forward[n..]);
+    }
     for ve in forward.iter() {
         let dest = *txn.find_block(channel, ve.e.dest()).unwrap();
         debug!(target:"pijul_core::forward", "deleting forward edge {:?} {:?} {:?}", ve.v, dest, ve.e);

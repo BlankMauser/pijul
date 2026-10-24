@@ -80,9 +80,7 @@ fn output_conflict<T: ChannelTxnT, B: VertexBuffer, P: ChangeStore>(
         let mut next = None;
         'outer: while elt.side < n_sides {
             if elt.side > 0 && elt.idx == 0 {
-                if let Some(id) = is_zombie.take() {
-                    line_buf.end_zombie_conflict::<P>(id)?;
-                }
+                end_zombie(changes, txn, graph, &mut is_zombie, line_buf)?;
                 match elt.conflict[elt.side].path[elt.idx] {
                     PathElement::Scc { scc } => {
                         let vid = sccs[scc][0];
@@ -134,24 +132,16 @@ fn output_conflict<T: ChannelTxnT, B: VertexBuffer, P: ChangeStore>(
 
         if elt.side >= n_sides {
             if n_sides > 1 {
-                if let Some(id) = is_zombie.take() {
-                    debug!("end zombie conflict {id} (line {})", line!());
-                    line_buf.end_zombie_conflict::<P>(id)?;
-                }
+                end_zombie(changes, txn, graph, &mut is_zombie, line_buf)?;
                 line_buf.end_conflict::<P>(elt.id)?;
             }
         } else {
-            if let Some(id) = is_zombie.take() {
-                debug!("end zombie conflict {id} (line {})", line!());
-                line_buf.end_zombie_conflict::<P>(id)?;
-            }
+            end_zombie(changes, txn, graph, &mut is_zombie, line_buf)?;
             stack.push(elt);
             stack.push(next.unwrap())
         }
     }
-    if let Some(id) = is_zombie.take() {
-        line_buf.end_zombie_conflict::<P>(id)?;
-    }
+    end_zombie(changes, txn, graph, &mut is_zombie, line_buf)?;
     Ok(())
 }
 
@@ -206,12 +196,66 @@ impl PathElement {
     }
 }
 
+/// An open zombie conflict: the change that deleted the context, and the alive
+/// lines met since, held back until we know whether they are inside the block.
+pub(super) struct Zombie {
+    id: usize,
+    by: Option<ChangeId>,
+    pending: Vec<VertexId>,
+}
+
+/// Close the conflict, then write the lines held back (they were after it).
+fn end_zombie<T: GraphTxnT, B: VertexBuffer, P: ChangeStore>(
+    changes: &P,
+    txn: &ArcTxn<T>,
+    graph: &Graph,
+    is_zombie: &mut Option<Zombie>,
+    vbuf: &mut B,
+) -> Result<(), FileError<P::Error, T>> {
+    if let Some(z) = is_zombie.take() {
+        debug!("end zombie conflict {}", z.id);
+        vbuf.end_zombie_conflict::<P>(z.id)?;
+        for w in z.pending {
+            output_vertex(changes, txn, graph, w, vbuf)?;
+        }
+    }
+    Ok(())
+}
+
+fn output_vertex<T: GraphTxnT, B: VertexBuffer, P: ChangeStore>(
+    changes: &P,
+    txn: &ArcTxn<T>,
+    graph: &Graph,
+    v: VertexId,
+    vbuf: &mut B,
+) -> Result<(), FileError<P::Error, T>> {
+    let vertex = graph[v].vertex;
+    let get_contents = |buf: &mut [u8]| {
+        let now = std::time::Instant::now();
+        let result = changes
+            .get_contents(
+                |p| txn.read().get_external(&p).ok().map(|x| x.into()),
+                vertex,
+                buf,
+            )
+            .map(|_| ())
+            .map_err(FileError::Changestore);
+        crate::TIMERS.lock().unwrap().alive_contents += now.elapsed();
+        result
+    };
+    let now = std::time::Instant::now();
+    debug!("outputting {:?}", vertex);
+    vbuf.output_line(vertex, get_contents)?;
+    crate::TIMERS.lock().unwrap().alive_write += now.elapsed();
+    Ok(())
+}
+
 fn output_scc<T: GraphTxnT, B: VertexBuffer, P: ChangeStore>(
     changes: &P,
     txn: &ArcTxn<T>,
     graph: &Graph,
     scc: &[VertexId],
-    is_zombie: &mut Option<usize>,
+    is_zombie: &mut Option<Zombie>,
     id: &mut usize,
     vbuf: &mut B,
 ) -> Result<(), FileError<P::Error, T>> {
@@ -224,43 +268,67 @@ fn output_scc<T: GraphTxnT, B: VertexBuffer, P: ChangeStore>(
     for &v in scc.iter() {
         let now = std::time::Instant::now();
         if graph[v].flags.contains(Flags::ZOMBIE) {
-            if is_zombie.is_none() {
+            let same = match *is_zombie {
+                Some(ref z) => z.by.is_none() || z.by == graph[v].zombie_by,
+                None => false,
+            };
+            if same {
+                // The alive lines held back are inside this conflict.
+                let pending = std::mem::take(&mut is_zombie.as_mut().unwrap().pending);
+                for w in pending {
+                    output_vertex(changes, txn, graph, w, vbuf)?;
+                }
+            } else {
+                end_zombie(changes, txn, graph, is_zombie, vbuf)?;
                 *id += 1;
-                *is_zombie = Some(*id);
                 debug!("begin zombie conflict {id}");
-                let txn = txn.read();
-                let hash = txn
-                    .get_external(&graph[v].vertex.change)
-                    .optional()?
-                    .unwrap();
-                vbuf.begin_zombie_conflict(*id, Some((changes, &[&hash.into()])))?;
+                let hash: Hash = {
+                    let txn = txn.read();
+                    let h = txn
+                        .get_external(&graph[v].vertex.change)
+                        .optional()?
+                        .unwrap();
+                    h.into()
+                };
+                vbuf.begin_zombie_conflict(*id, Some((changes, &[&hash])))?;
+                *is_zombie = Some(Zombie {
+                    id: *id,
+                    by: graph[v].zombie_by,
+                    pending: Vec::new(),
+                });
             }
-        } else if let Some(id) = is_zombie.take() {
-            debug!("end zombie conflict {id}");
-            vbuf.end_zombie_conflict::<P>(id)?;
+        } else if let Some(ref z) = *is_zombie {
+            // An alive line met inside a conflict region. The conflict is the
+            // whole block of lines inserted where the context was deleted, so
+            // hold it back: if a zombie of the same change follows, it belongs
+            // to the block. A line whose change knows the deleting one was
+            // written with that deletion in sight, and ends the block.
+            let bridge = match z.by {
+                Some(by) => {
+                    let txn_ = txn.read();
+                    let line: Hash = txn_
+                        .get_external(&graph[v].vertex.change)
+                        .optional()?
+                        .unwrap()
+                        .into();
+                    let del = txn_.get_external(&by).optional()?.map(Hash::from);
+                    std::mem::drop(txn_);
+                    match del {
+                        Some(del) => !changes.knows(&line, &del).unwrap_or(false),
+                        None => false,
+                    }
+                }
+                None => false,
+            };
+            if bridge {
+                is_zombie.as_mut().unwrap().pending.push(v);
+                crate::TIMERS.lock().unwrap().alive_write += now.elapsed();
+                continue;
+            }
+            end_zombie(changes, txn, graph, is_zombie, vbuf)?;
         }
         crate::TIMERS.lock().unwrap().alive_write += now.elapsed();
-
-        let vertex = graph[v].vertex;
-
-        let get_contents = |buf: &mut [u8]| {
-            let now = std::time::Instant::now();
-            let result = changes
-                .get_contents(
-                    |p| txn.read().get_external(&p).ok().map(|x| x.into()),
-                    vertex,
-                    buf,
-                )
-                .map(|_| ())
-                .map_err(FileError::Changestore);
-            crate::TIMERS.lock().unwrap().alive_contents += now.elapsed();
-            result
-        };
-
-        let now = std::time::Instant::now();
-        debug!("outputting {:?}", vertex);
-        vbuf.output_line(vertex, get_contents)?;
-        crate::TIMERS.lock().unwrap().alive_write += now.elapsed();
+        output_vertex(changes, txn, graph, v, vbuf)?;
     }
     let now = std::time::Instant::now();
     if scc.len() > 1 {
@@ -282,13 +350,31 @@ pub fn output_graph<T: ChannelTxnT, B: VertexBuffer, P: ChangeStore>(
         return Ok(());
     }
     let now0 = std::time::Instant::now();
-    let scc = graph.tarjan(); // SCCs are given here in reverse order.
-    let (conflict_tree, forward_scc) = graph.dfs(&scc);
-    {
-        let txn = txn.read();
-        let channel = channel.read();
-        graph.collect_forward_edges(&*txn, txn.graph(&*channel), &scc, &forward_scc, forward)?;
-    }
+    // The caller deletes the redundant pseudo-edges this collects, so the output
+    // must be the one of the graph it leaves behind: were it the one of the graph
+    // with them, outputting the same channel twice would give two different files
+    // (Tarjan's numbering, hence the conflict tree, depends on those edges).
+    // Take them out of the in-memory graph and start again, until none is left.
+    let (conflict_tree, scc) = loop {
+        let scc = graph.tarjan(); // SCCs are given here in reverse order.
+        let (conflict_tree, forward_scc) = graph.dfs(&scc);
+        let n = forward.len();
+        {
+            let txn = txn.read();
+            let channel = channel.read();
+            graph.collect_forward_edges(
+                &*txn,
+                txn.graph(&*channel),
+                &scc,
+                &forward_scc,
+                forward,
+            )?;
+        }
+        if forward.len() == n {
+            break (conflict_tree, scc);
+        }
+        graph.drop_edges(&forward[n..]);
+    };
     crate::TIMERS.lock().unwrap().alive_graph += now0.elapsed();
     let now1 = std::time::Instant::now();
     debug!("conflict_tree = {:?}", conflict_tree);

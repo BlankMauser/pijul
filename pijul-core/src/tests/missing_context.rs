@@ -137,6 +137,9 @@ fn missing_context_newnodes(alice: Option<&str>) -> Result<(), anyhow::Error> {
 
     let re = regex::bytes::Regex::new(r#" \[[^\]]*\]"#).unwrap();
     let buf_ = re.replace_all(&buf, &[][..]);
+    // The conflict is the whole block of lines inserted where Alice deleted the
+    // context: `x`, `y` and `z`. Applying the deletion the other way around
+    // (Bob's side below) must give the same thing.
     if alice.is_some() {
         assert_eq!(
             std::str::from_utf8(&buf_),
@@ -194,9 +197,11 @@ fn missing_context_newnodes(alice: Option<&str>) -> Result<(), anyhow::Error> {
     repo_bob.read_file("file", &mut buf)?;
     if alice.is_some() {
         let buf_ = re.replace_all(&buf, &[][..]);
+        // The same as on Alice's side: applying the deletion after the
+        // insertions gives what applying it before gives.
         assert_eq!(
             std::str::from_utf8(&buf_),
-            Ok(&"a\n>>>>>>> 1\nx\n<<<<<<< 1\ny\n>>>>>>> 2\nz\n<<<<<<< 2\nf\n"[..])
+            Ok(&"a\n>>>>>>> 1\nx\ny\nz\n<<<<<<< 1\nf\n"[..])
         );
     } else {
         assert_eq!(

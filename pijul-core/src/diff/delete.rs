@@ -203,14 +203,25 @@ fn delete_parents<T: GraphTxnT>(
     Ok(())
 }
 
+/// Whether deleting these bytes joins lines that the graph may not order: two
+/// sides of a conflict, or the end of a conflict and the start of the next
+/// one. The output shows consecutive conflicts one after the other, but their
+/// sides need not be ordered in the graph (a side of the first one can be a
+/// dead end, for instance).
 fn is_conflict_reordering(diff: &Diff, old_bytes: usize, len_bytes: usize) -> bool {
     let mut result = false;
     debug!("conflict reordering {:?} {:?}", old_bytes, len_bytes);
     trace!("markers: {:#?}", diff.marker);
     let mut level = 0;
+    let mut closed = false;
     for i in old_bytes..old_bytes + len_bytes {
         match diff.marker.get(&i) {
             Some(&ConflictMarker::Next) if level == 0 => result = true,
+            Some(&ConflictMarker::End) if level == 0 => closed = true,
+            Some(&ConflictMarker::Begin) if level == 0 && closed => {
+                result = true;
+                level += 1
+            }
             Some(&ConflictMarker::Begin) => level += 1,
             Some(&ConflictMarker::End) if level > 0 => level -= 1,
             _ => {}
@@ -323,8 +334,13 @@ fn resurrect_zombies<T: GraphTxnT>(
             if diff.pos_a[i].pos >= next_pos {
                 break;
             }
+            // Skip the vertices ending before `pos`. An empty vertex at `pos`
+            // (e.g. the resolution of an order conflict) shares its position
+            // with the next vertex but does not end before `pos`: skipping it
+            // would leave it a zombie, i.e. an empty conflict.
+            let empty_at_pos = diff.pos_a[i].pos == pos && diff.pos_a[i].vertex.is_empty();
             if diff.pos_a[i].vertex.is_root()
-                || (i + 1 < diff.pos_a.len() && diff.pos_a[i + 1].pos <= pos)
+                || (i + 1 < diff.pos_a.len() && diff.pos_a[i + 1].pos <= pos && !empty_at_pos)
             {
                 i += 1;
                 continue;
@@ -364,6 +380,13 @@ fn resurrect_zombie<T: GraphTxnT>(
     )? {
         let e = e?;
         if e.flag().contains(EdgeFlags::PSEUDO) || !e.flag().contains(EdgeFlags::PARENT) {
+            continue;
+        }
+        // As in `delete_parents`: when `target` starts inside `v`, only `v`'s
+        // BLOCK edges continue up to `target`. A context edge ends at the
+        // start of `v`; moving it to `target` would name an edge that was
+        // never in the graph, which unrecording this change then puts back.
+        if target.start != v.start && !v.is_empty() && !e.flag().contains(EdgeFlags::BLOCK) {
             continue;
         }
         let previous = e.flag() - EdgeFlags::PARENT;

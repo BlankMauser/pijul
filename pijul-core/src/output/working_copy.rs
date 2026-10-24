@@ -105,7 +105,10 @@ where
     T::Channel: Send + Sync + 'static,
 {
     debug!("output_repository_no_pending: {:?}", prefix);
-    let (c, f) = output_repository(
+    // The redundant pseudo-edges the conflict DFS finds are ignored while
+    // rendering, but *not* deleted from the channel: see the note on
+    // `Redundant`.
+    let (c, _) = output_repository(
         repo,
         changes,
         txn.clone(),
@@ -119,7 +122,6 @@ where
         false,
     )?;
 
-    del_redundant(txn.clone(), channel.clone(), &f)?;
     Ok(c)
 }
 
@@ -159,7 +161,7 @@ where
         "output_repository_no_pending_current: {:?} {:?}",
         prefix, is_current_channel
     );
-    let (c, f) = output_repository(
+    let (c, _) = output_repository(
         repo,
         changes,
         txn.clone(),
@@ -173,7 +175,6 @@ where
         is_current_channel,
     )?;
 
-    del_redundant(txn.clone(), channel.clone(), &f)?;
     Ok(c)
 }
 
@@ -216,6 +217,36 @@ where
         false,
     )?;
     Ok(c)
+}
+
+/// The deletion half of an output: remove from the working copy (and its tree)
+/// the files whose vertex is dead in `channel`, without rendering any file. For
+/// callers that output only the paths of the files that are still alive, rather
+/// than the directories of the deleted ones.
+pub fn output_deletions<
+    T: ChannelMutTxnT + TreeMutTxnT + Send + Sync + 'static,
+    R: WorkingCopy + Clone + Send + Sync + 'static,
+    P: ChangeStore,
+>(
+    repo: &R,
+    txn: &ArcTxn<T>,
+    channel: &ChannelRef<T>,
+) -> Result<(), OutputError<P::Error, T, R::Error>> {
+    let dead = {
+        let txn_ = txn.read();
+        let channel = channel.read();
+        collect_dead_files::<_, R, P>(
+            &*txn_,
+            txn_.graph(&*channel),
+            &HashMap::default(),
+            ChangeId::ROOT,
+            Inode::ROOT,
+        )?
+    };
+    if !dead.is_empty() {
+        kill_dead_files::<T, R, P>(&mut *txn.write(), channel, repo, &dead)?;
+    }
+    Ok(())
 }
 
 type WorkerInjector = crossbeam_deque::Injector<(OutputItem, Inode, String, Option<String>)>;
@@ -638,7 +669,7 @@ impl<'a> OutputState<'a> {
                 )?;
                 debug!("next_files {:?}", next_files);
             } else {
-                if needs_output(repo, self.if_modified_after, &path) {
+                if needs_output(repo, txn, self.if_modified_after, inode, &path) {
                     self.work
                         .push((output_item.clone(), inode, path.clone(), tmp.clone()));
                 } else {
@@ -685,18 +716,37 @@ fn make_conflicting_name(name: &str, name_key: Vertex<ChangeId>) -> String {
     parent
 }
 
-fn needs_output<R: WorkingCopy>(
+/// Whether `path` must be (re-)rendered. With `if_modified_after`, a file whose
+/// mtime predates it is skipped only when record's `(mtime, size)` stat cache
+/// also confirms it is unchanged: the channel-wide timestamp alone misses edits
+/// that carry an old mtime (`cp -p`, `tar`, `rsync -a`, clock skew…), and
+/// `reset` would then silently leave them in place.
+fn needs_output<T: TreeTxnT, R: WorkingCopy>(
     repo: &R,
+    txn: &ArcTxn<T>,
     if_modified_after: Option<std::time::SystemTime>,
+    inode: Inode,
     path: &str,
 ) -> bool {
-    if let Some(m) = if_modified_after
-        && let Ok(last) = repo.modified_time(path)
-    {
-        debug!("modified_after: {:?} {:?}", m, last);
-        return last.duration_since(m).is_ok();
+    let Some(m) = if_modified_after else {
+        return true;
+    };
+    let Ok(last) = repo.modified_time(path) else {
+        return true;
+    };
+    debug!("modified_after: {:?} {:?}", m, last);
+    if last.duration_since(m).is_ok() {
+        return true;
     }
-    true
+    let Ok(mtime) = last.duration_since(std::time::SystemTime::UNIX_EPOCH) else {
+        return true;
+    };
+    let mtime_ns = mtime.as_nanos() as u64;
+    let Ok(size) = repo.file_size(path) else {
+        return true;
+    };
+    let cached = txn.read().get_inode_stat(&inode).unwrap_or(None);
+    mtime_ns == 0 || cached != Some((mtime_ns, size))
 }
 
 use std::borrow::Cow;
@@ -916,32 +966,6 @@ fn refresh_stat_cache<T: TreeMutTxnT, W: WorkingCopy>(
         if mtime_ns != 0 {
             txn.write().set_inode_stat(&inode, mtime_ns, size)?;
         }
-    }
-    Ok(())
-}
-
-fn del_redundant<T: ChannelMutTxnT + GraphMutTxnT>(
-    txn: ArcTxn<T>,
-    channel: ChannelRef<T>,
-    forward: &[Redundant],
-) -> Result<(), TxnErr<T::GraphError>> {
-    if forward.is_empty() {
-        return Ok(());
-    }
-    let mut txn = txn.write();
-    let mut channel = channel.write();
-    for ve in forward.iter() {
-        // Unwrap ok since `edge` is in the channel.
-        let dest = *txn.find_block(txn.graph(&*channel), ve.e.dest()).unwrap();
-        debug!("deleting forward edge {:?} {:?} {:?}", ve.v, dest, ve.e);
-        del_graph_with_rev(
-            &mut *txn,
-            T::graph_mut(&mut *channel),
-            ve.e.flag(),
-            ve.v,
-            dest,
-            ve.e.introduced_by(),
-        )?;
     }
     Ok(())
 }

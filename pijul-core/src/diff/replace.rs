@@ -320,7 +320,21 @@ pub(super) fn get_down_context(
 ) -> Vec<Position<Option<ChangeId>>> {
     debug!("get down context");
     if old + old_len >= lines_a.len() {
-        return Vec::new();
+        // No line after, but empty vertices (e.g. resolutions of order
+        // conflicts) may still end the file: new lines must come before them,
+        // else they are in an order conflict with them, i.e. a conflict with an
+        // empty side. The first vertex is the file's inode, never a context
+        // below.
+        let end = diff.contents_a.len();
+        return diff
+            .pos_a
+            .iter()
+            .enumerate()
+            .rev()
+            .take_while(|(i, v)| *i > 0 && v.pos == end)
+            .filter(|(_, v)| !v.vertex.is_root() && v.vertex.is_empty())
+            .map(|(_, v)| v.vertex.start_pos().to_option())
+            .collect();
     }
     let mut down_context_idx = 1;
     let mut pos_bytes = if old + old_len == 0 {
@@ -375,7 +389,15 @@ pub(super) fn get_down_context(
                 } else {
                     diff.pos_a[down_context_idx + 1].pos
                 };
+                // The lines deleted after a previous (e.g. empty) vertex at the
+                // same position may already cover this one: its end is not a
+                // position in the graph.
+                let covered =
+                    pos_bytes > diff.pos_a[down_context_idx].pos && pos_bytes >= next_vertex_pos;
                 loop {
+                    if covered {
+                        break;
+                    }
                     match dd.is_deleted(lines_a, pos_bytes) {
                         Some(Deleted { replaced: true, .. }) => return Vec::new(),
                         Some(Deleted {
