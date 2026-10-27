@@ -144,6 +144,36 @@ pub struct Recorded {
     /// re-emitted by the graph and handled as structure, so its markers never
     /// reach content. The CLI refuses the record unless `--accept-conflict-markers`.
     pub conflict_marker_files: Vec<String>,
+    /// What keeps this change from being written as text and read back,
+    /// which `pijul record` does without `-a` (editor, `--from-change`).
+    pub unprintable: Vec<Unprintable>,
+}
+
+/// Why a recorded change can't go through the text format.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum Unprintable {
+    #[error(
+        "{path}: binary contents of {len} bytes (at most {} can be printed)",
+        crate::change::MAX_PRINTED_BINARY
+    )]
+    LargeBinary { path: String, len: usize },
+}
+
+/// Whether `len` bytes of contents of `path`, inserted by a change, can be
+/// printed, see [`Unprintable`].
+pub(crate) fn unprintable(
+    path: &str,
+    encoding: &Option<Encoding>,
+    len: usize,
+) -> Option<Unprintable> {
+    if encoding.is_none() && len > crate::change::MAX_PRINTED_BINARY {
+        Some(Unprintable::LargeBinary {
+            path: path.to_string(),
+            len,
+        })
+    } else {
+        None
+    }
 }
 
 impl Recorded {
@@ -233,6 +263,7 @@ impl Builder {
             boundaries: self.boundaries.clone(),
             boundary_crossings: Vec::new(),
             conflict_marker_files: Vec::new(),
+            unprintable: Vec::new(),
         }
     }
 
@@ -271,6 +302,7 @@ impl Builder {
             result
                 .conflict_marker_files
                 .extend(rec.conflict_marker_files);
+            result.unprintable.extend(rec.unprintable);
         }
         debug!(
             "result = {:?}, updatables = {:?}",
@@ -1232,6 +1264,11 @@ impl Recorded {
             self.has_binary_files |= encoding.is_none();
             let end = ChangePosition(contents.len().into());
             self.largest_file = self.largest_file.max(end.0.as_u64() - start.0.as_u64());
+            self.unprintable.extend(unprintable(
+                &item.full_path,
+                &encoding,
+                (end.0.as_u64() - start.0.as_u64()) as usize,
+            ));
             // A newly added file bypasses the diff, so check its content for
             // conflict markers here (the bytes were just decoded, no extra pass
             // over the working copy). Same guard as the diff path: flag the file

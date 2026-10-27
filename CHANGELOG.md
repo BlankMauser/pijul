@@ -19,6 +19,10 @@
 
 ### Fixed
 
+- `pijul record --amend <paths>` is now refused. It unrecorded the whole
+  change but recorded it again only from the given paths, silently dropping
+  the change's hunks outside them. The error suggests recording the paths,
+  then squashing the new change into the amended one with `pijul squash`.
 - `pijul unrecord` and `pijul fork --change` no longer panic when a change
   listed in the channel is missing from `.pijul/changes`: the missing file
   is reported as an error naming the change.

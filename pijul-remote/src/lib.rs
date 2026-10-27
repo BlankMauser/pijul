@@ -607,10 +607,10 @@ pub fn output_touched<T>(
     touched: &Touched,
     paths: &std::collections::BTreeSet<String>,
     covered: &TouchedPaths,
-    update_stat_cache: bool,
 ) -> Result<Vec<pijul_core::output::Conflict>, RemoteError>
 where
     T: pijul_core::ChannelMutTxnT
+        + pijul_core::TxnT
         + pijul_core::pristine::TreeMutTxnT<TreeError = <T as GraphTxnT>::GraphError>
         + Send
         + Sync
@@ -655,7 +655,7 @@ where
     let mut conflicts = Vec::new();
     for path in minimal_prefixes(output) {
         conflicts.extend(
-            pijul_core::output::output_repository_no_pending_current(
+            pijul_core::output::output_repository_no_pending(
                 working_copy,
                 changes,
                 txn,
@@ -665,7 +665,6 @@ where
                 None,
                 std::thread::available_parallelism()?.get(),
                 0,
-                update_stat_cache,
             )
             .map_err(other)?,
         );

@@ -53,6 +53,128 @@ fn output_if_modified_since_old_mtime_edit() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Output `channel` as the current channel, stamping the stat cache.
+fn stamp<T: MutTxnT + Send + Sync + 'static>(
+    repo: &working_copy::filesystem::FileSystem,
+    changes: &changestore::filesystem::FileSystem,
+    txn: &ArcTxn<T>,
+    channel: &ChannelRef<T>,
+) -> Result<(), anyhow::Error> {
+    output::output_repository_no_pending(repo, changes, txn, channel, "", true, None, 1, 0)?;
+    Ok(())
+}
+
+/// What `reset` does: skip the files whose mtime predates `since`, if the stat
+/// cache says they match the pristine. `since` is in the future, so this only
+/// renders the files the cache does not vouch for.
+fn reset_trusting_cache<T: MutTxnT + Send + Sync + 'static>(
+    repo: &working_copy::filesystem::FileSystem,
+    changes: &changestore::filesystem::FileSystem,
+    txn: &ArcTxn<T>,
+    channel: &ChannelRef<T>,
+) -> Result<(), anyhow::Error> {
+    let since = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+    output::output_repository_no_pending(repo, changes, txn, channel, "", true, Some(since), 1, 0)?;
+    Ok(())
+}
+
+/// A file at "a\n", then a change `h` turning it into "b\n", unrecorded again:
+/// the pristine and the working copy are at "a\n", stamped clean.
+fn a_then_b() -> Result<
+    (
+        tempfile::TempDir,
+        working_copy::filesystem::FileSystem,
+        tempfile::TempDir,
+        changestore::filesystem::FileSystem,
+        tempfile::TempDir,
+        ArcTxn<pristine::sanakirja::MutTxn0>,
+        ChannelRef<pristine::sanakirja::MutTxn0>,
+        Hash,
+    ),
+    anyhow::Error,
+> {
+    let r = tempfile::tempdir()?;
+    let repo = working_copy::filesystem::FileSystem::from_root(r.path());
+    let c = tempfile::tempdir()?;
+    let changes = changestore::filesystem::FileSystem::from_root(c.path(), MAX_FILES);
+    let p = tempfile::tempdir()?;
+    let env = pristine::sanakirja::Pristine::new(p.path().join("pristine"))?;
+    let txn = env.arc_txn_begin().unwrap();
+    let channel = txn
+        .write()
+        .open_or_create_channel(&SmallString::from_str("main"))
+        .unwrap();
+    let path = r.path().join("file");
+    std::fs::write(&path, b"a\n")?;
+    txn.write().add_file("file", 0)?;
+    record_all(&repo, &changes, &txn, &channel, "")?;
+    std::fs::write(&path, b"b\n")?;
+    let h = record_all(&repo, &changes, &txn, &channel, "")?;
+    txn.write()
+        .unrecord(&changes, &channel, &h, 0, &mut Default::default())?;
+    std::fs::write(&path, b"a\n")?;
+    stamp(&repo, &changes, &txn, &channel)?;
+    Ok((r, repo, c, changes, p, txn, channel, h))
+}
+
+/// Applying a change without outputting the files it touches (a dependency
+/// `pijul apply` pulled in, `--deps-only`, `replay`…) leaves them stale on disk:
+/// their stat must stop vouching for them, or `record`/`diff` see nothing and
+/// `reset` skips them.
+#[test]
+fn apply_without_output_forgets_stat() -> Result<(), anyhow::Error> {
+    env_logger::try_init().unwrap_or(());
+    let (r, repo, _c, changes, _p, txn, channel, h) = a_then_b()?;
+    let inode = crate::fs::find_inode(&*txn.read(), "file")?;
+    assert!(txn.read().get_inode_stat(&inode)?.is_some());
+
+    txn.write()
+        .apply_change(&changes, &mut *channel.write(), &h)?;
+    assert_eq!(txn.read().get_inode_stat(&inode)?, None);
+
+    reset_trusting_cache(&repo, &changes, &txn, &channel)?;
+    assert_eq!(std::fs::read(r.path().join("file"))?, b"b\n");
+    Ok(())
+}
+
+/// Same for an unrecord that keeps the working copy (`pijul unrecord` without
+/// `--reset`, or the pending patch of pull/apply after its output).
+#[test]
+fn unrecord_without_output_forgets_stat() -> Result<(), anyhow::Error> {
+    env_logger::try_init().unwrap_or(());
+    let (r, repo, _c, changes, _p, txn, channel, h) = a_then_b()?;
+    txn.write()
+        .apply_change(&changes, &mut *channel.write(), &h)?;
+    stamp(&repo, &changes, &txn, &channel)?;
+    let inode = crate::fs::find_inode(&*txn.read(), "file")?;
+    assert!(txn.read().get_inode_stat(&inode)?.is_some());
+
+    txn.write()
+        .unrecord(&changes, &channel, &h, 0, &mut Default::default())?;
+    assert_eq!(txn.read().get_inode_stat(&inode)?, None);
+
+    reset_trusting_cache(&repo, &changes, &txn, &channel)?;
+    assert_eq!(std::fs::read(r.path().join("file"))?, b"a\n");
+    Ok(())
+}
+
+/// Only the files a change touches lose their stat: the next `record` re-reads
+/// these, not the whole tree.
+#[test]
+fn apply_keeps_stat_of_untouched_files() -> Result<(), anyhow::Error> {
+    env_logger::try_init().unwrap_or(());
+    let (_r, repo, _c, changes, _p, txn, channel, _h) = a_then_b()?;
+    let inode = crate::fs::find_inode(&*txn.read(), "file")?;
+    let before = txn.read().get_inode_stat(&inode)?;
+    assert!(before.is_some());
+    // A change touching another file leaves this one's stat alone.
+    std::fs::write(_r.path().join("other"), b"x\n")?;
+    txn.write().add_file("other", 0)?;
+    record_all(&repo, &changes, &txn, &channel, "other")?;
+    assert_eq!(txn.read().get_inode_stat(&inode)?, before);
+    Ok(())
+}
+
 #[test]
 fn filesystem() -> Result<(), anyhow::Error> {
     env_logger::try_init().unwrap_or(());

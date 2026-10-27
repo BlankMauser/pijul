@@ -111,7 +111,12 @@ impl Diff {
         // pristine) so the next `diff`/`record` skips them. Only the clean ones —
         // a file that actually differs must never be cached as clean, or the
         // pending edit would be hidden. See notes-record-stat-cache.md.
-        let stat_updates = rec.take_stat_updates();
+        {
+            let stat_updates = rec.take_stat_updates();
+            let mut txn_ = txn.write();
+            pijul_core::record::update_stat_cache(&mut *txn_, &stat_updates, true)
+                .map_err(|e| anyhow::anyhow!("stat cache: {:?}", e))?;
+        }
 
         // The record-time palimpsest preview: group the recorded hunks by
         // file and annotate each file's working-copy content in full context.
@@ -155,13 +160,6 @@ impl Diff {
                             .ok_or_else(|| anyhow::anyhow!("non-UTF-8 path"))?
                     )?;
                 }
-            }
-            // Whole tree matches the pristine: warm the cache with every file
-            // this walk confirmed clean so the next diff/record skips them.
-            {
-                let mut txn_ = txn.write();
-                pijul_core::record::update_stat_cache(&mut *txn_, &stat_updates, true)
-                    .map_err(|e| anyhow::anyhow!("stat cache: {:?}", e))?;
             }
             txn.commit()?;
             return Ok(());
@@ -310,17 +308,10 @@ impl Diff {
                 Err(e) => return Err(e.into()),
             }
         }
-        // Persist the stat cache warmed by this walk (clean-only, so a pending
-        // edit is never cached as clean) and commit, so the next diff/record
-        // skips these files instead of re-diffing the whole tree.
-        {
-            let mut txn_ = txn.write();
-            pijul_core::record::update_stat_cache(&mut *txn_, &stat_updates, true)
-                .map_err(|e| anyhow::anyhow!("stat cache: {:?}", e))?;
-            if actions_is_empty && self.prefixes.is_empty() {
-                use pijul_core::ChannelMutTxnT;
-                txn_.touch_channel(&mut *channel.write(), None);
-            }
+        // Commit the stat cache warmed above.
+        if actions_is_empty && self.prefixes.is_empty() {
+            use pijul_core::ChannelMutTxnT;
+            txn.write().touch_channel(&mut *channel.write(), None);
         }
         txn.commit()?;
         Ok(())

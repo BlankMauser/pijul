@@ -313,7 +313,12 @@ pub fn apply_change_rec<T: MutTxnT, P: ChangeStore>(
     )
 }
 
-fn apply_change_to_channel<T: ChannelMutTxnT + TreeTxnT, F: FnMut(&Hash) -> bool>(
+fn apply_change_to_channel<
+    T: ChannelMutTxnT
+        + DepsTxnT<DepsError = <T as GraphTxnT>::GraphError>
+        + TreeMutTxnT<TreeError = <T as GraphTxnT>::GraphError>,
+    F: FnMut(&Hash) -> bool,
+>(
     txn: &mut T,
     channel: &mut T::Channel,
     changes: &mut F,
@@ -421,6 +426,7 @@ fn apply_change_to_channel<T: ChannelMutTxnT + TreeTxnT, F: FnMut(&Hash) -> bool
         }
     }
     clean_unjustified_pseudo_edges(txn, T::graph_mut(channel), &inodes)?;
+    forget_touched_stats(txn, change_id)?;
     info!("done applying change");
     Ok((n, merkle))
 }
@@ -431,7 +437,9 @@ fn apply_change_to_channel<T: ChannelMutTxnT + TreeTxnT, F: FnMut(&Hash) -> bool
 /// synchronise the pristine and the working copy after the
 /// application.
 pub fn apply_local_change_ws<
-    T: ChannelMutTxnT + DepsMutTxnT<DepsError = <T as GraphTxnT>::GraphError> + TreeMutTxnT,
+    T: ChannelMutTxnT
+        + DepsMutTxnT<DepsError = <T as GraphTxnT>::GraphError>
+        + TreeMutTxnT<TreeError = <T as GraphTxnT>::GraphError>,
 >(
     txn: &mut T,
     channel: &ChannelRef<T>,
@@ -481,7 +489,9 @@ pub fn apply_local_change_ws<
 
 /// Same as [apply_local_change_ws], but allocates its own workspace.
 pub fn apply_local_change<
-    T: ChannelMutTxnT + DepsMutTxnT<DepsError = <T as GraphTxnT>::GraphError> + TreeMutTxnT,
+    T: ChannelMutTxnT
+        + DepsMutTxnT<DepsError = <T as GraphTxnT>::GraphError>
+        + TreeMutTxnT<TreeError = <T as GraphTxnT>::GraphError>,
 >(
     txn: &mut T,
     channel: &ChannelRef<T>,
@@ -924,13 +934,13 @@ fn is_forward_reachable<T: GraphTxnT>(
         if budget == 0 {
             return Ok(false);
         }
->>>>>>>        // Dead vertices order nothing (the alive graph does not have them):
+        budget -= 1;
+        // Dead vertices order nothing (the alive graph does not have them):
         // a path through one does not make the reconnection redundant.
         if w != from && !is_alive(txn, channel, &w)? {
             continue;
         }
-=======        budget -= 1;
-<<<<<<<        for e in iter_adjacent(
+        for e in iter_adjacent(
             txn,
             channel,
             w,
@@ -1010,12 +1020,12 @@ fn forward_reachable_within<T: GraphTxnT>(
         if budget == 0 {
             return Ok(());
         }
->>>>>>>        // As in `is_forward_reachable`, do not go through dead vertices.
+        budget -= 1;
+        // As in `is_forward_reachable`, do not go through dead vertices.
         if v != from && !is_alive(txn, channel, &v)? {
             continue;
         }
-=======        budget -= 1;
-<<<<<<<        for e in iter_adjacent(
+        for e in iter_adjacent(
             txn,
             channel,
             v,
@@ -1030,7 +1040,10 @@ fn forward_reachable_within<T: GraphTxnT>(
                     return Ok(());
                 }
             }
->>>>>>>>>>>>>>        }
+            if visited.insert(c) {
+                stack.push(c)
+            }
+        }
     }
     Ok(())
 }
@@ -1070,10 +1083,7 @@ fn alive_exits_through_dead<T: GraphTxnT>(
                 continue;
             }
             stack.push(*txn.find_block(channel, e.dest())?);
-<<<<<<<=======            if visited.insert(c) {
-                stack.push(c)
-            }
-<<<<<<<        }
+        }
     }
     Ok(())
 }

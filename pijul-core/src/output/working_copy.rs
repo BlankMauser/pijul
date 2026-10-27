@@ -83,11 +83,18 @@ impl Conflict {
 /// Output updates the working copy after applying changes, including
 /// the graph-file correspondence.
 ///
+/// When `channel` is the current channel (the one `record` diffs the working
+/// copy against), every file rendered is stamped into record's `(mtime, size)`
+/// stat cache, so the next `record` need not re-read it. Another channel's
+/// content is never stamped: it would make `record` treat a differing file as
+/// clean. A pending patch applied during the output is harmless: unrecording
+/// it forgets the stat of the files it touches (`forget_touched_stats`).
+///
 /// **WARNING:** This overwrites the working copy, cancelling any
 /// unrecorded change.
 #[allow(clippy::too_many_arguments)]
 pub fn output_repository_no_pending<
-    T: ChannelMutTxnT + TreeMutTxnT<TreeError = T::GraphError> + Send + Sync + 'static,
+    T: ChannelMutTxnT + TreeMutTxnT<TreeError = T::GraphError> + TxnT + Send + Sync + 'static,
     R: WorkingCopy + Send + Clone + Sync + 'static,
     P: ChangeStore + Send + Clone + 'static,
 >(
@@ -105,6 +112,12 @@ where
     T::Channel: Send + Sync + 'static,
 {
     debug!("output_repository_no_pending: {:?}", prefix);
+    let is_current = {
+        let txn = txn.read();
+        let channel = channel.read();
+        txn.current_channel()
+            .is_ok_and(|c| c == txn.name(&*channel))
+    };
     // The redundant pseudo-edges the conflict DFS finds are ignored while
     // rendering, but *not* deleted from the channel: see the note on
     // `Redundant`.
@@ -119,60 +132,7 @@ where
         if_modified_since,
         n_workers,
         salt,
-        false,
-    )?;
-
-    Ok(c)
-}
-
-/// Like [`output_repository_no_pending`], but the caller asserts (via
-/// `is_current_channel`) that `channel` is, or is about to become, the current
-/// channel — i.e. the channel `record` will diff the working copy against. When
-/// that holds, every file this call writes is stamped into record's `(mtime,
-/// size)` stat cache, so the next `record` need not re-diff files that output
-/// just rewrote. When `is_current_channel` is false this behaves exactly like
-/// [`output_repository_no_pending`] (no cache update), because caching a
-/// non-current channel's content would make `record` treat a differing
-/// working-copy file as clean.
-///
-/// **WARNING:** This overwrites the working copy, cancelling any
-/// unrecorded change.
-#[allow(clippy::too_many_arguments)]
-pub fn output_repository_no_pending_current<
-    T: ChannelMutTxnT + TreeMutTxnT<TreeError = T::GraphError> + Send + Sync + 'static,
-    R: WorkingCopy + Send + Clone + Sync + 'static,
-    P: ChangeStore + Send + Clone + 'static,
->(
-    repo: &R,
-    changes: &P,
-    txn: &ArcTxn<T>,
-    channel: &ChannelRef<T>,
-    prefix: &str,
-    output_name_conflicts: bool,
-    if_modified_since: Option<std::time::SystemTime>,
-    n_workers: usize,
-    salt: u64,
-    is_current_channel: bool,
-) -> Result<BTreeSet<Conflict>, OutputError<P::Error, T, R::Error>>
-where
-    T::Channel: Send + Sync + 'static,
-{
-    debug!(
-        "output_repository_no_pending_current: {:?} {:?}",
-        prefix, is_current_channel
-    );
-    let (c, _) = output_repository(
-        repo,
-        changes,
-        txn.clone(),
-        channel.clone(),
-        ChangeId::ROOT,
-        &mut crate::path::components(prefix),
-        output_name_conflicts,
-        if_modified_since,
-        n_workers,
-        salt,
-        is_current_channel,
+        is_current,
     )?;
 
     Ok(c)
@@ -896,77 +856,7 @@ fn output_item<T: ChannelTxnT + TreeMutTxnT, P: ChangeStore, W: WorkingCopy>(
     forward: &mut Vec<Redundant>,
     update_stat_cache: bool,
 ) -> Result<(), OutputError<P::Error, T, W::Error>> {
-    if !repo.is_writable(path).map_err(OutputError::WorkingCopy)? {
-        return Ok(());
-    }
-    let mut l = {
-        debug!("write");
-        let txn = txn.write();
-        debug!("/write");
-        let channel = channel.read();
-        retrieve(&*txn, txn.graph(&*channel), output_item.pos, false)?
-    };
-    use std::io::Write;
-    // Render the file into a buffer rather than writing straight to disk, so
-    // we can compare it against the current on-disk content. `write_file`
-    // removes and recreates the file, bumping its mtime (and inode) even when
-    // the bytes are unchanged; that invalidates `record`'s `(mtime, size)`
-    // stat cache and forces the next `record` to re-diff the file. By skipping
-    // the write when the content is identical, output (from pull/push/apply/
-    // reset/clone) only ever touches the mtimes of files it actually changes.
-    let mut buf = Vec::new();
-    {
-        debug!("vertex_buffer");
-        let mut f = vertex_buffer::ConflictsWriter::new(&mut buf, path, output_item.pos, conflicts);
-        debug!("outputting graph");
-        alive::output_graph(changes, &txn, &channel, &mut f, &mut l, forward)
-            .map_err(PristineOutputError::from)?;
-        f.w.flush().unwrap_or(());
-    }
-    let mut current = Vec::new();
-    if repo.read_file(path, &mut current).is_ok() && current == buf {
-        debug!("unchanged, not rewriting {:?}", path);
-    } else {
-        let mut w = repo
-            .write_file(path, inode)
-            .map_err(OutputError::WorkingCopy)?;
-        w.write_all(&buf)
-            .map_err(|e| OutputError::Pristine(PristineOutputError::Io(e)))?;
-        w.flush().unwrap_or(());
-    }
-    // When the caller guarantees this channel is (or is about to become) the
-    // current channel, the file we just materialised now matches what `record`
-    // will diff against, so refresh its `(mtime, size)` entry in record's stat
-    // cache. That lets the next `record` skip re-diffing this file instead of
-    // being forced to reread it because output bumped its mtime. Only ever done
-    // for the current channel: caching another channel's content would make
-    // `record` treat a differing working-copy file as clean.
-    if update_stat_cache {
-        refresh_stat_cache(&txn, repo, inode, path)?;
-    }
-    Ok(())
-}
-
-/// Record the on-disk `(mtime, size)` of `path` into the `inodes` stat cache,
-/// matching the values [`crate::record`] computes so the next record recognises
-/// the file as unchanged. Missing/zero timestamps or sizes are left uncached
-/// (`mtime == 0` is the cache's "unknown" sentinel), which merely costs a
-/// re-diff rather than risking a stale hit.
-fn refresh_stat_cache<T: TreeMutTxnT, W: WorkingCopy>(
-    txn: &ArcTxn<T>,
-    repo: &W,
-    inode: Inode,
-    path: &str,
-) -> Result<(), TreeErr<T::TreeError>> {
-    if let Ok(mtime) = repo.modified_time(path)
-        && let Ok(dur) = mtime.duration_since(std::time::SystemTime::UNIX_EPOCH)
-        && let Ok(size) = repo.file_size(path)
-    {
-        let mtime_ns = dur.as_nanos() as u64;
-        if mtime_ns != 0 {
-            txn.write().set_inode_stat(&inode, mtime_ns, size)?;
-        }
-    }
+>>>>>>>    }
     Ok(())
 }
 
@@ -1130,3 +1020,74 @@ fn inode_filename<T: TreeTxnT>(
     debug!("inode_filename = {:?}", path);
     Ok(Some(path))
 }
+=======    if !repo.is_writable(path).map_err(OutputError::WorkingCopy)? {
+        return Ok(());
+    }
+    let mut l = {
+        debug!("write");
+        let txn = txn.write();
+        debug!("/write");
+        let channel = channel.read();
+        retrieve(&*txn, txn.graph(&*channel), output_item.pos, false)?
+    };
+    use std::io::Write;
+    // Render the file into a buffer rather than writing straight to disk, so
+    // we can compare it against the current on-disk content. `write_file`
+    // removes and recreates the file, bumping its mtime (and inode) even when
+    // the bytes are unchanged; that invalidates `record`'s `(mtime, size)`
+    // stat cache and forces the next `record` to re-diff the file. By skipping
+    // the write when the content is identical, output (from pull/push/apply/
+    // reset/clone) only ever touches the mtimes of files it actually changes.
+    let mut buf = Vec::new();
+    {
+        debug!("vertex_buffer");
+        let mut f = vertex_buffer::ConflictsWriter::new(&mut buf, path, output_item.pos, conflicts);
+        debug!("outputting graph");
+        alive::output_graph(changes, &txn, &channel, &mut f, &mut l, forward)
+            .map_err(PristineOutputError::from)?;
+        f.w.flush().unwrap_or(());
+    }
+    let mut current = Vec::new();
+    if repo.read_file(path, &mut current).is_ok() && current == buf {
+        debug!("unchanged, not rewriting {:?}", path);
+    } else {
+        let mut w = repo
+            .write_file(path, inode)
+            .map_err(OutputError::WorkingCopy)?;
+        w.write_all(&buf)
+            .map_err(|e| OutputError::Pristine(PristineOutputError::Io(e)))?;
+        w.flush().unwrap_or(());
+    }
+    // When the caller guarantees this channel is (or is about to become) the
+    // current channel, the file we just materialised now matches what `record`
+    // will diff against, so refresh its `(mtime, size)` entry in record's stat
+    // cache. That lets the next `record` skip re-diffing this file instead of
+    // being forced to reread it because output bumped its mtime. Only ever done
+    // for the current channel: caching another channel's content would make
+    // `record` treat a differing working-copy file as clean.
+    if update_stat_cache {
+        refresh_stat_cache(&txn, repo, inode, path)?;
+    }
+    Ok(())
+}
+
+/// Record the on-disk `(mtime, size)` of `path` into the `inodes` stat cache,
+/// matching the values [`crate::record`] computes so the next record recognises
+/// the file as unchanged. Missing/zero timestamps or sizes are left uncached
+/// (`mtime == 0` is the cache's "unknown" sentinel), which merely costs a
+/// re-diff rather than risking a stale hit.
+fn refresh_stat_cache<T: TreeMutTxnT, W: WorkingCopy>(
+    txn: &ArcTxn<T>,
+    repo: &W,
+    inode: Inode,
+    path: &str,
+) -> Result<(), TreeErr<T::TreeError>> {
+    if let Ok(mtime) = repo.modified_time(path)
+        && let Ok(dur) = mtime.duration_since(std::time::SystemTime::UNIX_EPOCH)
+        && let Ok(size) = repo.file_size(path)
+    {
+        let mtime_ns = dur.as_nanos() as u64;
+        if mtime_ns != 0 {
+            txn.write().set_inode_stat(&inode, mtime_ns, size)?;
+        }
+<<<<<<<

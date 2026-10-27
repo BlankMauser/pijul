@@ -1502,6 +1502,7 @@ fn fuzz_render<T>(
 where
     T: crate::pristine::ChannelMutTxnT
         + crate::pristine::TreeMutTxnT<TreeError = <T as crate::pristine::GraphTxnT>::GraphError>
+        + crate::pristine::TxnT
         + Send
         + Sync
         + 'static,

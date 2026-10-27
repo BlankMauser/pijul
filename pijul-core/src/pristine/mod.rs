@@ -2444,6 +2444,62 @@ pub(crate) fn register_change<
     Ok(())
 }
 
+/// Mark as unknown the working-copy stat cache entry of every file `change`
+/// touches. Applying or unapplying a change rewrites these files in the
+/// pristine, and the old `(mtime, size)` no longer proves the file on disk
+/// matches it: trusted, it makes `record`/`diff` report the file clean and
+/// `reset` skip it, freezing the stale content until the file is edited.
+///
+/// Called where the graph changes (`apply_change_to_channel`, `unrecord`), so
+/// that no command has to compensate. The entry is stamped again by whatever
+/// next establishes that the file matches: an output with `update_stat_cache`,
+/// or `record` after applying its change. Only the files `change` touches are
+/// forgotten, and those already unknown are left alone (no write), so this
+/// costs one `revinodes` lookup per touched file and `record` re-reads no more
+/// than these.
+pub(crate) fn forget_touched_stats<
+    T: GraphTxnT
+        + DepsTxnT<DepsError = <T as GraphTxnT>::GraphError>
+        + TreeMutTxnT<TreeError = <T as GraphTxnT>::GraphError>,
+>(
+    txn: &mut T,
+    change: ChangeId,
+) -> Result<(), TxnErr<T::GraphError>> {
+    let mut touched = Vec::new();
+    for x in txn.iter_rev_touched_files(&change, None)? {
+        let (p, pos) = x?;
+        if *p > change {
+            break;
+        } else if *p < change {
+            continue;
+        }
+        touched.push(*pos)
+    }
+    forget_stats(txn, touched.iter()).map_err(|e| TxnErr(e.0))
+}
+
+/// Mark as unknown the working-copy stat cache entry of the files at these
+/// positions (see [`forget_touched_stats`]), e.g. those that differ between
+/// the old and the new current channel. Positions without an inode in the
+/// working copy, and entries already unknown, are skipped.
+pub fn forget_stats<'a, T: TreeMutTxnT, I: IntoIterator<Item = &'a Position<ChangeId>>>(
+    txn: &mut T,
+    positions: I,
+) -> Result<(), TreeErr<T::TreeError>> {
+    let mut inodes = Vec::new();
+    for pos in positions {
+        if let Some(&inode) = txn.get_revinodes(pos, None)?
+            && txn.get_inode_stat(&inode)?.is_some()
+        {
+            inodes.push(inode)
+        }
+    }
+    for inode in inodes {
+        txn.set_inode_stat(&inode, 0, 0)?;
+    }
+    Ok(())
+}
+
 fn first_state_after<T: ChannelTxnT>(
     txn: &T,
     c: &T::Channel,

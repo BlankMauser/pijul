@@ -34,7 +34,7 @@ impl Unrecord {
     }
 
     pub fn run(mut self, config: &pijul_config::Config) -> Result<(), anyhow::Error> {
-        let mut repo = self.base.find_root()?;
+        let repo = self.base.find_root()?;
         let txn = repo.pristine.arc_txn_begin()?;
 
         let (channel, is_current_channel) = load_channel(self.channel.as_deref(), &*txn.read())?;
@@ -159,7 +159,6 @@ impl Unrecord {
                 touched_by,
                 &Default::default(),
                 &covered,
-                true,
             )?;
         }
         if let Some(h) = pending_hash {
@@ -170,7 +169,6 @@ impl Unrecord {
             repo.changes.del_change(&h)?;
         }
 
-        txn.write().touch_inodes(&mut repo.working_copy, &touched)?;
         txn.commit()?;
 
         Ok(())

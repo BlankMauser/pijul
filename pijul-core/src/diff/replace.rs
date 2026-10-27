@@ -112,6 +112,11 @@ impl Recorded {
         if start >= end {
             return;
         }
+        self.unprintable.extend(crate::record::unprintable(
+            &diff.path,
+            encoding,
+            end - start,
+        ));
         contents.push(0);
         std::mem::drop(contents);
 

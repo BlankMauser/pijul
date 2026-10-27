@@ -28,6 +28,7 @@ mod squash_fuzz;
 mod sub_root;
 mod text;
 mod text_changes;
+mod text_roundtrip;
 mod unrecord;
 
 thread_local! {

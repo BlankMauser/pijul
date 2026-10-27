@@ -19,6 +19,11 @@ pub enum TextDeError {
     MissingChange(usize),
     #[error("Byte position {0} from this change missing")]
     MissingPosition(u64),
+    /// The text format doesn't carry binary contents (see `print_contents`):
+    /// reading back a binary insertion without its bytes would record an
+    /// empty vertex instead.
+    #[error("Binary contents of {0} missing from this change")]
+    MissingBinaryContents(String),
 }
 
 #[derive(Debug, Error)]
@@ -835,6 +840,7 @@ impl Hunk<Option<Hash>, Local> {
                         // them here and build an empty vertex rather than
                         // panicking — cf. the `SolveOrderConflict` branch,
                         // which handles the empty case the same way.
+                        check_binary_contents(&path, &encoding, &new_vertex, &contents)?;
                         let mut x = default_newvertex();
                         x.inode = inode;
                         x.flag = EdgeFlags::BLOCK;
@@ -877,6 +883,7 @@ impl Hunk<Option<Hash>, Local> {
                 replacement_contents,
             } => {
                 let inode = from_printable_pos(changes, pos)?;
+                check_binary_contents(&path, &encoding, &replacement, &replacement_contents)?;
 
                 let replacement = {
                     let mut x = default_newvertex();
@@ -1120,6 +1127,20 @@ pub trait WriteChangeLine: std::io::Write {
 
 impl WriteChangeLine for &mut Vec<u8> {}
 >>>>>>>
+/// A binary insertion read back from text must come with all its bytes: an
+/// empty vertex is fine (`start == end`), missing bytes are not.
+fn check_binary_contents(
+    path: &str,
+    encoding: &Option<Encoding>,
+    new_vertex: &PrintableNewVertex,
+    contents: &[u8],
+) -> Result<(), TextDeError> {
+    if encoding.is_none() && contents.len() as u64 != new_vertex.end - new_vertex.start {
+        return Err(TextDeError::MissingBinaryContents(path.to_string()));
+    }
+    Ok(())
+}
+
 pub fn get_change_contents<C: ChangeStore>(
     changes: &C,
     change: &Atom<Option<Hash>>,
