@@ -83,11 +83,18 @@ impl Conflict {
 /// Output updates the working copy after applying changes, including
 /// the graph-file correspondence.
 ///
+/// When `channel` is the current channel (the one `record` diffs the working
+/// copy against), every file rendered is stamped into record's `(mtime, size)`
+/// stat cache, so the next `record` need not re-read it. Another channel's
+/// content is never stamped: it would make `record` treat a differing file as
+/// clean. A pending patch applied during the output is harmless: unrecording
+/// it forgets the stat of the files it touches (`forget_touched_stats`).
+///
 /// **WARNING:** This overwrites the working copy, cancelling any
 /// unrecorded change.
 #[allow(clippy::too_many_arguments)]
 pub fn output_repository_no_pending<
-    T: ChannelMutTxnT + TreeMutTxnT<TreeError = T::GraphError> + Send + Sync + 'static,
+    T: ChannelMutTxnT + TreeMutTxnT<TreeError = T::GraphError> + TxnT + Send + Sync + 'static,
     R: WorkingCopy + Send + Clone + Sync + 'static,
     P: ChangeStore + Send + Clone + 'static,
 >(
@@ -105,6 +112,12 @@ where
     T::Channel: Send + Sync + 'static,
 {
     debug!("output_repository_no_pending: {:?}", prefix);
+    let is_current = {
+        let txn = txn.read();
+        let channel = channel.read();
+        txn.current_channel()
+            .is_ok_and(|c| c == txn.name(&*channel))
+    };
     // The redundant pseudo-edges the conflict DFS finds are ignored while
     // rendering, but *not* deleted from the channel: see the note on
     // `Redundant`.
@@ -119,60 +132,7 @@ where
         if_modified_since,
         n_workers,
         salt,
-        false,
-    )?;
-
-    Ok(c)
-}
-
-/// Like [`output_repository_no_pending`], but the caller asserts (via
-/// `is_current_channel`) that `channel` is, or is about to become, the current
-/// channel — i.e. the channel `record` will diff the working copy against. When
-/// that holds, every file this call writes is stamped into record's `(mtime,
-/// size)` stat cache, so the next `record` need not re-diff files that output
-/// just rewrote. When `is_current_channel` is false this behaves exactly like
-/// [`output_repository_no_pending`] (no cache update), because caching a
-/// non-current channel's content would make `record` treat a differing
-/// working-copy file as clean.
-///
-/// **WARNING:** This overwrites the working copy, cancelling any
-/// unrecorded change.
-#[allow(clippy::too_many_arguments)]
-pub fn output_repository_no_pending_current<
-    T: ChannelMutTxnT + TreeMutTxnT<TreeError = T::GraphError> + Send + Sync + 'static,
-    R: WorkingCopy + Send + Clone + Sync + 'static,
-    P: ChangeStore + Send + Clone + 'static,
->(
-    repo: &R,
-    changes: &P,
-    txn: &ArcTxn<T>,
-    channel: &ChannelRef<T>,
-    prefix: &str,
-    output_name_conflicts: bool,
-    if_modified_since: Option<std::time::SystemTime>,
-    n_workers: usize,
-    salt: u64,
-    is_current_channel: bool,
-) -> Result<BTreeSet<Conflict>, OutputError<P::Error, T, R::Error>>
-where
-    T::Channel: Send + Sync + 'static,
-{
-    debug!(
-        "output_repository_no_pending_current: {:?} {:?}",
-        prefix, is_current_channel
-    );
-    let (c, _) = output_repository(
-        repo,
-        changes,
-        txn.clone(),
-        channel.clone(),
-        ChangeId::ROOT,
-        &mut crate::path::components(prefix),
-        output_name_conflicts,
-        if_modified_since,
-        n_workers,
-        salt,
-        is_current_channel,
+        is_current,
     )?;
 
     Ok(c)

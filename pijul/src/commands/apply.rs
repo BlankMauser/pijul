@@ -76,6 +76,13 @@ impl Apply {
                 }
             })
         }
+        // Everything applied below, dependencies included, gets a number from
+        // here on: that, not `hashes`, is what the output must cover.
+        let first_applied = {
+            use pijul_core::ChannelTxnT;
+            txn.read().apply_counter(&*channel.read())
+        };
+        let mut replaced = std::collections::BTreeSet::new();
         if self.deps_only {
             if hashes.len() > 1 {
                 bail!("--deps-only is only applicable to a single change")
@@ -91,8 +98,14 @@ impl Apply {
                 // channel before applying — in this same txn, so a failure
                 // aborts the whole thing. Shared with pull/push via the core
                 // `unrecord_superseded` helper. (`unrecord` locks the channel
-                // itself, so this runs with no write-guard held.)
-                txnw.unrecord_superseded(&repo.changes, &channel, hash)?;
+                // itself, so this runs with no write-guard held.) The paths of
+                // the predecessors it unrecords are output too.
+                replaced.extend(pijul_remote::unrecord_superseded(
+                    &mut *txnw,
+                    &repo.changes,
+                    &channel,
+                    &[pijul_remote::CS::Change(*hash)],
+                )?);
                 {
                     let mut channelw = channel.write();
                     txnw.apply_change_rec(&repo.changes, &mut channelw, hash)?;
@@ -101,10 +114,20 @@ impl Apply {
         }
 
         if let Some(base) = base {
-            let applied: Vec<_> = hashes
-                .iter()
-                .map(|h| pijul_remote::CS::Change(*h))
-                .collect();
+            let applied: Vec<_> = {
+                use pijul_core::GraphTxnT;
+                let txn_ = txn.read();
+                let channel_ = channel.read();
+                let mut applied = Vec::new();
+                for x in
+                    pijul_core::pristine::changeid_log(&*txn_, &*channel_, first_applied.into())?
+                {
+                    let (_, p) = x?;
+                    let h: pijul_core::Hash = txn_.get_external(&p.a)?.into();
+                    applied.push(pijul_remote::CS::Change(h))
+                }
+                applied
+            };
             let touched = pijul_remote::touched_inodes(&*txn.read(), &channel, &applied)?;
             // Where the output can overwrite unrecorded changes, as the working
             // copy still is: the files these changes create have no such place.
@@ -142,7 +165,7 @@ impl Apply {
                 &repo.working_copy,
                 &repo.changes,
                 &Default::default(),
-                &Default::default(),
+                &replaced,
             )?;
             covered.extend(prefixes);
             let conflicts = pijul_remote::output_touched(
@@ -151,9 +174,8 @@ impl Apply {
                 &txn,
                 &channel,
                 &touched,
-                &Default::default(),
+                &replaced,
                 &covered,
-                true,
             )?;
             super::print_conflicts(&conflicts)?;
             if let Some(h) = hash {
@@ -162,8 +184,6 @@ impl Apply {
                     .unrecord(&repo.changes, &channel, &h, 0, &mut touched_inodes)?;
                 // The pending patch is ephemeral: drop its change file.
                 repo.changes.del_change(&h)?;
-                txn.write()
-                    .touch_inodes(&repo.working_copy, &touched_inodes)?;
             }
         }
         txn.commit()?;

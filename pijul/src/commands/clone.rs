@@ -114,8 +114,11 @@ impl Clone {
                 .await?;
         }
 
+        // Current before the output, which stamps the current channel's files
+        // into record's stat cache.
+        txn.write().set_current_channel(&self.channel)?;
         if self.partial_paths.is_empty() {
-            pijul_core::output::output_repository_no_pending_current(
+            pijul_core::output::output_repository_no_pending(
                 &repo.working_copy,
                 &repo.changes,
                 &txn,
@@ -125,11 +128,10 @@ impl Clone {
                 None,
                 std::thread::available_parallelism()?.get(),
                 self.salt.unwrap_or(0),
-                true,
             )?;
         } else {
             for p in self.partial_paths.iter() {
-                pijul_core::output::output_repository_no_pending_current(
+                pijul_core::output::output_repository_no_pending(
                     &repo.working_copy,
                     &repo.changes,
                     &txn,
@@ -139,12 +141,10 @@ impl Clone {
                     None,
                     std::thread::available_parallelism()?.get(),
                     self.salt.unwrap_or(0),
-                    true,
                 )?;
             }
         }
         remote.finish().await?;
-        txn.write().set_current_channel(&self.channel)?;
 
         let time = std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -302,7 +302,7 @@ impl Clone {
         )?;
 
         // Materialise the working copy (now with the imported project under `dir/`).
-        pijul_core::output::output_repository_no_pending_current(
+        pijul_core::output::output_repository_no_pending(
             &repo.working_copy,
             &repo.changes,
             &txn,
@@ -312,7 +312,6 @@ impl Clone {
             None,
             std::thread::available_parallelism()?.get(),
             self.salt.unwrap_or(0),
-            true,
         )?;
 
         // Register the imported sub-root as a shared monorepo boundary in the

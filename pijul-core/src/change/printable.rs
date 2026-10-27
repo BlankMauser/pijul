@@ -610,6 +610,12 @@ pub fn get_encoding(contents: &[u8]) -> Option<Encoding> {
     crate::get_valid_encoding(&detector, None, true, contents).map(Encoding)
 }
 
+/// Binary contents are printed (in base64) only up to this size: a change with
+/// larger ones can't be written as text and read back, so recording it needs
+/// `-a` (see [`crate::record::Unprintable`]). Printing them anyway would make
+/// the text look like something that can be applied.
+pub const MAX_PRINTED_BINARY: usize = 4096;
+
 fn print_contents<W: WriteChangeLine>(
     w: &mut W,
     prefix: &str,
@@ -634,7 +640,7 @@ fn print_contents<W: WriteChangeLine>(
             writeln!(w, "\\")?;
         }
         Ok(())
-    } else if contents.len() <= 4096 {
+    } else if contents.len() <= MAX_PRINTED_BINARY {
         writeln!(w, "{}b{}", prefix, data_encoding::BASE64.encode(contents))
     } else {
         Ok(())

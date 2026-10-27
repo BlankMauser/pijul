@@ -322,9 +322,7 @@ impl Local {
             &touched,
             &replaced,
         )?;
-        crate::output_touched(
-            &repo, &store, &txn, &channel, &touched, &replaced, &covered, false,
-        )?;
+        crate::output_touched(&repo, &store, &txn, &channel, &touched, &replaced, &covered)?;
 
         // Restore the remote's pending patch to unrecorded state: unrecord it
         // (the working copy keeps the merged content output above) and drop its

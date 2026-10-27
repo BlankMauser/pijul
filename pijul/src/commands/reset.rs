@@ -130,7 +130,7 @@ impl Reset {
                 }
 
                 let last_modified = last_modified(&*txn.read(), &*channel.read());
-                pijul_core::output::output_repository_no_pending_current(
+                pijul_core::output::output_repository_no_pending(
                     &repo.working_copy,
                     &repo.changes,
                     &txn,
@@ -140,7 +140,6 @@ impl Reset {
                     Some(last_modified),
                     std::thread::available_parallelism()?.get(),
                     0,
-                    true,
                 )?;
                 txn.write().touch_channel(&mut *channel.write(), None);
                 txn.commit()?;
@@ -166,6 +165,10 @@ impl Reset {
                 };
                 changes_after(&*txn_, &*cur.read(), a, &mut changediff, &mut inodes)?;
                 changes_after(&*txn_, &*channel.read(), b, &mut changediff, &mut inodes)?;
+                // These files differ between the two channels: their cached
+                // stat describes the old channel's content.
+                pijul_core::pristine::forget_stats(&mut *txn_, inodes.iter())
+                    .map_err(|e| anyhow::anyhow!("stat cache: {:?}", e))?;
             }
 
             if let Some(ref c) = self.channel {
@@ -195,7 +198,7 @@ impl Reset {
                 }
                 debug!("resetting {:?}", path);
                 conflicts.extend(
-                    pijul_core::output::output_repository_no_pending_current(
+                    pijul_core::output::output_repository_no_pending(
                         &repo.working_copy,
                         &repo.changes,
                         &txn,
@@ -205,7 +208,6 @@ impl Reset {
                         None,
                         std::thread::available_parallelism()?.get(),
                         0,
-                        true,
                     )?
                     .into_iter(),
                 );
@@ -225,7 +227,7 @@ impl Reset {
                     bail!("path not tracked by Pijul: {}", root.display());
                 }
                 conflicts.extend(
-                    pijul_core::output::output_repository_no_pending_current(
+                    pijul_core::output::output_repository_no_pending(
                         &repo.working_copy,
                         &repo.changes,
                         &txn,
@@ -235,7 +237,6 @@ impl Reset {
                         None,
                         std::thread::available_parallelism()?.get(),
                         0,
-                        true,
                     )?
                     .into_iter(),
                 );

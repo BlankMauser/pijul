@@ -1209,8 +1209,6 @@ impl Pull {
                     &touched,
                     &replaced,
                     &covered,
-                    // `base` is only forked for the current channel.
-                    true,
                 )?
             };
             if self.json {
@@ -1222,14 +1220,10 @@ impl Pull {
                 txn.write()
                     .unrecord(&repo.changes, &mut channel, &h, 0, &mut touched_inodes)?;
                 // The pending patch is ephemeral: drop its change file.
+                // The output above stamped the merged files clean with the
+                // pending patch applied; its unrecord forgot their stat again
+                // (`forget_touched_stats`), so `record`/`diff` re-read them.
                 repo.changes.del_change(&h)?;
-                // The output above ran with the pending patch applied and stamped
-                // the merged files into record's stat cache as clean. Now that the
-                // pending patch is unrecorded again those files are dirty: bump
-                // their mtime so `record`/`diff` re-read them. Otherwise they report
-                // nothing, touch the channel, and `reset` then skips these files.
-                txn.write()
-                    .touch_inodes(&repo.working_copy, &touched_inodes)?;
             }
         }
 

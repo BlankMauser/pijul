@@ -42,7 +42,11 @@ pub struct Record {
     pub accept_conflict_markers: bool,
     #[clap(flatten)]
     pub header: HeaderOpts,
-    /// Amend this change instead of creating a new change
+    /// Amend this change (the last one by default) instead of creating a new
+    /// change: it is unrecorded, then replaced by a record of the whole working
+    /// copy. Cannot be restricted to paths, since the amended change's hunks
+    /// outside them would be dropped; to add changes to an existing change,
+    /// record them, then `pijul squash` both.
     #[clap(long = "amend")]
     #[allow(clippy::option_option)]
     pub amend: Option<Option<String>>,
@@ -65,6 +69,28 @@ impl Record {
     }
 
     pub async fn run(mut self, config: &pijul_config::Config) -> Result<(), anyhow::Error> {
+        // An amend unrecords the whole change and records it again from the
+        // working copy. Restricted to paths, that record would silently drop
+        // the change's hunks outside them, while the editor (which shows the
+        // final change) never displays them.
+        if let Some(ref amend) = self.amend {
+            if !self.prefixes.is_empty() {
+                let target = amend.as_deref().unwrap_or("<last change>");
+                let paths: Vec<_> = self
+                    .prefixes
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect();
+                bail!(
+                    "--amend cannot be restricted to paths: the hunks of the amended change outside them would be dropped.\n\
+                     To add the changes under these paths to {}, record them, then squash:\n    \
+                     pijul record {} && pijul squash {} <new change>",
+                    target,
+                    paths.join(" "),
+                    target,
+                );
+            }
+        }
         let mut repo = self.base.find_root()?;
         let mut stdout = std::io::stdout();
         let mut stderr = std::io::stderr();
@@ -169,7 +195,6 @@ impl Record {
             // itself, and its `unrecord_superseded` re-marks all of them — so the
             // lineage stays filtered without any special "superseding" unrecord.
             txn.unrecord(&repo.changes, &mut channel, &h, salt, &mut touched_inodes)?;
-            txn.touch_inodes(&mut repo.working_copy, &mut touched_inodes)?;
             header
         } else {
             self.header.header(config).await?
@@ -690,8 +715,19 @@ impl Record {
             );
         }
 
-        if rec.has_binary_files && !self.all {
-            bail!("Cannot record a binary change interactively. Please use -a.")
+        // Without -a, the change goes through the text format (editor,
+        // `--from-change`), which can't carry everything.
+        if !self.all && !rec.unprintable.is_empty() {
+            let list = rec
+                .unprintable
+                .iter()
+                .map(|u| format!("  {}", u))
+                .collect::<Vec<_>>()
+                .join("\n");
+            bail!(
+                "This change can't be printed, so it can't be edited:\n{}\nPlease record it with -a.",
+                list
+            )
         }
 
         debug!("TAKING LOCK {}", line!());
@@ -744,7 +780,6 @@ impl Record {
             }
         }
 
-        debug!("has_binary = {:?}", rec.has_binary_files);
         let mut change = if self.all {
             change
         } else if let Some(ref from) = self.from_change {

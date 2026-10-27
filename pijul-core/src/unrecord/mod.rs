@@ -93,6 +93,8 @@ pub fn unrecord<T: MutTxnT, P: ChangeStore>(
     let mut channel = channel.write();
 
     del_channel_changes::<T, P>(txn, &mut channel, change_id)?;
+    // Before `unapply`, while the touched files still map to their inodes.
+    crate::pristine::forget_touched_stats(txn, change_id)?;
 
     let change = changes
         .get_change(hash)
