@@ -1,0 +1,46 @@
+Cargo.toml
+  h_03360edcd9e88f 112-116
+zstd-seekable/Cargo.toml
+  h_03360edcd9e88f 1-20
+zstd-seekable/README.md
+  h_03360edcd9e88f 1-18
+zstd-seekable/build.rs
+  h_03360edcd9e88f 1-43
+zstd-seekable/seekable/LICENSE
+  h_03360edcd9e88f 1-30
+zstd-seekable/seekable/common/compiler.h
+  h_03360edcd9e88f 1-354
+zstd-seekable/seekable/common/debug.h
+  h_03360edcd9e88f 1-107
+zstd-seekable/seekable/common/mem.h
+  h_03360edcd9e88f 1-435
+zstd-seekable/seekable/common/portability_macros.h
+  h_03360edcd9e88f 1-156
+zstd-seekable/seekable/common/xxhash.h
+  h_03360edcd9e88f 1-5686
+zstd-seekable/seekable/common/zstd_deps.h
+  h_03360edcd9e88f 1-111
+zstd-seekable/seekable/zstd_seekable.h
+  h_03360edcd9e88f 1-217
+zstd-seekable/seekable/zstdseek_compress.c
+  h_03360edcd9e88f 1-363
+zstd-seekable/seekable/zstdseek_decompress.c
+  h_03360edcd9e88f 1-595
+zstd-seekable/src/bindings.rs
+  h_03360edcd9e88f 1-219
+zstd-seekable/src/lib.rs
+  h_03360edcd9e88f 1-797
+zstd-seekable/xxh64.c
+  h_03360edcd9e88f 1-5
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "10356908641aab80c20748a4771a30779814721d",
+  "prompts": {},
+  "humans": {
+    "h_03360edcd9e88f": {
+      "author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}

@@ -1,0 +1,19 @@
+pijul-core/src/apply.rs
+  s_f36f8f7bce4731::t_0a132d5b94166b 927,932-933,1013,1017-1018,1033,1073,1076
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "32d90d3ec9d5aa64c689ac2e11a8537c84a7a19c",
+  "prompts": {},
+  "sessions": {
+    "s_f36f8f7bce4731": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a16d2f-82c4-7631-a77a-2ddc2b5c7556",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}

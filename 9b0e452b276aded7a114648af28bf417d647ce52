@@ -1,0 +1,14 @@
+Cargo.lock
+  h_03360edcd9e88f 4621-4631
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9b0e452b276aded7a114648af28bf417d647ce52",
+  "prompts": {},
+  "humans": {
+    "h_03360edcd9e88f": {
+      "author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}

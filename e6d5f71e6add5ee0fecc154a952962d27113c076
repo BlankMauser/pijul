@@ -1,0 +1,47 @@
+CHANGELOG.md
+  s_f36f8f7bce4731::t_b25cab01a51dbe 5-19,22-24,27-30,34-42
+Cargo.lock
+  s_f36f8f7bce4731::t_b5705b05011fac 2276,2326,2344,2390,2406,2414,2423,2452
+Cargo.toml
+  s_f36f8f7bce4731::t_129f8fe10db0c0 16,24-27,29-30
+pijul-interaction/src/progress/mod.rs
+  s_f36f8f7bce4731::t_d89c35cdd4549b 8,18,57-60
+pijul-interaction/src/progress/terminal.rs
+  s_f36f8f7bce4731::t_0acab41569088c 217-220
+pijul-remote/src/local.rs
+  s_f36f8f7bce4731::t_f4bbce3839ba4c 270-285,313-327,455-458,461
+pijul-remote/src/ssh.rs
+  s_f36f8f7bce4731::t_eb6be92c8957e3 294-297,483,533-534,538-541,1034,1075-1087
+pijul/Cargo.toml
+  s_f36f8f7bce4731::t_8028b91f4df3f2 17,44
+pijul/src/commands/apply.rs
+  s_f36f8f7bce4731::t_456cc4de253c3d 1,9,11,48-54,103-117,122-128,136-157,159-167
+pijul/src/commands/mod.rs
+  s_f36f8f7bce4731::t_2744e5b1faf2d2 17-18,57-59
+pijul/src/commands/protocol.rs
+  s_f36f8f7bce4731::t_25881988d6fe0b 228-249,331,371
+pijul/src/commands/pushpull.rs
+  s_f36f8f7bce4731::t_681b259619f176 434-437,474-477,485-536,538-539,541,586,594-603,611-624,696-705,788-920,942-945,1014-1032,1078-1085,1088-1091,1174-1188,1190-1215,1221-1233
+pijul/src/commands/record.rs
+  s_f36f8f7bce4731::t_fbcff147aa41d6 18,43-44,155,164,175,216-220,284,363,487-489,563-568,641,771,774,779
+pijul/src/commands/unrecord.rs
+  s_f36f8f7bce4731::t_f0ca6bfd2a4dae 94-102,106-118,153-154,159-161
+pijul/src/main.rs
+  s_f36f8f7bce4731::t_409d32b2701223 114-127,281,322
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e6d5f71e6add5ee0fecc154a952962d27113c076",
+  "prompts": {},
+  "sessions": {
+    "s_f36f8f7bce4731": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a16d2f-82c4-7631-a77a-2ddc2b5c7556",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
