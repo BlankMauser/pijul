@@ -109,3 +109,8 @@ url = "2.5"
 validator = "0.21"
 whoami = { version = "2.1", default-features = false }
 zstd-seekable = "0.1"
+
+# Baark: zstd-seekable linked against zstd-sys, so one zstd library is linked
+# (zstd-seekable/README.md). Baark's root Cargo.toml carries the same patch.
+[patch.crates-io]
+zstd-seekable = { path = "zstd-seekable" }

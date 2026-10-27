@@ -1,0 +1,20 @@
+[package]
+name = "zstd-seekable"
+description = "Bindings to the seekable version of ZStandard, linked against zstd-sys."
+# Same version as the crates.io release it replaces through [patch.crates-io].
+version = "0.1.23"
+authors = ["Pierre-Étienne Meunier <pe@pijul.org>"]
+edition = "2018"
+license = "BSD-3-Clause"
+publish = false
+
+[dependencies]
+libc = "0.2"
+thiserror = "1.0"
+threadpool = "1.8"
+# The one zstd library of the build. The crates.io release compiles its own
+# copy of zstd's C sources, which collides with zstd-sys at link time.
+zstd-sys = { version = "2.0.10", default-features = false }
+
+[build-dependencies]
+cc = "1.0"
