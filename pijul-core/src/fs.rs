@@ -875,6 +875,14 @@ pub fn iter_paths<T: GraphTxnT, F: FnMut(&mut dyn Iterator<Item = Position<Chang
     Ok(())
 }
 
+/// The inode at `path`, following the oldest alive name at each component;
+/// `true` when some component had more than one alive name (a conflict).
+///
+/// A channel can hold several roots (two independent repositories merged,
+/// e.g. a Git history with two root commits): the null root then has one
+/// empty name per root, and a top-level path can live under any of them.
+/// Every root is searched, as `output` and `iter_graph_children` do; the
+/// first root alone used to be, so paths under the others were not found.
 pub(crate) fn follow_oldest_path<T: ChannelTxnT, C: ChangeStore>(
     changes: &C,
     txn: &T,
@@ -889,14 +897,19 @@ pub(crate) fn follow_oldest_path<T: ChannelTxnT, C: ChangeStore>(
     let mut name_buf = Vec::new();
     let mut ambiguous = false;
     let mut seen = HashSet::new();
+    seen.insert(current);
     for c in crate::path::components(path) {
-        'outer: loop {
-            let mut next = None;
-            debug!("follow_oldest_path, loop {:?}", current);
+        let mut next = None;
+        // `current`, then every root reached from it through an empty name.
+        let mut parents = vec![current];
+        let mut i = 0;
+        while let Some(&parent) = parents.get(i) {
+            i += 1;
+            debug!("follow_oldest_path, parent {:?}", parent);
             for name in iter_adjacent(
                 txn,
                 txn.graph(channel),
-                current.inode_vertex(),
+                parent.inode_vertex(),
                 flag0,
                 flag1,
             )? {
@@ -904,12 +917,15 @@ pub(crate) fn follow_oldest_path<T: ChannelTxnT, C: ChangeStore>(
                 let name_dest = txn.find_block(txn.graph(channel), name.dest()).unwrap();
                 debug!("name_dest = {:?}", name_dest);
                 if name_dest.start == name_dest.end {
-                    // non-null root, just continue.
-                    current = iter_adjacent(txn, txn.graph(channel), *name_dest, flag0, flag1)?
+                    // A non-null root: its children are searched too.
+                    let root = iter_adjacent(txn, txn.graph(channel), *name_dest, flag0, flag1)?
                         .next()
                         .unwrap()?
                         .dest();
-                    continue 'outer;
+                    if seen.insert(root) {
+                        parents.push(root);
+                    }
+                    continue;
                 }
                 name_buf.resize(name_dest.end - name_dest.start, 0);
                 debug!("getting contents {:?}", name);
@@ -937,19 +953,19 @@ pub(crate) fn follow_oldest_path<T: ChannelTxnT, C: ChangeStore>(
                     }
                 }
             }
-            if let Some((next, _)) = next {
-                let current_ = iter_adjacent(txn, txn.graph(channel), *next, flag0, flag1)?
-                    .next()
-                    .unwrap()?
-                    .dest();
-                if seen.insert(current_) {
-                    current = current_;
-                    break;
-                }
-            } else {
-                return Err(FsErrorC::NotFound(FsNotFound(path.to_string())));
-            }
         }
+        let Some((next, _)) = next else {
+            return Err(FsErrorC::NotFound(FsNotFound(path.to_string())));
+        };
+        let current_ = iter_adjacent(txn, txn.graph(channel), *next, flag0, flag1)?
+            .next()
+            .unwrap()?
+            .dest();
+        if !seen.insert(current_) {
+            // A cycle of names: no such path.
+            return Err(FsErrorC::NotFound(FsNotFound(path.to_string())));
+        }
+        current = current_;
     }
     Ok((current, ambiguous))
 }
