@@ -906,13 +906,8 @@ pub(crate) fn follow_oldest_path<T: ChannelTxnT, C: ChangeStore>(
         while let Some(&parent) = parents.get(i) {
             i += 1;
             debug!("follow_oldest_path, parent {:?}", parent);
-            for name in iter_adjacent(
-                txn,
-                txn.graph(channel),
-                parent.inode_vertex(),
-                flag0,
-                flag1,
-            )? {
+            for name in iter_adjacent(txn, txn.graph(channel), parent.inode_vertex(), flag0, flag1)?
+            {
                 let name = name?;
                 let name_dest = txn.find_block(txn.graph(channel), name.dest()).unwrap();
                 debug!("name_dest = {:?}", name_dest);
