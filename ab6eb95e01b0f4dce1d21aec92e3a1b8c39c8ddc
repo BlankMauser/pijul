@@ -1,0 +1,41 @@
+pijul-core/src/change/text_changes.rs
+  s_f36f8f7bce4731::t_39a9d1032a7300 1122-1124
+pijul-core/src/changestore/filesystem.rs
+  s_f36f8f7bce4731::t_06807483fc36ac 205-206
+pijul-core/src/changestore/mod.rs
+  s_f36f8f7bce4731::t_5351e904e9af72 90-92
+pijul-core/src/missing_context.rs
+  s_f36f8f7bce4731::t_bdf209ac1d4af5 335-336
+pijul-core/src/pristine/mod.rs
+  s_f36f8f7bce4731::t_6aecafb79a2bd6 2352-2356
+pijul-core/src/tests/add_file.rs
+  s_f36f8f7bce4731::t_a2a933d270ba0d 60-62
+pijul-core/src/tests/missing_context.rs
+  s_f36f8f7bce4731::t_b8bacb604cf1d6 196-197
+pijul-core/src/tests/performance.rs
+  s_f36f8f7bce4731::t_c112867b17e573 131-145
+pijul-core/src/tests/rollback.rs
+  s_f36f8f7bce4731::t_236ca6aa440f51 64-65
+pijul-core/src/unrecord/mod.rs
+  s_f36f8f7bce4731::t_48fec162fb2ae2 708,879-938
+pijul-core/src/vertex_buffer.rs
+  s_f36f8f7bce4731::t_94b6acb891c6b5 199-200
+pijul-core/src/working_copy/filesystem.rs
+  s_f36f8f7bce4731::t_05a1e51fd2b177 400-402,497-498
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ab6eb95e01b0f4dce1d21aec92e3a1b8c39c8ddc",
+  "prompts": {},
+  "sessions": {
+    "s_f36f8f7bce4731": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a16d2f-82c4-7631-a77a-2ddc2b5c7556",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
