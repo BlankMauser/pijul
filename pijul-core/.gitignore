@@ -1,0 +1,10 @@
+# Debug dumps written into the crate directory by the core tests.
+/*.dot
+/after0
+/alice[01]
+/before[01]
+/bob[01]
+/debug
+/debug4165
+/debug_sanakirja
+/debug_tree
