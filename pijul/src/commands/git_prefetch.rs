@@ -30,6 +30,17 @@ pub(super) struct Prepared {
 }
 
 impl Prepared {
+    #[cfg(test)]
+    fn load_empty(_: &git2::Repository, oid: git2::Oid) -> Result<Self, anyhow::Error> {
+        Ok(Self {
+            oid,
+            files: Arc::new(HashMap::new()),
+            tree_order: Vec::new(),
+            parents: Vec::new(),
+            elapsed: Duration::ZERO,
+        })
+    }
+
     pub fn load(git: &git2::Repository, oid: git2::Oid) -> Result<Self, anyhow::Error> {
         let start = Instant::now();
         let commit = git.find_commit(oid)?;
@@ -85,24 +96,47 @@ pub(super) struct Prefetch {
 
 impl Prefetch {
     pub fn start(path: &Path, order: Vec<git2::Oid>) -> Self {
+        Self::start_with(path, order, Prepared::load)
+    }
+
+    fn start_with(
+        path: &Path,
+        order: Vec<git2::Oid>,
+        load: impl Fn(&git2::Repository, git2::Oid) -> Result<Prepared, anyhow::Error> + Send + 'static,
+    ) -> Self {
         // At most one queued snapshot plus the one being prepared. No history
         // of blobs/trees is accumulated, including when recording is slower.
         let (sender, receiver) = mpsc::sync_channel(1);
         let path = path.to_path_buf();
         let worker = std::thread::spawn(move || {
-            let git = match git2::Repository::open(path) {
-                Ok(git) => git,
-                Err(e) => {
-                    let _ = sender.send(Err(e.into()));
-                    return;
+            // A panic must reach the importer as an error that says why, not
+            // as an anonymous closed channel.
+            let panic_sender = sender.clone();
+            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let git = match git2::Repository::open(path) {
+                    Ok(git) => git,
+                    Err(e) => {
+                        let _ = sender.send(Err(e.into()));
+                        return;
+                    }
+                };
+                for oid in order {
+                    let prepared = load(&git, oid);
+                    let failed = prepared.is_err();
+                    if sender.send(prepared).is_err() || failed {
+                        break;
+                    }
                 }
-            };
-            for oid in order {
-                let prepared = Prepared::load(&git, oid);
-                let failed = prepared.is_err();
-                if sender.send(prepared).is_err() || failed {
-                    break;
-                }
+            }));
+            if let Err(payload) = run {
+                let cause = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_string());
+                let _ = panic_sender.send(Err(anyhow::anyhow!(
+                    "Git prefetch thread panicked: {cause}"
+                )));
             }
         });
         Self {
@@ -112,7 +146,10 @@ impl Prefetch {
     }
 
     pub fn next(&self, oid: git2::Oid) -> Result<Prepared, anyhow::Error> {
-        let p = self.receiver.as_ref().unwrap().recv()??;
+        let p =
+            self.receiver.as_ref().unwrap().recv().map_err(|_| {
+                anyhow::anyhow!("Git prefetch thread ended before the import did")
+            })??;
         anyhow::ensure!(p.oid == oid, "Git prefetch order differs from import order");
         Ok(p)
     }
@@ -161,6 +198,28 @@ mod tests {
         let oid = git2::Oid::ZERO_SHA1;
         let p = Prefetch::start(dir.path(), vec![oid]);
         assert!(p.next(oid).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn worker_panic_cause_reaches_importer() -> Result<(), anyhow::Error> {
+        let dir = tempfile::tempdir()?;
+        let git = git2::Repository::init(dir.path())?;
+        let a = git2::Oid::from_bytes(&[1; 20])?;
+        let b = git2::Oid::from_bytes(&[2; 20])?;
+        let p = Prefetch::start_with(git.path(), vec![a, b], move |git, oid| {
+            if oid == b {
+                panic!("boom while preparing {oid}");
+            }
+            Prepared::load_empty(git, oid)
+        });
+        assert_eq!(p.next(a)?.oid, a);
+        let err = p.next(b).err().expect("the panic must be an error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("panicked") && msg.contains("boom while preparing"),
+            "{msg}"
+        );
         Ok(())
     }
 }

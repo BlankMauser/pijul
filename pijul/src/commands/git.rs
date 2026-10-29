@@ -694,6 +694,46 @@ fn git_reset<'a, T: TxnTExt + MutTxnTExt>(
     Ok((object, prefixes, pref, touched))
 }
 
+/// Largest total size of the files a commit diffs (new contents, as Git
+/// reports it) for which the importer still uses the parallel `Builder::record`.
+/// That path holds, for every file of the commit at once, the new file and the
+/// reconstructed old side (about twice this figure, plus the diff itself), so
+/// the budget bounds its memory. Above it the serial path is used.
+/// `PIJUL_GIT_PARALLEL_BUDGET` (bytes) overrides it, e.g. `0` to force serial.
+const PARALLEL_RECORD_BUDGET: u64 = 256 << 20;
+
+fn parallel_record_budget() -> u64 {
+    std::env::var("PIJUL_GIT_PARALLEL_BUDGET")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(PARALLEL_RECORD_BUDGET)
+}
+
+/// Whether the files a record of this commit would diff (everything `skip`
+/// does not vouch for, that exists as a file in the new tree) total at most
+/// `budget` bytes according to `size`.
+fn diffed_bytes_within(
+    files: &std::collections::HashMap<String, prefetch::Entry>,
+    skip: &Skip,
+    mut size: impl FnMut(&prefetch::Entry) -> u64,
+    budget: u64,
+) -> bool {
+    let mut total = 0u64;
+    let diffed = skip
+        .touched
+        .iter()
+        .chain(skip.unsettled.iter().filter(|p| !skip.touched.contains(*p)));
+    for path in diffed {
+        if let Some(entry) = files.get(path).filter(|e| !e.is_dir) {
+            total = total.saturating_add(size(entry));
+            if total > budget {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 #[derive(Clone)]
 struct Commit {
     r: std::sync::Arc<std::sync::Mutex<git2::Repository>>,
@@ -843,6 +883,34 @@ fn import_commit<T: TxnTExt + MutTxnTExt + GraphIter + Send + Sync + 'static>(
         && prepared.parents[0]
             .iter()
             .all(|d| d.status == git2::Delta::Modified);
+    // `Builder::record` keeps every prepared diff of the commit (new file plus
+    // reconstructed old side) until it emits the first one, so a commit that
+    // rewrites a lot of data goes through the serial path, which holds one
+    // file at a time. For these (namespace-stable) commits both paths produce
+    // the same change.
+    let parallel = parallel && {
+        let budget = parallel_record_budget();
+        let within = diffed_bytes_within(
+            &prepared.files,
+            skip.as_ref().unwrap(),
+            |entry| {
+                repo.git_objects
+                    .lock()
+                    .ok()
+                    .and_then(|r| Some(r.odb().ok()?.read_header(entry.oid).ok()?.0 as u64))
+                    // Unknown size: assume the worst.
+                    .unwrap_or(u64::MAX)
+            },
+            budget,
+        );
+        if !within {
+            debug!(
+                "commit {:?} exceeds the {} byte parallel-record budget",
+                child, budget
+            );
+        }
+        within
+    };
     let diffed = std::sync::Arc::new(std::sync::Mutex::new(HashSet::new()));
     debug!("prefixes = {:?}", prefixes);
     let mut txn_ = txn.write();
@@ -1289,6 +1357,56 @@ impl Stats {
         )?;
         pijul_core::reset_timers();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    fn entry(n: u8, is_dir: bool) -> prefetch::Entry {
+        prefetch::Entry {
+            oid: git2::Oid::from_bytes(&[n; 20]).unwrap(),
+            mode: 0o100644,
+            is_dir,
+        }
+    }
+
+    fn set(paths: &[&str]) -> std::sync::Arc<HashSet<String>> {
+        std::sync::Arc::new(paths.iter().map(|p| p.to_string()).collect())
+    }
+
+    #[test]
+    fn budget_counts_touched_and_unsettled_files_once() {
+        let files: std::collections::HashMap<_, _> = [
+            ("big".to_string(), entry(1, false)),
+            ("also".to_string(), entry(2, false)),
+            ("dir".to_string(), entry(3, true)),
+            ("untouched".to_string(), entry(4, false)),
+        ]
+        .into();
+        let skip = Skip {
+            touched: set(&["big", "dir", "gone"]),
+            unsettled: set(&["big", "also"]),
+        };
+        // 100 bytes each: `big` once, `also`; not the dir, the missing path
+        // or the untouched file.
+        let size = |_: &prefetch::Entry| 100;
+        assert!(diffed_bytes_within(&files, &skip, size, 200));
+        assert!(!diffed_bytes_within(&files, &skip, size, 199));
+        assert!(!diffed_bytes_within(&files, &skip, size, 0));
+        // An unknown size is the worst case.
+        assert!(!diffed_bytes_within(
+            &files,
+            &skip,
+            |_| u64::MAX,
+            u64::MAX - 1
+        ));
+    }
+
+    #[test]
+    fn default_budget_is_bounded() {
+        assert_eq!(PARALLEL_RECORD_BUDGET, 256 << 20);
     }
 }
 

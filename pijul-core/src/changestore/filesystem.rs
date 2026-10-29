@@ -5,17 +5,53 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-/// When the known cache reaches this many entries it is cleared
-/// wholesale and rebuilt lazily, rather than evicting entries one by
-/// one. Each entry is tiny (two small `Vec<Hash>`), so this bound is
-/// generous, and the occasional clear is amortised over many lookups.
+/// When the known cache reaches this many entries, or `KNOWN_CACHE_MAX_BYTES`
+/// of hashes, it is cleared wholesale and rebuilt lazily, rather than evicting
+/// entries one by one. Most entries are tiny (two small `Vec<Hash>`), but a
+/// change with a very long dependency list is not, hence the byte bound; the
+/// occasional clear is amortised over many lookups.
 const KNOWN_CACHE_MAX: usize = 1 << 16;
+const KNOWN_CACHE_MAX_BYTES: usize = 64 << 20;
+
+/// The known cache: entries plus the (approximate) bytes of hashes they hold.
+#[derive(Default)]
+struct KnownCache {
+    map: HashMap<Hash, (Vec<Hash>, Vec<Hash>)>,
+    bytes: usize,
+}
+
+/// How many times `load` re-opens a file that was replaced while it was being
+/// opened, before giving up on caching the handle.
+const LOAD_ATTEMPTS: usize = 4;
+
+/// Per-key invalidation counters, striped: a key maps to one of
+/// `GENERATION_STRIPES` counters, so a bump only (spuriously, and harmlessly)
+/// makes concurrent loads of 1/64th of the keys skip caching.
+struct Generations([AtomicU64; GENERATION_STRIPES]);
+const GENERATION_STRIPES: usize = 64;
+
+impl Generations {
+    fn new() -> Self {
+        Generations(std::array::from_fn(|_| AtomicU64::new(0)))
+    }
+    fn stripe(&self, change: &ChangeId) -> &AtomicU64 {
+        let n = (change.0).0;
+        &self.0[(n.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize % GENERATION_STRIPES]
+    }
+    fn get(&self, change: &ChangeId) -> u64 {
+        self.stripe(change).load(Ordering::SeqCst)
+    }
+    fn bump(&self, change: &ChangeId) {
+        self.stripe(change).fetch_add(1, Ordering::SeqCst);
+    }
+}
 
 /// One open change file in the cache. Each entry has its own lock, so
 /// reading the contents of one change (a zstd frame decompression) does not
 /// block readers of other changes.
-type CachedChange = Arc<Mutex<ChangeFile>>;
+pub(crate) type CachedChange = Arc<Mutex<ChangeFile>>;
 
 /// A file system change store.
 ///
@@ -28,7 +64,10 @@ pub struct FileSystem {
     /// changes) of a change, keyed by its hash. This is queried
     /// repeatedly during `apply` (once per deleted parent edge) and is
     /// immutable for a given hash, so entries never need invalidating.
-    known_cache: Arc<Mutex<HashMap<Hash, (Vec<Hash>, Vec<Hash>)>>>,
+    known_cache: Arc<Mutex<KnownCache>>,
+    /// Bumped (under the `change_cache` lock) whenever a change file is
+    /// replaced, so that a load that raced with the replacement can tell.
+    generations: Arc<Generations>,
     changes_dir: PathBuf,
 }
 
@@ -38,6 +77,7 @@ impl Clone for FileSystem {
             changes_dir: self.changes_dir.clone(),
             change_cache: self.change_cache.clone(),
             known_cache: self.known_cache.clone(),
+            generations: self.generations.clone(),
         }
     }
 }
@@ -107,7 +147,8 @@ impl FileSystem {
         FileSystem {
             changes_dir,
             change_cache: Arc::new(Mutex::new(lru_cache::LruCache::new(cap.max(1)))),
-            known_cache: Arc::new(Mutex::new(HashMap::new())),
+            known_cache: Arc::new(Mutex::new(KnownCache::default())),
+            generations: Arc::new(Generations::new()),
         }
     }
 
@@ -119,29 +160,68 @@ impl FileSystem {
     /// The open change file of `change`, opening it on a cache miss. The
     /// cache lock is not held while the file is opened (that reads and
     /// deserializes its whole hashed section).
-    fn load<F: Fn(ChangeId) -> Option<Hash>>(
+    pub(crate) fn load<F: Fn(ChangeId) -> Option<Hash>>(
         &self,
         hash: F,
         change: ChangeId,
     ) -> Result<CachedChange, crate::change::ChangeError> {
-        if let Some(p) = self.change_cache.lock().get_mut(&change) {
-            return Ok(p.clone());
+        self.load_with(hash, change, || ())
+    }
+
+    /// [`Self::load`], calling `between_open_and_insert` once the file has been
+    /// opened and before the handle is offered to the cache. Tests use it to
+    /// interleave a concurrent replacement at the exact point of the race.
+    pub(crate) fn load_with<F: Fn(ChangeId) -> Option<Hash>>(
+        &self,
+        hash: F,
+        change: ChangeId,
+        between_open_and_insert: impl FnOnce(),
+    ) -> Result<CachedChange, crate::change::ChangeError> {
+        let mut between_open_and_insert = Some(between_open_and_insert);
+        for attempt in 1..=LOAD_ATTEMPTS {
+            if let Some(p) = self.change_cache.lock().get_mut(&change) {
+                return Ok(p.clone());
+            }
+            // Read the generation *before* opening: an invalidation after this
+            // point may have replaced the file under our feet.
+            let generation = self.generations.get(&change);
+            let h = hash(change).unwrap();
+            let path = self.filename(&h);
+            debug!("changefile: {:?}", path);
+            let p = Arc::new(Mutex::new(crate::change::ChangeFile::open(
+                h,
+                path.to_str().unwrap(),
+            )?));
+            debug!("patch done");
+            if let Some(f) = between_open_and_insert.take() {
+                f()
+            }
+            let mut cache = self.change_cache.lock();
+            // Another thread may have opened it meanwhile: keep theirs.
+            if let Some(q) = cache.get_mut(&change) {
+                return Ok(q.clone());
+            }
+            // `invalidate` bumps the generation under this same lock, so
+            // checking it here is atomic with inserting. If it moved, our
+            // handle may be of the file that was just replaced: never cache it.
+            if self.generations.get(&change) == generation {
+                cache.insert(change, p.clone());
+                return Ok(p);
+            }
+            if attempt == LOAD_ATTEMPTS {
+                // Still racing with writers: hand out the handle uncached.
+                return Ok(p);
+            }
         }
-        let h = hash(change).unwrap();
-        let path = self.filename(&h);
-        debug!("changefile: {:?}", path);
-        let p = Arc::new(Mutex::new(crate::change::ChangeFile::open(
-            h,
-            path.to_str().unwrap(),
-        )?));
-        debug!("patch done");
+        unreachable!()
+    }
+
+    /// Drop the cached handle of `change` (its file was just replaced) and
+    /// make loads that started before this call discard what they opened.
+    fn invalidate(&self, change: &ChangeId) {
         let mut cache = self.change_cache.lock();
-        // Another thread may have opened it meanwhile: keep theirs.
-        if let Some(q) = cache.get_mut(&change) {
-            return Ok(q.clone());
-        }
-        cache.insert(change, p.clone());
-        Ok(p)
+        cache.remove(change);
+        self.generations.bump(change);
     }
 
     pub fn save_from_buf(
@@ -169,7 +249,7 @@ impl FileSystem {
         std::fs::create_dir_all(file_name.parent().unwrap())?;
         f.persist(file_name)?;
         if let Some(ref change_id) = change_id {
-            self.change_cache.lock().remove(change_id);
+            self.invalidate(change_id);
         }
         Ok(())
     }
@@ -192,7 +272,7 @@ impl ChangeStore for FileSystem {
 
     fn knows(&self, hash0: &Hash, hash1: &Hash) -> Result<bool, Self::Error> {
         let mut cache = self.known_cache.lock();
-        if let Some((deps, known)) = cache.get(hash0) {
+        if let Some((deps, known)) = cache.map.get(hash0) {
             return Ok(known.contains(hash1) || deps.contains(hash1));
         }
         // Not cached: open the change and remember only its "known"
@@ -205,10 +285,16 @@ impl ChangeStore for FileSystem {
         let deps = hashed.dependencies.clone();
         let known = hashed.extra_known.clone();
         let result = known.contains(hash1) || deps.contains(hash1);
-        if cache.len() >= KNOWN_CACHE_MAX {
-            cache.clear();
+        let bytes = (deps.len() + known.len()) * std::mem::size_of::<Hash>();
+        if cache.map.len() >= KNOWN_CACHE_MAX || cache.bytes + bytes > KNOWN_CACHE_MAX_BYTES {
+            cache.map.clear();
+            cache.bytes = 0;
         }
-        cache.insert(*hash0, (deps, known));
+        // An entry that alone exceeds the bound is not worth keeping.
+        if bytes <= KNOWN_CACHE_MAX_BYTES {
+            cache.bytes += bytes;
+            cache.map.insert(*hash0, (deps, known));
+        }
         Ok(result)
     }
 

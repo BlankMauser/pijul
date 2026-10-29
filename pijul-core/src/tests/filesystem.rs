@@ -343,3 +343,84 @@ fn overwrite_dead_symlink() -> Result<(), anyhow::Error> {
     txn.commit().unwrap();
     Ok(())
 }
+
+/// A change `h` recorded for a file with contents, as stored on disk (`full`),
+/// and the same file cut right before its contents section (`metadata_only`).
+fn full_and_metadata_only() -> Result<(Hash, Vec<u8>, Vec<u8>), anyhow::Error> {
+    let r = tempfile::tempdir()?;
+    let repo = working_copy::filesystem::FileSystem::from_root(r.path());
+    let c = tempfile::tempdir()?;
+    let changes = changestore::filesystem::FileSystem::from_root(c.path(), MAX_FILES);
+    let p = tempfile::tempdir()?;
+    let env = pristine::sanakirja::Pristine::new(p.path().join("pristine"))?;
+    let txn = env.arc_txn_begin().unwrap();
+    let channel = txn
+        .write()
+        .open_or_create_channel(&SmallString::from_str("main"))
+        .unwrap();
+    std::fs::write(r.path().join("file"), b"some contents\n")?;
+    txn.write().add_file("file", 0)?;
+    let h = record_all(&repo, &changes, &txn, &channel, "")?;
+    let full = std::fs::read(changes.filename(&h))?;
+    let offsets: crate::change::Offsets =
+        bincode::deserialize(&full[..crate::change::Change::OFFSETS_SIZE as usize])?;
+    let metadata_only = full[..offsets.contents_off as usize].to_vec();
+    assert!(metadata_only.len() < full.len());
+    Ok((h, full, metadata_only))
+}
+
+/// A reader that opened the old, metadata-only file of a change must not
+/// cache that handle once a writer has replaced the file and invalidated the
+/// entry: later reads of the contents would keep failing.
+#[test]
+fn replacement_during_load_is_not_cached() -> Result<(), anyhow::Error> {
+    env_logger::try_init().unwrap_or(());
+    let (h, full, metadata_only) = full_and_metadata_only()?;
+    let dir = tempfile::tempdir()?;
+    let store = changestore::filesystem::FileSystem::from_root(dir.path(), MAX_FILES);
+    let id = ChangeId(L64(7));
+    store.save_from_buf_unchecked(&metadata_only, &h, Some(id))?;
+    assert!(!store.has_contents(h, Some(id)));
+
+    // Reader opens the metadata-only file; the writer installs the complete
+    // one and invalidates; only then does the reader get to insert.
+    let old = store.load_with(
+        |_| Some(h),
+        id,
+        || store.save_from_buf_unchecked(&full, &h, Some(id)).unwrap(),
+    )?;
+    // The reader notices the replacement and re-opens the current file...
+    assert!(old.lock().has_contents());
+    // ...and nobody is handed the stale handle from the cache either.
+    assert!(store.has_contents(h, Some(id)));
+    let again = store.load(|_| Some(h), id)?;
+    assert!(again.lock().has_contents());
+    Ok(())
+}
+
+/// The same race with real threads: whatever the interleaving, once the writer
+/// has returned, readers see the complete file.
+#[test]
+fn concurrent_replacement_converges() -> Result<(), anyhow::Error> {
+    let (h, full, metadata_only) = full_and_metadata_only()?;
+    for round in 0..50u64 {
+        let dir = tempfile::tempdir()?;
+        let store = changestore::filesystem::FileSystem::from_root(dir.path(), MAX_FILES);
+        let id = ChangeId(L64(round + 1));
+        store.save_from_buf_unchecked(&metadata_only, &h, Some(id))?;
+        std::thread::scope(|s| {
+            for _ in 0..3 {
+                let store = store.clone();
+                s.spawn(move || {
+                    for _ in 0..20 {
+                        let _ = store.load(|_| Some(h), id);
+                    }
+                });
+            }
+            store.save_from_buf_unchecked(&full, &h, Some(id)).unwrap();
+        });
+        assert!(store.has_contents(h, Some(id)), "round {round}");
+        assert!(store.load(|_| Some(h), id)?.lock().has_contents());
+    }
+    Ok(())
+}
