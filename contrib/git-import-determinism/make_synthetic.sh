@@ -62,5 +62,11 @@ sed -i 's/a line 35$/a line 35 late/' src/a.txt; c -am "late: edit a"
 git checkout -q main
 m late -m "merge late"
 lines z 1 3 > z.txt; git add z.txt; c -m "final"
+c --allow-empty -m "settle before mixed additions"
+# The record walk visits z before a. A parallel builder that eagerly allocates
+# new files but defers existing-file edits changes the shared contents offsets.
+lines changed-z 1 3 > z.txt
+mkdir a-added; lines added 1 3 > a-added/file.txt
+git add -A; c -m "existing edit before mixed file and directory additions"
 git branch -D feature late other -q
 git log --oneline --graph | head -60

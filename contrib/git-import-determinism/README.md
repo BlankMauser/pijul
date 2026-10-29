@@ -37,6 +37,27 @@ edited / directory / binary renames, deletions, binary add+modify, an exec-bit
 change, a symlink, an empty commit, and a second root merged with
 `--allow-unrelated-histories`.
 
+## Import fast-path invariants
+
+- Git-unchanged does not mean Pijul-clean. A previous record can leave zombie
+  lines that the next identical diff resurrects. Skip only paths whose last
+  diff emitted no hunks; content hunks invalidate that path, and namespace
+  hunks invalidate the whole channel's certificates. Merges/resumes full-diff
+  until certificates are re-established. Names/metadata are always checked.
+- Parallel `Builder::record` is deterministic across worker counts, but its
+  new-file allocation happens before existing-file diffs. This is **not** the
+  layout of `record_single_thread` for mixed additions/edits. The importer
+  retains the serial path for unknown namespaces, merges and non-modification
+  Git deltas, and checks every tracked inode's channel membership before using
+  parallel record. The synthetic corpus includes an existing-file edit visited
+  before a new file/directory, specifically to catch changed contents offsets.
+- A bounded producer owns its own Git repository and prepares owned tree/delta
+  snapshots in the importer's priority order. The real importer verifies each
+  OID before consuming it. Record workers share a separate mutex-protected Git
+  object reader; no non-Sync git2 handle is shared unsafely. No blobs are read
+  merely to populate a snapshot. Early importer errors disconnect and join the
+  producer, including when its result queue is full.
+
 Self-check: the harness was shown to catch a deliberate change (one commit's
 timestamp shifted by 1 s): it reported the commit, its two hashes, and the 13
 commits whose Merkle state changed downstream.

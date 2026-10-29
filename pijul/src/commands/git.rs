@@ -10,6 +10,9 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+#[path = "git_prefetch.rs"]
+mod prefetch;
+
 #[derive(Parser, Debug)]
 pub struct Git {
     /// Process this path instead of the current directory, creating a Pijul repository if necessary.
@@ -32,6 +35,7 @@ struct OpenRepo {
     n: usize,
     check: usize,
     current_commit: Option<git2::Oid>,
+    git_objects: std::sync::Arc<std::sync::Mutex<git2::Repository>>,
     /// Per imported commit whose channel is still alive: the paths whose
     /// contents in that channel may not be settled, i.e. a full diff against
     /// the commit's own blob could still produce hunks (see `Skip`).
@@ -107,6 +111,9 @@ impl Git {
             n: 0,
             check: self.check,
             current_commit: None,
+            git_objects: std::sync::Arc::new(std::sync::Mutex::new(git2::Repository::open(
+                git.path(),
+            )?)),
             unsettled: std::collections::HashMap::new(),
         };
         import(&git, &mut env_git, &mut repo, &dag)?;
@@ -238,7 +245,7 @@ impl Dag {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Todo {
     todo: Vec<git2::Oid>,
     todo_set: BTreeSet<git2::Oid>,
@@ -281,6 +288,35 @@ impl Todo {
     fn all_processed(&self, parents: &[git2::Oid]) -> bool {
         parents.iter().all(|x| self.refs.contains_key(x))
     }
+}
+
+/// Simulate the same priority walk without touching the pristine. The producer
+/// may read ahead, but the real importer checks every received OID in order.
+fn import_order(dag: &Dag, mut todo: Todo) -> Vec<git2::Oid> {
+    let mut order = Vec::new();
+    while !todo.is_empty() {
+        let mut pending = std::mem::take(&mut todo.todo);
+        let mut draining = pending.drain(..);
+        while let Some(oid) = draining.next() {
+            if let Some(parents) = dag.parents.get(&oid) {
+                if !todo.all_processed(parents) {
+                    todo.insert_next(oid);
+                    continue;
+                }
+                for p in parents {
+                    *todo.refs.get_mut(p).unwrap() -= 1;
+                }
+            }
+            order.push(oid);
+            dag.insert_children_in_todo(&oid, &mut todo);
+            for oid in draining.by_ref() {
+                todo.insert_next(oid);
+            }
+        }
+        drop(draining);
+        todo.swap_next(pending);
+    }
+    order
 }
 
 /// Import the entire Git DAG into Pijul.
@@ -328,6 +364,7 @@ fn import(
     }
     std::mem::drop(txn);
     todo.swap_next(Vec::new());
+    let prefetch = prefetch::Prefetch::start(git.path(), import_order(dag, todo.clone()));
 
     while !todo.is_empty() {
         debug!("TODO: {:?}", todo);
@@ -361,9 +398,11 @@ fn import(
                     channel
                 };
 
+                let prepared = prefetch.next(oid)?;
                 let mut stats = Stats::new(oid);
                 import_commit_parents(repo, dag, &txn, &channel, &oid, &mut ws, &mut stats)?;
-                let state = import_commit(git, repo, dag, &txn, &channel, &oid, &mut stats)?;
+                let state =
+                    import_commit(git, repo, dag, &txn, &channel, &oid, &prepared, &mut stats)?;
                 save_state(env_git, &oid, state)?;
                 dag.collect_dead_parents(&oid, &mut todo, &txn)?;
                 if let Some(parents) = dag.parents.get(&oid) {
@@ -542,7 +581,7 @@ fn git_reset<'a, T: TxnTExt + MutTxnTExt>(
     channel: &ChannelRef<T>,
 
     child: &git2::Oid,
-
+    prepared: &prefetch::Prepared,
     stats: &mut Stats,
 ) -> Result<
     (
@@ -566,31 +605,19 @@ fn git_reset<'a, T: TxnTExt + MutTxnTExt>(
     let mut pref = HashSet::new();
     // Every path (old and new side) of every delta against the parents.
     let mut touched = HashSet::new();
-    let single_parent;
+    let single_parent = prepared.parents.len() == 1;
     {
-        let commit = object.as_commit().unwrap();
-        single_parent = commit.parent_count() == 1;
-        let new_tree = commit.tree().unwrap();
-
         debug!("inspecting commit");
-        let git_diff_time = std::time::Instant::now();
-        let mut has_parents = false;
-        for parent in commit.parents() {
-            has_parents = true;
-            let old_tree = parent.tree().unwrap();
-            let mut diff = git
-                .diff_tree_to_tree(Some(&old_tree), Some(&new_tree), None)
-                .unwrap();
-            diff.find_similar(None).unwrap();
+        for deltas in &prepared.parents {
             let mut moves = Vec::new();
             let mut txn = txn.write();
-            for delta in diff.deltas() {
-                let old_path = delta.old_file().path().unwrap();
-                let new_path = delta.new_file().path().unwrap();
+            for delta in deltas {
+                let old_path = &delta.old;
+                let new_path = &delta.new;
                 touched.insert(old_path.to_string_lossy().into_owned());
                 touched.insert(new_path.to_string_lossy().into_owned());
-                let is_dir = delta.new_file().mode() == git2::FileMode::Tree;
-                match delta.status() {
+                let is_dir = delta.mode == git2::FileMode::Tree;
+                match delta.status {
                     git2::Delta::Renamed => {
                         info!(
                             "mv {:?} {:?}",
@@ -637,7 +664,7 @@ fn git_reset<'a, T: TxnTExt + MutTxnTExt>(
                         prefixes.insert(old_path, is_dir);
                     }
                     _ => {
-                        if delta.new_file().mode() != git2::FileMode::Link {
+                        if delta.mode != git2::FileMode::Link {
                             debug!("delta old = {:?} new = {:?}", old_path, new_path);
                             let old_path_ = old_path.to_path_buf();
                             let new_path_ = new_path.to_path_buf();
@@ -656,21 +683,10 @@ fn git_reset<'a, T: TxnTExt + MutTxnTExt>(
                 }
             }
         }
-        if !has_parents {
-            use git2::{TreeWalkMode, TreeWalkResult};
-            new_tree
-                .walk(TreeWalkMode::PreOrder, |x, t| {
-                    debug!("t = {:?} {:?}", x, t.name());
-                    if let Ok(n) = t.name() {
-                        let mut m = Path::new(x).to_path_buf();
-                        m.push(n);
-                        prefixes.insert(m, t.kind() == Some(git2::ObjectType::Tree));
-                    }
-                    TreeWalkResult::Ok
-                })
-                .unwrap();
+        if prepared.parents.is_empty() {
+            prefixes.extend(prepared.tree_order.iter().cloned());
         }
-        stats.git_diff_time = git_diff_time.elapsed();
+        stats.git_diff_time = prepared.elapsed;
         debug!("record prefixes {:?}", prefixes);
     }
     // Only a single-parent commit can skip diffs (see `Skip`).
@@ -679,9 +695,9 @@ fn git_reset<'a, T: TxnTExt + MutTxnTExt>(
 }
 
 #[derive(Clone)]
-struct Commit<'a> {
-    r: &'a git2::Repository,
-    c: git2::Commit<'a>,
+struct Commit {
+    r: std::sync::Arc<std::sync::Mutex<git2::Repository>>,
+    files: std::sync::Arc<std::collections::HashMap<String, prefetch::Entry>>,
     pref: HashSet<String>,
     skip: Option<Skip>,
     /// Paths `record` asked `known_clean` about and was told to diff.
@@ -729,17 +745,25 @@ fn next_unsettled(
     Some(unsettled)
 }
 
-impl<'a> pijul_core::working_copy::WorkingCopyRead for Commit<'a> {
+impl Commit {
+    fn entry(&self, file: &str) -> Result<&prefetch::Entry, git2::Error> {
+        self.files
+            .get(file)
+            .ok_or_else(|| git2::Error::from_str("path absent from Git tree"))
+    }
+}
+
+impl pijul_core::working_copy::WorkingCopyRead for Commit {
     type Error = git2::Error;
 
     fn file_metadata(&self, file: &str) -> Result<InodeMetadata, Self::Error> {
         debug!("metadata {:?}", file);
-        let entry = self.c.tree()?.get_path(Path::new(file))?;
-        let is_dir = entry.kind() == Some(git2::ObjectType::Tree);
+        let entry = self.entry(file)?;
+        let is_dir = entry.is_dir;
         if is_dir {
             Ok(InodeMetadata::new(0o100, true))
         } else {
-            let permissions = entry.filemode();
+            let permissions = entry.mode;
             debug!(
                 "permissions = {:o} {:o} {:?}",
                 permissions,
@@ -752,11 +776,11 @@ impl<'a> pijul_core::working_copy::WorkingCopyRead for Commit<'a> {
 
     fn read_file(&self, file: &str, buffer: &mut Vec<u8>) -> Result<(), Self::Error> {
         debug!("read file {:?}", file);
-        let entry = self.c.tree()?.get_path(Path::new(file))?;
-        if let Ok(b) = entry.to_object(self.r)?.peel_to_blob() {
+        let entry = self.entry(file)?;
+        let repo = self.r.lock().unwrap();
+        if let Ok(b) = repo.find_object(entry.oid, None)?.peel_to_blob() {
             buffer.extend(b.content());
         }
-        debug!("entry {:?}", entry.kind());
         Ok(())
     }
 
@@ -773,8 +797,8 @@ impl<'a> pijul_core::working_copy::WorkingCopyRead for Commit<'a> {
 
     fn file_size(&self, file: &str) -> Result<u64, Self::Error> {
         // The blob's size from its header, without reading the blob.
-        let entry = self.c.tree()?.get_path(Path::new(file))?;
-        let (size, _) = self.r.odb()?.read_header(entry.id())?;
+        let entry = self.entry(file)?;
+        let (size, _) = self.r.lock().unwrap().odb()?.read_header(entry.oid)?;
         Ok(size as u64)
     }
 
@@ -789,6 +813,7 @@ impl<'a> pijul_core::working_copy::WorkingCopyRead for Commit<'a> {
 
 /// Reset to the Git commit specified as `child`, and record the
 /// corresponding change in Pijul.
+#[allow(clippy::too_many_arguments)]
 fn import_commit<T: TxnTExt + MutTxnTExt + GraphIter + Send + Sync + 'static>(
     git: &git2::Repository,
     repo: &mut OpenRepo,
@@ -796,9 +821,11 @@ fn import_commit<T: TxnTExt + MutTxnTExt + GraphIter + Send + Sync + 'static>(
     txn: &ArcTxn<T>,
     channel: &ChannelRef<T>,
     child: &git2::Oid,
+    prepared: &prefetch::Prepared,
     stats: &mut Stats,
 ) -> Result<pijul_core::Merkle, anyhow::Error> {
-    let (object, prefixes, prefstr, touched) = git_reset(git, repo, &txn, &channel, child, stats)?;
+    let (object, prefixes, prefstr, touched) =
+        git_reset(git, repo, &txn, &channel, child, prepared, stats)?;
     let first_parent = dag.parents.get(child).and_then(|p| p.first());
     let parent_unsettled = first_parent.and_then(|p| repo.unsettled.get(p)).cloned();
     let skip = match (touched, &parent_unsettled) {
@@ -808,6 +835,14 @@ fn import_commit<T: TxnTExt + MutTxnTExt + GraphIter + Send + Sync + 'static>(
         }),
         _ => None,
     };
+    // The parallel builder allocates additions during its walk, before it
+    // emits existing-file diffs. That layout differs from record_single_thread
+    // for mixed additions/edits. Only use it for namespace-stable commits.
+    let parallel = skip.is_some()
+        && prepared.parents.len() == 1
+        && prepared.parents[0]
+            .iter()
+            .all(|d| d.status == git2::Delta::Modified);
     let diffed = std::sync::Arc::new(std::sync::Mutex::new(HashSet::new()));
     debug!("prefixes = {:?}", prefixes);
     let mut txn_ = txn.write();
@@ -877,8 +912,8 @@ fn import_commit<T: TxnTExt + MutTxnTExt + GraphIter + Send + Sync + 'static>(
         &channel,
         // &repo.repo.working_copy
         &Commit {
-            r: git,
-            c: git.find_commit(*child)?,
+            r: repo.git_objects.clone(),
+            files: prepared.files.clone(),
             pref: prefstr,
             skip,
             diffed: diffed.clone(),
@@ -896,6 +931,7 @@ fn import_commit<T: TxnTExt + MutTxnTExt + GraphIter + Send + Sync + 'static>(
             timestamp: jiff::Timestamp::from_second(signature.when().seconds())?,
         },
         stats,
+        parallel,
     );
     {
         let mut txn = txn.write();
@@ -947,10 +983,11 @@ fn import_commit<T: TxnTExt + MutTxnTExt + GraphIter + Send + Sync + 'static>(
     Ok(state)
 }
 
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn record_apply<
-    T: TxnT + TxnTExt + MutTxnTExt,
-    C: pijul_core::changestore::ChangeStore + Clone,
-    W: pijul_core::working_copy::WorkingCopyRead + Clone,
+    T: TxnT + TxnTExt + MutTxnTExt + Send + Sync + 'static,
+    C: pijul_core::changestore::ChangeStore + Clone + Send + 'static,
+    W: pijul_core::working_copy::WorkingCopyRead + Clone + Send + Sync + 'static,
 >(
     txn: &ArcTxn<T>,
     channel: &ChannelRef<T>,
@@ -959,6 +996,7 @@ fn record_apply<
     prefixes: &BTreeMap<PathBuf, bool>,
     header: pijul_core::change::ChangeHeader,
     stats: &mut Stats,
+    parallel: bool,
 ) -> Result<
     (
         usize,
@@ -974,6 +1012,42 @@ where
     debug!("record_apply {:?}", prefixes);
     let record_time = std::time::Instant::now();
     let mut state = pijul_core::RecordBuilder::new();
+    let n_workers = std::thread::available_parallelism().map_or(1, usize::from);
+    // Mirror record's get_inodes check, including channel membership. Git's
+    // deltas alone cannot prove that every tracked inode is an existing file.
+    let parallel = parallel && {
+        let txn = txn.read();
+        let channel = channel.read();
+        let start = OwnedPathId {
+            parent_inode: Inode::ROOT,
+            basename: pijul_core::small_string::SmallString::new(),
+        };
+        let mut existing = true;
+        for entry in txn.iter_tree(&start, None)? {
+            let (path, inode) = entry?;
+            if path.basename.is_empty() {
+                continue;
+            }
+            let Some(vertex) = txn.get_inodes(inode, None)? else {
+                existing = false;
+                break;
+            };
+            let edge = iter_adjacent(
+                &*txn,
+                txn.graph(&*channel),
+                vertex.inode_vertex(),
+                EdgeFlags::PARENT,
+                EdgeFlags::all(),
+            )?
+            .next()
+            .transpose()?;
+            if !edge.is_some_and(|e| e.flag().is_parent()) {
+                existing = false;
+                break;
+            }
+        }
+        existing
+    };
     let mut last = None;
     for (p, _) in prefixes.iter() {
         if let Some(last) = last {
@@ -981,33 +1055,65 @@ where
                 continue;
             }
         }
-        state
-            .record_single_thread(
-                txn.clone(),
-                pijul_core::Algorithm::default(),
-                false,
-                &pijul_core::DEFAULT_SEPARATOR,
-                channel.clone(),
-                working_copy,
-                changes,
-                p.to_str().unwrap(),
-            )
-            .unwrap();
+        if parallel {
+            state
+                .record(
+                    txn.clone(),
+                    pijul_core::Algorithm::default(),
+                    false,
+                    &pijul_core::DEFAULT_SEPARATOR,
+                    channel.clone(),
+                    working_copy,
+                    changes,
+                    p.to_str().unwrap(),
+                    n_workers,
+                )
+                .unwrap();
+        } else {
+            state
+                .record_single_thread(
+                    txn.clone(),
+                    pijul_core::Algorithm::default(),
+                    false,
+                    &pijul_core::DEFAULT_SEPARATOR,
+                    channel.clone(),
+                    working_copy,
+                    changes,
+                    p.to_str().unwrap(),
+                )
+                .unwrap();
+        }
         last = Some(p);
     }
     if prefixes.is_empty() {
-        state
-            .record_single_thread(
-                txn.clone(),
-                pijul_core::Algorithm::default(),
-                false,
-                &pijul_core::DEFAULT_SEPARATOR,
-                channel.clone(),
-                working_copy,
-                changes,
-                "",
-            )
-            .unwrap();
+        if parallel {
+            state
+                .record(
+                    txn.clone(),
+                    pijul_core::Algorithm::default(),
+                    false,
+                    &pijul_core::DEFAULT_SEPARATOR,
+                    channel.clone(),
+                    working_copy,
+                    changes,
+                    "",
+                    n_workers,
+                )
+                .unwrap();
+        } else {
+            state
+                .record_single_thread(
+                    txn.clone(),
+                    pijul_core::Algorithm::default(),
+                    false,
+                    &pijul_core::DEFAULT_SEPARATOR,
+                    channel.clone(),
+                    working_copy,
+                    changes,
+                    "",
+                )
+                .unwrap();
+        }
     }
     let rec = state.finish();
     let mut txn = txn.write();
@@ -1190,6 +1296,28 @@ mod skip_tests {
 
     fn paths(p: &[&str]) -> HashSet<String> {
         p.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn prefetch_order_keeps_branch_priority_and_waits_for_merge_parents() {
+        let oid = |n| git2::Oid::from_bytes(&[n; 20]).unwrap();
+        let (a, b, c, d, e) = (oid(1), oid(2), oid(3), oid(4), oid(5));
+        let dag = Dag {
+            root: vec![(a, None)],
+            children: BTreeMap::from([(a, vec![b, c]), (b, vec![e]), (c, vec![d]), (e, vec![d])]),
+            parents: BTreeMap::from([(b, vec![a]), (c, vec![a]), (e, vec![b]), (d, vec![e, c])]),
+        };
+        let mut todo = Todo::new();
+        todo.insert_next(a);
+        todo.swap_next(Vec::new());
+        assert_eq!(import_order(&dag, todo), vec![a, b, e, c, d]);
+        // Resume: a's imported channel exists but has no in-memory skip state.
+        let mut todo = Todo::new();
+        todo.refs.insert(a, 2);
+        todo.insert_next(b);
+        todo.insert_next(c);
+        todo.swap_next(Vec::new());
+        assert_eq!(import_order(&dag, todo), vec![b, e, c, d]);
     }
 
     #[test]

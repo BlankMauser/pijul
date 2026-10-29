@@ -1558,10 +1558,10 @@ impl Recorded {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
         let ambiguous = cur_mtime == 0 || cur_mtime >= walk_start_ns;
-        // The working copy may know that this file's contents equal the ones
-        // the pristine was last recorded from (e.g. `pijul git`, for a file a
-        // single-parent commit does not touch): then neither its size nor its
-        // contents need reading.
+        // The working copy may certify that diffing this file against the
+        // current pristine emits no content hunks (see WorkingCopyRead's
+        // known_clean contract). Equal last-recorded bytes alone are not enough:
+        // an unchanged file can still need zombie-resurrection hunks.
         let known_clean = !self.force_rediff && working_copy.known_clean(&item.full_path);
         let cur_size = if known_clean {
             u64::MAX
