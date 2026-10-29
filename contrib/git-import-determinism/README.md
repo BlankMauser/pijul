@@ -41,8 +41,10 @@ change, a symlink, an empty commit, and a second root merged with
 
 - Git-unchanged does not mean Pijul-clean. A previous record can leave zombie
   lines that the next identical diff resurrects. Skip only paths whose last
-  diff emitted no hunks; content hunks invalidate that path, and namespace
-  hunks invalidate the whole channel's certificates. Merges/resumes full-diff
+  diff emitted no hunks; content hunks and fresh file additions invalidate that
+  path. Other namespace hunks invalidate the whole channel's certificates:
+  unlike a fresh addition, they may mutate existing descendants/aliases.
+  Merges/resumes full-diff
   until certificates are re-established. Names/metadata are always checked.
 - Parallel `Builder::record` is deterministic across worker counts, but its
   new-file allocation happens before existing-file diffs. This is **not** the

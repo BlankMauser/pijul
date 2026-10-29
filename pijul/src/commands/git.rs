@@ -1131,9 +1131,10 @@ where
         .map(|rec| rec.globalize(&*txn).unwrap())
         .collect();
     let n = actions.len();
-    // Content hunks affect their file's graph. Namespace changes are harder:
-    // path aliases and directory moves can affect descendants whose paths are
-    // not named by the hunk. Discard certificates rather than guessing.
+    // Content hunks affect their file's graph. A FileAdd only introduces fresh
+    // vertices, so it cannot mutate another existing file's content graph.
+    // Other namespace changes are harder: aliases, deletions and moves can
+    // affect descendants not named by the hunk. Discard their certificates.
     let mut hunk_paths = Some(HashSet::new());
     for a in actions.iter() {
         match a {
@@ -1141,7 +1142,8 @@ where
             | pijul_core::change::Hunk::Replacement { .. }
             | pijul_core::change::Hunk::SolveOrderConflict { .. }
             | pijul_core::change::Hunk::UnsolveOrderConflict { .. }
-            | pijul_core::change::Hunk::ResurrectZombies { .. }) => {
+            | pijul_core::change::Hunk::ResurrectZombies { .. }
+            | pijul_core::change::Hunk::FileAdd { .. }) => {
                 if let Some(ref mut h) = hunk_paths {
                     h.insert(a.path().to_string());
                 }
