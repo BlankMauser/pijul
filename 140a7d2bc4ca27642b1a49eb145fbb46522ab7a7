@@ -1,0 +1,22 @@
+pijul-core/src/change.rs
+  h_03360edcd9e88f 1806-1810
+pijul-core/src/changestore/filesystem.rs
+  h_03360edcd9e88f 7
+pijul-core/src/working_copy/mod.rs
+  h_03360edcd9e88f 17-22,26-28
+pijul-repository/src/lib.rs
+  h_03360edcd9e88f 70-73
+pijul/src/commands/git.rs
+  h_03360edcd9e88f 37,676,711-731,765,801,924-930,932-933,1028-1030,1034-1038,1043-1046,1186-1232
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "140a7d2bc4ca27642b1a49eb145fbb46522ab7a7",
+  "prompts": {},
+  "humans": {
+    "h_03360edcd9e88f": {
+      "author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}

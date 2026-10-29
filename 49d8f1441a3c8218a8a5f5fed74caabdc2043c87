@@ -1,0 +1,16 @@
+contrib/git-import-determinism/README.md
+  h_03360edcd9e88f 40-42
+contrib/git-import-determinism/fast-import-validation.md
+  h_03360edcd9e88f 1-108
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "49d8f1441a3c8218a8a5f5fed74caabdc2043c87",
+  "prompts": {},
+  "humans": {
+    "h_03360edcd9e88f": {
+      "author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
