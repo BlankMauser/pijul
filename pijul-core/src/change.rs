@@ -1787,6 +1787,23 @@ impl Change {
     /// Deserialise a change from the file given as input `file`.
     #[cfg(feature = "zstd")]
     pub fn deserialize(file: &str, hash: Option<&Hash>) -> Result<Self, ChangeError> {
+        Self::deserialize_(file, hash, true)
+    }
+
+    /// Like [`Self::deserialize`] (the hashed section is still checked against
+    /// `hash`), but leaves `contents` empty instead of reading and
+    /// decompressing it. For callers that only need the hunks, such as
+    /// `apply`, which never reads a change's contents.
+    #[cfg(feature = "zstd")]
+    pub fn deserialize_without_contents(
+        file: &str,
+        hash: Option<&Hash>,
+    ) -> Result<Self, ChangeError> {
+        Self::deserialize_(file, hash, false)
+    }
+
+    #[cfg(feature = "zstd")]
+    fn deserialize_(file: &str, hash: Option<&Hash>, with_contents: bool) -> Result<Self, ChangeError> {
         use std::io::Read;
         let mut r = std::fs::File::open(file).map_err(|err| {
             if let Some(h) = hash {
@@ -1841,15 +1858,19 @@ impl Change {
         };
         debug!("unhashed = {:?}", unhashed);
 
-        buf.clear();
-        buf.resize((offsets.total - offsets.contents_off) as usize, 0);
-        let contents = if r.read_exact(&mut buf).is_ok() {
-            let mut s = zstd_seekable::Seekable::init_buf(&buf[..])?;
-            let mut contents = vec![0u8; offsets.contents_len as usize];
-            s.decompress(&mut contents[..], 0)?;
-            contents
-        } else {
+        let contents = if !with_contents {
             Vec::new()
+        } else {
+            buf.clear();
+            buf.resize((offsets.total - offsets.contents_off) as usize, 0);
+            if r.read_exact(&mut buf).is_ok() {
+                let mut s = zstd_seekable::Seekable::init_buf(&buf[..])?;
+                let mut contents = vec![0u8; offsets.contents_len as usize];
+                s.decompress(&mut contents[..], 0)?;
+                contents
+            } else {
+                Vec::new()
+            }
         };
         debug!("contents = {:?}", contents);
 

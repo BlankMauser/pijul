@@ -3,6 +3,7 @@ use crate::change::{Change, ChangeFile};
 use crate::pristine::{Base32, ChangeId, Hash, Merkle, Vertex};
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::path::{Path, PathBuf};
 
 /// When the known cache reaches this many entries it is cleared
@@ -11,24 +12,32 @@ use std::path::{Path, PathBuf};
 /// generous, and the occasional clear is amortised over many lookups.
 const KNOWN_CACHE_MAX: usize = 1 << 16;
 
+/// One open change file in the cache. Each entry has its own lock, so
+/// reading the contents of one change (a zstd frame decompression) does not
+/// block readers of other changes.
+type CachedChange = Arc<Mutex<ChangeFile>>;
+
 /// A file system change store.
+///
+/// Clones share the change cache and the known cache: worker threads of
+/// `output` and `record` get a clone each, and a cold cache per clone made
+/// them re-open (and re-deserialize) every change file they touched.
 pub struct FileSystem {
-    change_cache: Mutex<lru_cache::LruCache<ChangeId, ChangeFile>>,
+    change_cache: Arc<Mutex<lru_cache::LruCache<ChangeId, CachedChange>>>,
     /// Cache of the "known" information (dependencies and extra known
     /// changes) of a change, keyed by its hash. This is queried
     /// repeatedly during `apply` (once per deleted parent edge) and is
     /// immutable for a given hash, so entries never need invalidating.
-    known_cache: Mutex<HashMap<Hash, (Vec<Hash>, Vec<Hash>)>>,
+    known_cache: Arc<Mutex<HashMap<Hash, (Vec<Hash>, Vec<Hash>)>>>,
     changes_dir: PathBuf,
 }
 
 impl Clone for FileSystem {
     fn clone(&self) -> Self {
-        let len = self.change_cache.lock().capacity();
         FileSystem {
             changes_dir: self.changes_dir.clone(),
-            change_cache: Mutex::new(lru_cache::LruCache::new(len)),
-            known_cache: Mutex::new(HashMap::new()),
+            change_cache: self.change_cache.clone(),
+            known_cache: self.known_cache.clone(),
         }
     }
 }
@@ -97,29 +106,42 @@ impl FileSystem {
         std::fs::create_dir_all(&changes_dir).unwrap();
         FileSystem {
             changes_dir,
-            change_cache: Mutex::new(lru_cache::LruCache::new(cap)),
-            known_cache: Mutex::new(HashMap::new()),
+            change_cache: Arc::new(Mutex::new(lru_cache::LruCache::new(cap.max(1)))),
+            known_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    fn load<'a, F: Fn(ChangeId) -> Option<Hash>>(
-        &'a self,
+    /// Number of open change files the cache keeps (shared by all clones).
+    pub fn cache_capacity(&self) -> usize {
+        self.change_cache.lock().capacity()
+    }
+
+    /// The open change file of `change`, opening it on a cache miss. The
+    /// cache lock is not held while the file is opened (that reads and
+    /// deserializes its whole hashed section).
+    fn load<F: Fn(ChangeId) -> Option<Hash>>(
+        &self,
         hash: F,
         change: ChangeId,
-    ) -> Result<
-        parking_lot::MutexGuard<'a, lru_cache::LruCache<ChangeId, ChangeFile>>,
-        crate::change::ChangeError,
-    > {
-        let mut change_cache = self.change_cache.lock();
-        if !change_cache.contains_key(&change) {
-            let h = hash(change).unwrap();
-            let path = self.filename(&h);
-            debug!("changefile: {:?}", path);
-            let p = crate::change::ChangeFile::open(h, path.to_str().unwrap())?;
-            debug!("patch done");
-            change_cache.insert(change, p);
+    ) -> Result<CachedChange, crate::change::ChangeError> {
+        if let Some(p) = self.change_cache.lock().get_mut(&change) {
+            return Ok(p.clone());
         }
-        Ok(change_cache)
+        let h = hash(change).unwrap();
+        let path = self.filename(&h);
+        debug!("changefile: {:?}", path);
+        let p = Arc::new(Mutex::new(crate::change::ChangeFile::open(
+            h,
+            path.to_str().unwrap(),
+        )?));
+        debug!("patch done");
+        let mut cache = self.change_cache.lock();
+        // Another thread may have opened it meanwhile: keep theirs.
+        if let Some(q) = cache.get_mut(&change) {
+            return Ok(q.clone());
+        }
+        cache.insert(change, p.clone());
+        Ok(p)
     }
 
     pub fn save_from_buf(
@@ -157,9 +179,9 @@ impl ChangeStore for FileSystem {
     type Error = Error;
     fn has_contents(&self, hash: Hash, change_id: Option<ChangeId>) -> bool {
         if let Some(ref change_id) = change_id
-            && let Some(l) = self.change_cache.lock().get_mut(change_id)
+            && let Some(l) = self.change_cache.lock().get_mut(change_id).cloned()
         {
-            return l.has_contents();
+            return l.lock().has_contents();
         }
         let path = self.filename(&hash);
         match crate::change::ChangeFile::open(hash, path.to_str().unwrap()) {
@@ -208,9 +230,8 @@ impl ChangeStore for FileSystem {
             return Ok(0);
         }
         assert_eq!(key.end - key.start, buf.len());
-        let mut cache = self.load(hash, key.change)?;
-        let p = cache.get_mut(&key.change).unwrap();
-        let n = p.read_contents(key.start.into(), buf)?;
+        let p = self.load(hash, key.change)?;
+        let n = p.lock().read_contents(key.start.into(), buf)?;
         debug!("get_contents {:?}", n);
         Ok(n)
     }
@@ -238,8 +259,8 @@ impl ChangeStore for FileSystem {
         change: ChangeId,
         pos: Position<Option<Hash>>,
     ) -> Result<Vec<Hash>, Self::Error> {
-        let mut cache = self.load(hash, change)?;
-        let p = cache.get_mut(&change).unwrap();
+        let p = self.load(hash, change)?;
+        let p = p.lock();
         let mut v = Vec::new();
         for c in p.hashed().changes.iter() {
             for c in c.iter() {
@@ -286,6 +307,12 @@ impl ChangeStore for FileSystem {
         let file_name = file_name.to_str().unwrap();
         debug!("file_name = {:?}", file_name);
         Ok(Change::deserialize(file_name, Some(h))?)
+    }
+    fn get_change_without_contents(&self, h: &Hash) -> Result<Change, Self::Error> {
+        let file_name = self.filename(h);
+        let file_name = file_name.to_str().unwrap();
+        debug!("file_name = {:?}", file_name);
+        Ok(Change::deserialize_without_contents(file_name, Some(h))?)
     }
 }
 

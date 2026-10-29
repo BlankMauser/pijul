@@ -47,11 +47,18 @@ impl Git {
     }
 
     pub fn run(self, config: &pijul_config::Config) -> Result<(), anyhow::Error> {
-        let repo = if let Ok(repo) = Repository::find_root(self.pijul_path.as_deref()) {
+        let mut repo = if let Ok(repo) = Repository::find_root(self.pijul_path.as_deref()) {
             repo
         } else {
             Repository::init(config, self.pijul_path.as_deref(), None, None)?
         };
+        // The conversion re-reads the same change files for every commit:
+        // size the (shared) change cache from the raised open files limit
+        // rather than the inherited soft limit / (2 * cores).
+        repo.changes = pijul_core::changestore::filesystem::FileSystem::from_changes(
+            repo.changes_dir.clone(),
+            pijul_repository::shared_cache_capacity(),
+        );
         let git_path = if let Some(git_path) = self.git_path.clone() {
             git_path
         } else {
@@ -404,7 +411,7 @@ fn make_apply_plan<T: TxnTExt>(
     let mut needs_output = false;
     if let Some(parents) = dag.parents.get(&oid) {
         let txn = txn.read();
-        for p in parents {
+        for (i, p) in parents.iter().enumerate() {
             // If one of the parents is not the repo's current commit,
             // then we're doing either a merge or a checkout of
             // another branch. If that is the case, we need to output
@@ -414,6 +421,12 @@ fn make_apply_plan<T: TxnTExt>(
                 if current_commit != *p {
                     needs_output = true
                 }
+            }
+            if i == 0 {
+                // `channel` was forked from the first parent's channel, so it
+                // already has every change of that log: walking it (O(history)
+                // per commit) would add nothing to the plan.
+                continue;
             }
             let p_name = format!("{}", p);
             let p_channel = txn.load_channel(p_name.parse()?)?.unwrap();
@@ -485,7 +498,9 @@ fn import_commit_parents<T: TxnTExt + MutTxnTExt + GraphIter + Send + Sync + 'st
             "",
             false,
             None,
-            std::thread::available_parallelism()?.get(),
+            // The sink writes nothing, so extra output workers would only
+            // spin waiting for work while the tree walk runs on this thread.
+            1,
             0,
         )?;
         let t = output_time.elapsed();
