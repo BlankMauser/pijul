@@ -1,0 +1,19 @@
+pijul-core/src/apply/descendants.rs
+  s_6ec2343be0447c::t_75aaafa0e59e6f 1-90
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b439cd2d2afb7b0a8e1793cffd274b4814ce51e5",
+  "prompts": {},
+  "sessions": {
+    "s_6ec2343be0447c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a17761-1156-7b23-99fd-7f94f6579a1b",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
