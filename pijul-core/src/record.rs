@@ -1552,15 +1552,26 @@ impl Recorded {
             .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        let cur_size = working_copy.file_size(&item.full_path).unwrap_or(u64::MAX);
-        let cached = txn.read().get_inode_stat(&item.inode).unwrap_or(None);
         let walk_start_ns = self
             .walk_start
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
         let ambiguous = cur_mtime == 0 || cur_mtime >= walk_start_ns;
-        let up_to_date = !self.force_rediff && !ambiguous && cached == Some((cur_mtime, cur_size));
+        // The working copy may know that this file's contents equal the ones
+        // the pristine was last recorded from (e.g. `pijul git`, for a file a
+        // single-parent commit does not touch): then neither its size nor its
+        // contents need reading.
+        let known_clean = !self.force_rediff && working_copy.known_clean(&item.full_path);
+        let cur_size = if known_clean {
+            u64::MAX
+        } else {
+            working_copy.file_size(&item.full_path).unwrap_or(u64::MAX)
+        };
+        let up_to_date = known_clean || {
+            let cached = txn.read().get_inode_stat(&item.inode).unwrap_or(None);
+            !self.force_rediff && !ambiguous && cached == Some((cur_mtime, cur_size))
+        };
 
         let diff = if new_meta.is_file() && !up_to_date {
             let mut ret = {

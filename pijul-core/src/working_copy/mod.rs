@@ -17,6 +17,13 @@ pub trait WorkingCopyRead {
     /// Size of `file` in bytes. Paired with [`Self::modified_time`] as a cheap
     /// "did this file change?" check by `record`. The default reads the whole
     /// file; on-disk backends should override it with a `stat`.
+    /// `true` when the caller knows that `file`'s contents are exactly the
+    /// ones the pristine was last recorded from, so `record` may skip reading
+    /// and diffing it (its name, metadata and parent are still checked).
+    /// Only return `true` when that is certain; the default never claims it.
+    fn known_clean(&self, _file: &str) -> bool {
+        false
+    }
     fn file_size(&self, file: &str) -> Result<u64, Self::Error> {
         let mut buffer = Vec::new();
         self.read_file(file, &mut buffer)?;
