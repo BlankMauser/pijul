@@ -1,0 +1,11 @@
+[package]
+name = "gitdb-dump"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone: not a member of the pijul workspace.
+[workspace]
+
+[dependencies]
+sanakirja = { version = "=2.0.0-beta.3", default-features = false, features = ["crc32", "mmap"] }
