@@ -7,10 +7,12 @@ The exported schema is a local-cache protocol, not a node/API format.
 """
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import tomllib
 import unittest
 
 
@@ -192,6 +194,46 @@ class Checkpoints(unittest.TestCase):
         _, second = self.convert(two, original_seed)
         self.assertEqual(first["commits"], second["commits"])
         self.assert_parity(first)
+
+
+    def log_hashes(self, repository):
+        result = subprocess.run([self.pijul, "log", "--hash-only"], cwd=repository, env=self.env,
+                                capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.split()
+
+    def test_checkpoint_over_the_limit_does_not_fail_the_import(self):
+        """A history whose recipes exceed the size limit stays importable: the
+        conversion is the normal one and no checkpoint is exported (or left
+        stale). The limit is lowered through a test-only environment hook."""
+        for n in range(3):
+            self.commit(f"f{n}", f"{n}\n")
+        plain = self.root / "plain"
+        self.cmd(self.pijul, "git", str(self.git), str(plain))
+        raw = self.root / "raw"
+        exported = raw.with_suffix(".json")
+        exported.write_text("stale checkpoint from an older run")
+        self.env["PIJUL_GIT_CHECKPOINT_MAX_BYTES"] = "64"
+        result = self.cmd(self.pijul, "git", str(self.git), str(raw),
+                          "--import-state-out", str(exported))
+        del self.env["PIJUL_GIT_CHECKPOINT_MAX_BYTES"]
+        self.assertFalse(exported.exists(), "an oversized or stale checkpoint was left")
+        self.assertIn("without a checkpoint", result.stderr)
+        self.assertIn("size limit", result.stderr)
+        self.assertEqual(self.log_hashes(raw), self.log_hashes(plain))
+        self.assertEqual(len(self.log_hashes(raw)), 3)
+        # With the real limit the same history exports as before.
+        self.convert(self.root / "normal")
+
+    def test_packaged_cli_includes_the_checkpoint_module(self):
+        manifest = tomllib.loads((Path(__file__).resolve().parents[1] / "Cargo.toml").read_text())
+        included = set(manifest["package"]["include"])
+        self.assertIn("src/commands/git_checkpoint.rs", included)
+        # Every module reached through #[path] must be packaged too.
+        source = Path(__file__).resolve().parents[1] / "src/commands"
+        for file in source.glob("*.rs"):
+            for target in re.findall(r'#\[path = "([^"]+)"\]', file.read_text()):
+                self.assertIn(f"src/commands/{target}", included, f"{file.name} -> {target}")
 
 
 if __name__ == "__main__":

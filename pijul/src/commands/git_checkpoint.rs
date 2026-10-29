@@ -11,6 +11,15 @@ use std::path::Path;
 
 const MAX_BYTES: u64 = 64 << 20;
 
+/// Largest checkpoint file read or written. `PIJUL_GIT_CHECKPOINT_MAX_BYTES`
+/// lowers it; it exists only so tests can reach the limit with a tiny history.
+fn max_bytes() -> u64 {
+    std::env::var("PIJUL_GIT_CHECKPOINT_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(MAX_BYTES, |limit| limit.min(MAX_BYTES))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Recipe {
@@ -40,7 +49,7 @@ impl Checkpoints {
 
     pub(super) fn read(path: &Path) -> Result<Self, anyhow::Error> {
         let meta = path.symlink_metadata()?;
-        if !meta.is_file() || meta.len() > MAX_BYTES {
+        if !meta.is_file() || meta.len() > max_bytes() {
             bail!("invalid or oversized Git checkpoint file")
         }
         let mut state: Self = serde_json::from_reader(std::fs::File::open(path)?)?;
@@ -163,10 +172,27 @@ impl Checkpoints {
     }
 
     /// Never expose a partial export. Called only after all native commits.
-    pub(super) fn write(&self, path: &Path) -> Result<(), anyhow::Error> {
+    /// A checkpoint over the size limit is not an error: the conversion is
+    /// complete and valid, so the export is skipped (and a stale file at
+    /// `path`, which no longer describes this conversion, is removed) and the
+    /// caller is told with `Ok(false)`. A later import then converts in full.
+    pub(super) fn write(&self, path: &Path) -> Result<bool, anyhow::Error> {
         let bytes = serde_json::to_vec(self)?;
-        if bytes.len() as u64 > MAX_BYTES {
-            bail!("Git checkpoint exceeds size limit")
+        let limit = max_bytes();
+        if bytes.len() as u64 > limit {
+            match std::fs::symlink_metadata(path) {
+                Ok(meta) if meta.is_file() => std::fs::remove_file(path)?,
+                Ok(_) => bail!("checkpoint output is not a regular file"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            eprintln!(
+                "warning: Git checkpoint ({} bytes) exceeds the size limit ({limit} bytes); \
+                 the import completed without a checkpoint export, so a later import \
+                 converts the history in full",
+                bytes.len()
+            );
+            return Ok(false);
         }
         let parent = path
             .parent()
@@ -177,7 +203,7 @@ impl Checkpoints {
         file.as_file().sync_all()?;
         file.persist(path).map_err(|error| error.error)?;
         std::fs::File::open(parent)?.sync_all()?;
-        Ok(())
+        Ok(true)
     }
 }
 
