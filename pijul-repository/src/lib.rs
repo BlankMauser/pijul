@@ -67,7 +67,10 @@ pub fn shared_cache_capacity() -> usize {
         }
     };
     let cap = ((n / 2) as usize).clamp(64, 1 << 16);
-    debug!("shared_cache_capacity = {:?} (open files limit {:?})", cap, n);
+    debug!(
+        "shared_cache_capacity = {:?} (open files limit {:?})",
+        cap, n
+    );
     cap
 }
 

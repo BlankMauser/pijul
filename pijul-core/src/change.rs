@@ -1803,7 +1803,11 @@ impl Change {
     }
 
     #[cfg(feature = "zstd")]
-    fn deserialize_(file: &str, hash: Option<&Hash>, with_contents: bool) -> Result<Self, ChangeError> {
+    fn deserialize_(
+        file: &str,
+        hash: Option<&Hash>,
+        with_contents: bool,
+    ) -> Result<Self, ChangeError> {
         use std::io::Read;
         let mut r = std::fs::File::open(file).map_err(|err| {
             if let Some(h) = hash {

@@ -14,16 +14,18 @@ pub trait WorkingCopyRead {
     fn file_metadata(&self, file: &str) -> Result<InodeMetadata, Self::Error>;
     fn read_file(&self, file: &str, buffer: &mut Vec<u8>) -> Result<(), Self::Error>;
     fn modified_time(&self, file: &str) -> Result<std::time::SystemTime, Self::Error>;
-    /// Size of `file` in bytes. Paired with [`Self::modified_time`] as a cheap
-    /// "did this file change?" check by `record`. The default reads the whole
-    /// file; on-disk backends should override it with a `stat`.
-    /// `true` when the caller knows that `file`'s contents are exactly the
-    /// ones the pristine was last recorded from, so `record` may skip reading
-    /// and diffing it (its name, metadata and parent are still checked).
-    /// Only return `true` when that is certain; the default never claims it.
+    /// `true` only when diffing this file against the current pristine would
+    /// emit no content hunks. Names, metadata and parents are still checked.
+    /// Equality with the last recorded working-copy bytes is NOT sufficient:
+    /// recording can leave zombies that a subsequent identical diff resurrects.
+    /// A caller must have observed a no-hunk diff and know that neither the
+    /// file's graph nor its bytes changed since. The default never claims this.
     fn known_clean(&self, _file: &str) -> bool {
         false
     }
+    /// Size of `file` in bytes. Paired with [`Self::modified_time`] as a cheap
+    /// "did this file change?" check by `record`. The default reads the whole
+    /// file; on-disk backends should override it with a `stat`.
     fn file_size(&self, file: &str) -> Result<u64, Self::Error> {
         let mut buffer = Vec::new();
         self.read_file(file, &mut buffer)?;

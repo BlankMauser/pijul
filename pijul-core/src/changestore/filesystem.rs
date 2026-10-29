@@ -3,8 +3,8 @@ use crate::change::{Change, ChangeFile};
 use crate::pristine::{Base32, ChangeId, Hash, Merkle, Vertex};
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// When the known cache reaches this many entries it is cleared
 /// wholesale and rebuilt lazily, rather than evicting entries one by

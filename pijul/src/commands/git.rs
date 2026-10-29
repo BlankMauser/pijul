@@ -34,7 +34,7 @@ struct OpenRepo {
     current_commit: Option<git2::Oid>,
     /// Per imported commit whose channel is still alive: the paths whose
     /// contents in that channel may not be settled, i.e. a full diff against
-    /// the commit's own blob could still produce hunks (see `Unsettled`).
+    /// the commit's own blob could still produce hunks (see `Skip`).
     /// No entry means unknown: the children diff every file.
     unsettled: std::collections::HashMap<git2::Oid, std::sync::Arc<HashSet<String>>>,
 }
@@ -673,7 +673,7 @@ fn git_reset<'a, T: TxnTExt + MutTxnTExt>(
         stats.git_diff_time = git_diff_time.elapsed();
         debug!("record prefixes {:?}", prefixes);
     }
-    // Only a single-parent commit can skip diffs (see `Unsettled`).
+    // Only a single-parent commit can skip diffs (see `Skip`).
     let touched = if single_parent { Some(touched) } else { None };
     Ok((object, prefixes, pref, touched))
 }
@@ -706,6 +706,27 @@ struct Commit<'a> {
 struct Skip {
     touched: std::sync::Arc<HashSet<String>>,
     unsettled: std::sync::Arc<HashSet<String>>,
+}
+
+impl Skip {
+    fn contains(&self, file: &str) -> bool {
+        !self.touched.contains(file) && !self.unsettled.contains(file)
+    }
+}
+
+fn next_unsettled(
+    hunks: Option<HashSet<String>>,
+    parent: Option<&HashSet<String>>,
+    diffed: &HashSet<String>,
+    full_walk: bool,
+) -> Option<HashSet<String>> {
+    let mut unsettled = hunks?;
+    if let Some(parent) = parent {
+        unsettled.extend(parent.iter().filter(|p| !diffed.contains(*p)).cloned());
+    } else if !full_walk {
+        return None;
+    }
+    Some(unsettled)
 }
 
 impl<'a> pijul_core::working_copy::WorkingCopyRead for Commit<'a> {
@@ -741,7 +762,7 @@ impl<'a> pijul_core::working_copy::WorkingCopyRead for Commit<'a> {
 
     fn known_clean(&self, file: &str) -> bool {
         let clean = match self.skip {
-            Some(ref skip) => !skip.touched.contains(file) && !skip.unsettled.contains(file),
+            Some(ref skip) => skip.contains(file),
             None => false,
         };
         if !clean {
@@ -777,8 +798,7 @@ fn import_commit<T: TxnTExt + MutTxnTExt + GraphIter + Send + Sync + 'static>(
     child: &git2::Oid,
     stats: &mut Stats,
 ) -> Result<pijul_core::Merkle, anyhow::Error> {
-    let (object, prefixes, prefstr, touched) =
-        git_reset(git, repo, &txn, &channel, child, stats)?;
+    let (object, prefixes, prefstr, touched) = git_reset(git, repo, &txn, &channel, child, stats)?;
     let first_parent = dag.parents.get(child).and_then(|p| p.first());
     let parent_unsettled = first_parent.and_then(|p| repo.unsettled.get(p)).cloned();
     let skip = match (touched, &parent_unsettled) {
@@ -901,17 +921,16 @@ fn import_commit<T: TxnTExt + MutTxnTExt + GraphIter + Send + Sync + 'static>(
     // unsettled in the first parent's channel that this record did not diff.
     // A full walk diffed every tracked file, so it needs no parent state.
     let full_walk = prefixes_.is_empty() || prefixes_.contains_key(&PathBuf::new());
-    let base = match parent_unsettled {
-        Some(u) => Some(u),
-        None if full_walk => Some(std::sync::Arc::new(HashSet::new())),
-        None => None,
-    };
-    match (hunk_paths, base) {
-        (Some(mut unsettled), Some(base)) => {
-            let diffed = diffed.lock().unwrap();
-            unsettled.extend(base.iter().filter(|p| !diffed.contains(*p)).cloned());
+    match next_unsettled(
+        hunk_paths,
+        parent_unsettled.as_deref(),
+        &diffed.lock().unwrap(),
+        full_walk,
+    ) {
+        Some(unsettled) => {
             debug!("unsettled after {:?}: {:?}", child, unsettled);
-            repo.unsettled.insert(*child, std::sync::Arc::new(unsettled));
+            repo.unsettled
+                .insert(*child, std::sync::Arc::new(unsettled));
         }
         _ => {
             repo.unsettled.remove(child);
@@ -1006,19 +1025,24 @@ where
         .map(|rec| rec.globalize(&*txn).unwrap())
         .collect();
     let n = actions.len();
-    // The paths this change has hunks on; `None` if a hunk is not about one
-    // path (roots).
+    // Content hunks affect their file's graph. Namespace changes are harder:
+    // path aliases and directory moves can affect descendants whose paths are
+    // not named by the hunk. Discard certificates rather than guessing.
     let mut hunk_paths = Some(HashSet::new());
     for a in actions.iter() {
         match a {
-            pijul_core::change::Hunk::AddRoot { .. } | pijul_core::change::Hunk::DelRoot { .. } => {
-                hunk_paths = None;
-                break;
-            }
-            a => {
+            a @ (pijul_core::change::Hunk::Edit { .. }
+            | pijul_core::change::Hunk::Replacement { .. }
+            | pijul_core::change::Hunk::SolveOrderConflict { .. }
+            | pijul_core::change::Hunk::UnsolveOrderConflict { .. }
+            | pijul_core::change::Hunk::ResurrectZombies { .. }) => {
                 if let Some(ref mut h) = hunk_paths {
                     h.insert(a.path().to_string());
                 }
+            }
+            _ => {
+                hunk_paths = None;
+                break;
             }
         }
     }
@@ -1157,5 +1181,52 @@ impl Stats {
         )?;
         pijul_core::reset_timers();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod skip_tests {
+    use super::*;
+
+    fn paths(p: &[&str]) -> HashSet<String> {
+        p.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn unchanged_blob_is_not_a_settled_graph() {
+        // A merge emitted a hunk on ws.rs. Its unchanged Git blob must still
+        // be diffed: the following record can resurrect zombie lines (ryvfs 29).
+        let parent = paths(&["src/ws.rs"]);
+        let skip = Skip {
+            touched: std::sync::Arc::new(paths(&["tools/windows-smoke.ps1"])),
+            unsettled: std::sync::Arc::new(parent.clone()),
+        };
+        assert!(!skip.contains("src/ws.rs"));
+        assert!(!skip.contains("tools/windows-smoke.ps1"));
+        assert!(skip.contains("README.md"));
+        // Self-healing isn't necessarily finished after one more record.
+        let again = next_unsettled(Some(parent.clone()), Some(&parent), &parent, true).unwrap();
+        assert_eq!(again, parent);
+        // Only an observed no-hunk diff certifies it.
+        assert!(
+            next_unsettled(Some(paths(&[])), Some(&again), &again, true)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn partial_walks_and_unknown_namespaces_are_conservative() {
+        let parent = paths(&["a", "b"]);
+        assert_eq!(
+            next_unsettled(Some(paths(&[])), Some(&parent), &paths(&["a"]), false),
+            Some(paths(&["b"]))
+        );
+        assert!(next_unsettled(Some(paths(&[])), None, &paths(&["a"]), false).is_none());
+        assert!(next_unsettled(None, Some(&parent), &parent, true).is_none());
+        assert_eq!(
+            next_unsettled(Some(paths(&["a"])), None, &parent, true),
+            Some(paths(&["a"]))
+        );
     }
 }
