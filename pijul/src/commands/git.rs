@@ -10,6 +10,9 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+#[path = "git_checkpoint.rs"]
+mod checkpoint;
+
 #[derive(Parser, Debug)]
 pub struct Git {
     /// Process this path instead of the current directory, creating a Pijul repository if necessary.
@@ -21,6 +24,12 @@ pub struct Git {
     /// Time the import, and output values to this file.
     #[clap(long = "stats", hide = true, value_hint = ValueHint::FilePath)]
     stats: Option<PathBuf>,
+    /// Restore discarded Git fork-point channels from a local checkpoint.
+    #[clap(long, value_hint = ValueHint::FilePath)]
+    import_state_in: Option<PathBuf>,
+    /// Atomically export local Git checkpoint recipes after conversion.
+    #[clap(long, value_hint = ValueHint::FilePath)]
+    import_state_out: Option<PathBuf>,
     /// Check only the first n commits processed.
     #[clap(default_value = "0", hide = true)]
     check: usize,
@@ -32,6 +41,7 @@ struct OpenRepo {
     n: usize,
     check: usize,
     current_commit: Option<git2::Oid>,
+    checkpoints: Option<checkpoint::Checkpoints>,
 }
 
 #[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq)]
@@ -47,6 +57,13 @@ impl Git {
     }
 
     pub fn run(self, config: &pijul_config::Config) -> Result<(), anyhow::Error> {
+        // Parse before opening/mutating the repository. Partial or corrupt
+        // exports are never usable resume evidence.
+        let checkpoints = match self.import_state_in.as_deref() {
+            Some(path) => Some(checkpoint::Checkpoints::read(path)?),
+            None if self.import_state_out.is_some() => Some(checkpoint::Checkpoints::new()),
+            None => None,
+        };
         let repo = if let Ok(repo) = Repository::find_root(self.pijul_path.as_deref()) {
             repo
         } else {
@@ -95,7 +112,40 @@ impl Git {
             n: 0,
             check: self.check,
             current_commit: None,
+            checkpoints,
         };
+        // Resume hook only: reconstruct dropped boundary channels and output
+        // one parent to the bookkeeping sink. Existing parent-switch logic
+        // then handles subsequent commits without recorder/apply changes.
+        if self.import_state_in.is_some() {
+            let txn = repo.repo.pristine.arc_txn_begin()?;
+            for &(boundary, state) in &dag.root {
+                if let Some(state) = state {
+                    let channel = repo.checkpoints.as_ref().unwrap().restore(
+                        &mut *txn.write(),
+                        &repo.repo.changes,
+                        boundary,
+                        state,
+                    )?;
+                    if repo.current_commit.is_none() {
+                        pijul_core::output::output_repository_no_pending(
+                            &pijul_core::working_copy::sink(),
+                            &repo.repo.changes,
+                            &txn,
+                            &channel,
+                            "",
+                            false,
+                            None,
+                            std::thread::available_parallelism()?.get(),
+                            0,
+                        )?;
+                        txn.write().set_current_channel(&boundary.to_string())?;
+                        repo.current_commit = Some(boundary);
+                    }
+                }
+            }
+            txn.commit()?;
+        }
         import(&git, &mut env_git, &mut repo, &dag)?;
 
         let txn = repo.repo.pristine.arc_txn_begin()?;
@@ -114,6 +164,12 @@ impl Git {
                     0,
                 )?;
             }
+        }
+        if let (Some(checkpoints), Some(path)) =
+            (&mut repo.checkpoints, self.import_state_out.as_deref())
+        {
+            checkpoints.head = oid.to_string();
+            checkpoints.write(path)?;
         }
         Ok(())
     }
@@ -285,12 +341,9 @@ fn import(
         if let Some(merkle) = merkle {
             let oid_ = format!("{}", oid);
             let channel = load_channel_exact(&oid_, &*txn.read())?;
-            let (_, &p) = txn
-                .read()
-                .changeid_reverse_log(&*channel.read(), None)?
-                .next()
-                .unwrap()?;
-            let merkle_: pijul_core::Merkle = (&p.b).into();
+            // Empty Git commits have a valid empty state but no reverse-log
+            // entry; checkpoint resume must not unwrap that absent entry.
+            let merkle_ = txn.read().current_state(&channel.read())?;
             if merkle != merkle_ {
                 bail!(
                     "Pijul channel changed since last import. Please unrecord channel {} to state {}",
@@ -352,6 +405,16 @@ fn import(
                 import_commit_parents(repo, dag, &txn, &channel, &oid, &mut ws, &mut stats)?;
                 let state = import_commit(git, repo, &txn, &channel, &oid, &mut stats)?;
                 save_state(env_git, &oid, state)?;
+                if let Some(checkpoints) = &mut repo.checkpoints {
+                    checkpoints.capture(
+                        &*txn.read(),
+                        &channel,
+                        oid,
+                        dag.parents
+                            .get(&oid)
+                            .and_then(|parents| parents.first().copied()),
+                    )?;
+                }
                 dag.collect_dead_parents(&oid, &mut todo, &txn)?;
                 dag.insert_children_in_todo(&oid, &mut todo);
 
