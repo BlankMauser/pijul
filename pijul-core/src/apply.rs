@@ -7,10 +7,18 @@ use crate::record::InodeUpdate;
 use crate::{HashMap, HashSet};
 use std::collections::BTreeSet;
 use thiserror::Error;
+mod dead_context;
+mod dead_exits;
+mod descendants;
+use dead_context::DeadContext;
+use dead_exits::DeadExits;
+use descendants::Descendants;
 pub mod edge;
 pub(crate) use edge::*;
 pub mod vertex;
 pub(crate) use vertex::*;
+#[cfg(test)]
+mod pseudo_cleanup_tests;
 
 pub enum ApplyError<ChangestoreError: std::error::Error, T: GraphTxnT + TreeTxnT> {
     Changestore(ChangestoreError),
@@ -633,7 +641,7 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
     }];
 
     let mut visited = BTreeSet::new();
-    let mut descendants = BTreeSet::new();
+    let mut descendants = Descendants::default();
     // `entering[d]` = alive vertices that reach a dead vertex `d` (the
     // `last_alive` of each revisit of `d`). Together with `descendants[d]`
     // (the alive vertices below `d`), this is the bipartite order relation
@@ -821,20 +829,32 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
         v.dedup();
         v
     };
+    debug!(target: "pijul_core::apply::repair", "DFS complete: {} vertices, {} revisited vertices, {} bridges", visited.len(), dead_vertices.len(), bridges.len());
+    let mut frontiers = if dead_vertices.len() > PROBE_MAX_SET {
+        DeadExits::new(txn, channel, &visited)?
+    } else {
+        None
+    };
+    debug!(target: "pijul_core::apply::repair", "frontier snapshot cached={}", frontiers.is_some());
     let mut reached = HashSet::default();
+    let mut dead_context = DeadContext::new(true);
+    // Different dead vertices often imply the same bridge. Preserve its first
+    // insertion's order, but do not repeat the two pristine writes for it.
+    let mut reconnected = HashSet::default();
     for d in dead_vertices {
         let ent: HashSet<Vertex<ChangeId>> = entering
             .range((d, Vertex::ROOT)..=(d, Vertex::MAX))
             .map(|(_, l)| *l)
             .collect();
-        let mut exi: HashSet<Vertex<ChangeId>> = descendants
-            .range((d, Vertex::ROOT)..=(d, Vertex::MAX))
-            .map(|(_, r)| *r)
-            .collect();
+        let mut exi: HashSet<Vertex<ChangeId>> = descendants.get(d).into_iter().collect();
         // The DFS only records the alive descendants of the dead vertices on
         // the path when it finds them: a dead vertex whose dead children were
         // already visited gets none, although it leads to theirs.
-        alive_exits_through_dead(txn, channel, d, &mut exi)?;
+        if let Some(frontiers) = &frontiers {
+            frontiers.extend(d, &mut exi);
+        } else {
+            alive_exits_through_dead(txn, channel, d, &mut exi, &mut dead_context)?;
+        }
         if exi.is_empty() {
             continue;
         }
@@ -848,7 +868,7 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
             maximal.extend(ent.iter().copied())
         } else {
             for &l in ent.iter() {
-                if !reaches_any_within(txn, channel, l, &ent)? {
+                if !reaches_any_within(txn, channel, l, &ent, &mut dead_context)? {
                     maximal.push(l)
                 }
             }
@@ -860,7 +880,7 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
         let mut non_minimal = HashSet::default();
         if exi.len() > 1 && exi.len() <= PROBE_MAX_SET {
             for &r in exi.iter() {
-                forward_reachable_within(txn, channel, r, &exi, &mut reached)?;
+                forward_reachable_within(txn, channel, r, &exi, &mut reached, &mut dead_context)?;
                 for &x in reached.iter() {
                     non_minimal.insert(x);
                 }
@@ -869,15 +889,22 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
 
         for &l in maximal.iter() {
             for &r in exi.iter() {
-                if non_minimal.contains(&r) || l == r {
+                if non_minimal.contains(&r) || l == r || !reconnected.insert((l, r)) {
                     continue;
                 }
                 debug!("put_pseudo (reduced) {:?} {:?}", l, r);
-                put_graph_with_rev(txn, channel, EdgeFlags::PSEUDO, l, r, ChangeId::ROOT)?;
+                if put_graph_with_rev(txn, channel, EdgeFlags::PSEUDO, l, r, ChangeId::ROOT)? {
+                    dead_context.invalidate(l);
+                    // The initial inode may be used as an ancestor even when
+                    // actually dead. Unless its new edge preserves all cached
+                    // frontiers, fall back to exact current-graph walks.
+                    DeadExits::invalidate_after_insert(&mut frontiers, l, r);
+                }
             }
         }
     }
 
+    debug!(target: "pijul_core::apply::repair", "reductions complete: {} distinct reconnections", reconnected.len());
     // Emit the deferred nearest-alive-ancestor reconnections, but only when the
     // target is not already reachable from the source through the alive graph
     // (real edges plus the bridges already emitted above and here). This turns
@@ -891,12 +918,15 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
         if u == v || !emitted.insert((u, v)) {
             continue;
         }
-        if is_forward_reachable(txn, channel, u, v)? {
+        if is_forward_reachable(txn, channel, u, v, &mut dead_context)? {
             continue;
         }
         debug!("put_pseudo (bridge) {:?} {:?}", u, v);
-        put_graph_with_rev(txn, channel, EdgeFlags::PSEUDO, u, v, ChangeId::ROOT)?;
+        if put_graph_with_rev(txn, channel, EdgeFlags::PSEUDO, u, v, ChangeId::ROOT)? {
+            dead_context.invalidate(u);
+        }
     }
+    debug!(target: "pijul_core::apply::repair", "bridges complete");
 
     Ok(())
 }
@@ -922,6 +952,7 @@ fn is_forward_reachable<T: GraphTxnT>(
     channel: &T::Graph,
     from: Vertex<ChangeId>,
     to: Vertex<ChangeId>,
+    context: &mut DeadContext,
 ) -> Result<bool, BlockError<T::GraphError>> {
     if from == to {
         return Ok(true);
@@ -937,18 +968,10 @@ fn is_forward_reachable<T: GraphTxnT>(
         budget -= 1;
         // Dead vertices order nothing (the alive graph does not have them):
         // a path through one does not make the reconnection redundant.
-        if w != from && !is_alive(txn, channel, &w)? {
+        if w != from && !context.is_alive(txn, channel, w)? {
             continue;
         }
-        for e in iter_adjacent(
-            txn,
-            channel,
-            w,
-            EdgeFlags::empty(),
-            EdgeFlags::all() - EdgeFlags::DELETED - EdgeFlags::PARENT,
-        )? {
-            let e = e?;
-            let c = *txn.find_block(channel, e.dest())?;
+        for &c in context.forward_edges(txn, channel, w)? {
             if c == to {
                 return Ok(true);
             }
@@ -968,6 +991,7 @@ fn reaches_any_within<T: GraphTxnT>(
     channel: &T::Graph,
     from: Vertex<ChangeId>,
     targets: &HashSet<Vertex<ChangeId>>,
+    context: &mut DeadContext,
 ) -> Result<bool, BlockError<T::GraphError>> {
     let mut visited = HashSet::default();
     visited.insert(from);
@@ -978,15 +1002,7 @@ fn reaches_any_within<T: GraphTxnT>(
             return Ok(false);
         }
         budget -= 1;
-        for e in iter_adjacent(
-            txn,
-            channel,
-            v,
-            EdgeFlags::empty(),
-            EdgeFlags::all() - EdgeFlags::DELETED - EdgeFlags::PARENT,
-        )? {
-            let e = e?;
-            let c = *txn.find_block(channel, e.dest())?;
+        for &c in context.forward_edges(txn, channel, v)? {
             if c != from && targets.contains(&c) {
                 return Ok(true);
             }
@@ -1009,6 +1025,7 @@ fn forward_reachable_within<T: GraphTxnT>(
     from: Vertex<ChangeId>,
     targets: &HashSet<Vertex<ChangeId>>,
     out: &mut HashSet<Vertex<ChangeId>>,
+    context: &mut DeadContext,
 ) -> Result<(), BlockError<T::GraphError>> {
     out.clear();
     let max_hits = targets.len() - usize::from(targets.contains(&from));
@@ -1022,18 +1039,10 @@ fn forward_reachable_within<T: GraphTxnT>(
         }
         budget -= 1;
         // As in `is_forward_reachable`, do not go through dead vertices.
-        if v != from && !is_alive(txn, channel, &v)? {
+        if v != from && !context.is_alive(txn, channel, v)? {
             continue;
         }
-        for e in iter_adjacent(
-            txn,
-            channel,
-            v,
-            EdgeFlags::empty(),
-            EdgeFlags::all() - EdgeFlags::DELETED - EdgeFlags::PARENT,
-        )? {
-            let e = e?;
-            let c = *txn.find_block(channel, e.dest())?;
+        for &c in context.forward_edges(txn, channel, v)? {
             if c != from && targets.contains(&c) {
                 out.insert(c);
                 if out.len() >= max_hits {
@@ -1055,10 +1064,11 @@ fn alive_exits_through_dead<T: GraphTxnT>(
     channel: &T::Graph,
     d: Vertex<ChangeId>,
     out: &mut HashSet<Vertex<ChangeId>>,
+    context: &mut DeadContext,
 ) -> Result<(), BlockError<T::GraphError>> {
     // `entering` also holds revisited alive vertices, whose reconnection is not
     // this one's business.
-    if is_alive(txn, channel, &d)? {
+    if context.is_alive(txn, channel, d)? {
         return Ok(());
     }
     let mut visited = HashSet::default();
@@ -1067,22 +1077,12 @@ fn alive_exits_through_dead<T: GraphTxnT>(
         if !visited.insert(v) {
             continue;
         }
-        if v != d && is_alive(txn, channel, &v)? {
+        if v != d && context.is_alive(txn, channel, v)? {
             out.insert(v);
             continue;
         }
-        for e in iter_adjacent(
-            txn,
-            channel,
-            v,
-            EdgeFlags::empty(),
-            EdgeFlags::all() - EdgeFlags::PARENT - EdgeFlags::FOLDER,
-        )? {
-            let e = e?;
-            if e.flag().contains(EdgeFlags::PARENT) {
-                continue;
-            }
-            stack.push(*txn.find_block(channel, e.dest())?);
+        for &(c, _) in context.edges(txn, channel, v)? {
+            stack.push(c);
         }
     }
     Ok(())
@@ -1172,6 +1172,9 @@ pub(crate) fn clean_unjustified_pseudo_edges<T: GraphMutTxnT + TreeTxnT>(
     let mut visited = HashSet::default();
     let mut jstack = Vec::new();
     let mut jvisited = HashSet::default();
+    let mut context = DeadContext::new(false);
+    let mut targets = HashSet::default();
+    let mut candidates = Vec::new();
     let mut del = Vec::new();
     for root in inodes.iter() {
         stack.clear();
@@ -1179,6 +1182,8 @@ pub(crate) fn clean_unjustified_pseudo_edges<T: GraphMutTxnT + TreeTxnT>(
         stack.push(root.inode_vertex());
         visited.insert(root.inode_vertex());
         while let Some(v) = stack.pop() {
+            candidates.clear();
+            targets.clear();
             for e in iter_adjacent(
                 txn,
                 channel,
@@ -1195,25 +1200,69 @@ pub(crate) fn clean_unjustified_pseudo_edges<T: GraphMutTxnT + TreeTxnT>(
                 if visited.insert(c) {
                     stack.push(c)
                 }
-                if flag.contains(EdgeFlags::PSEUDO)
-                    && !flag.contains(EdgeFlags::DELETED)
-                    && !crate::pristine::pseudo_edge_justified(
-                        txn,
-                        channel,
-                        v,
-                        c,
-                        &mut jstack,
-                        &mut jvisited,
-                    )?
-                {
-                    del.push((flag, v, c, e.introduced_by()))
+                if flag.contains(EdgeFlags::PSEUDO) && !flag.contains(EdgeFlags::DELETED) {
+                    targets.insert(c);
+                    candidates.push((flag, v, c, e.introduced_by()));
                 }
             }
+            // The old per-edge search walked the same deleted region once for
+            // every target of a fan. Search once per source instead, retaining
+            // exactly the targets for which no backing path exists.
+            retain_unjustified_pseudo_targets(
+                txn,
+                channel,
+                v,
+                &mut targets,
+                &mut jstack,
+                &mut jvisited,
+                &mut context,
+            )?;
+            del.extend(
+                candidates
+                    .drain(..)
+                    .filter(|(_, _, c, _)| targets.contains(c)),
+            );
         }
     }
     for (flag, a, b, intro) in del.drain(..) {
         debug!("deleting unjustified pseudo edge {:?} -> {:?}", a, b);
         del_graph_with_rev(txn, channel, flag, a, b, intro)?;
+    }
+    Ok(())
+}
+
+// Batched equivalent of pristine::pseudo_edge_justified: follow real edges,
+// through dead intermediate vertices only. Test a destination before aliveness
+// and visitation, just as the single-target search does (including cycles and
+// dead targets). Never truncate this search: an incomplete answer deletes
+// justified edges and changes the graph's order.
+fn retain_unjustified_pseudo_targets<T: GraphTxnT>(
+    txn: &T,
+    channel: &T::Graph,
+    from: Vertex<ChangeId>,
+    targets: &mut HashSet<Vertex<ChangeId>>,
+    stack: &mut Vec<Vertex<ChangeId>>,
+    visited: &mut HashSet<Vertex<ChangeId>>,
+    context: &mut DeadContext,
+) -> Result<(), BlockError<T::GraphError>> {
+    if targets.is_empty() {
+        return Ok(());
+    }
+    stack.clear();
+    stack.push(from);
+    visited.clear();
+    visited.insert(from);
+    while !targets.is_empty() {
+        let Some(v) = stack.pop() else { break };
+        for &(c, alive) in context.edges(txn, channel, v)? {
+            targets.remove(&c);
+            if targets.is_empty() {
+                return Ok(());
+            }
+            if !alive && visited.insert(c) {
+                stack.push(c);
+            }
+        }
     }
     Ok(())
 }
