@@ -392,6 +392,107 @@ fn cached_probes_preserve_budget_order_and_invalidation() -> Result<(), anyhow::
 }
 
 #[test]
+fn oversized_frontier_matrix_falls_back_at_boundary() -> Result<(), anyhow::Error> {
+    let env = sanakirja::Pristine::new_anon()?;
+    let mut txn = env.mut_txn_begin()?;
+    let channel =
+        txn.open_or_create_channel(&crate::small_string::SmallString::from_str("test"))?;
+    let mut channel = channel.write();
+    let graph = &mut *channel;
+    let real = ChangeId(L64(42));
+    // 32,768 dead rows * 256 words * 8 bytes is exactly 64 MiB.
+    let dead_count = 32_768;
+    let alive_count = 16_384;
+    let first_alive = vertex(dead_count + 1);
+    for i in 1..=dead_count + alive_count {
+        let flags = if i <= dead_count {
+            EdgeFlags::BLOCK | EdgeFlags::DELETED
+        } else {
+            EdgeFlags::BLOCK
+        };
+        put_graph_with_rev(&mut txn, graph, flags, Vertex::ROOT, vertex(i), real)?;
+    }
+    put_graph_with_rev(
+        &mut txn,
+        graph,
+        EdgeFlags::PSEUDO,
+        vertex(1),
+        first_alive,
+        ChangeId::ROOT,
+    )?;
+    let mut vertices = (1..=dead_count + alive_count).map(vertex).collect();
+    let snapshot = DeadExits::new(&txn, graph, &vertices)?.expect("matrix at cap fits");
+    let mut exits = HashSet::default();
+    snapshot.extend(vertex(1), &mut exits);
+    assert_eq!(exits, [first_alive].into_iter().collect());
+    drop(snapshot);
+
+    // One extra dead row crosses the limit without changing the word count.
+    let extra_dead = vertex(dead_count + alive_count + 1);
+    put_graph_with_rev(
+        &mut txn,
+        graph,
+        EdgeFlags::BLOCK | EdgeFlags::DELETED,
+        Vertex::ROOT,
+        extra_dead,
+        real,
+    )?;
+    vertices.insert(extra_dead);
+    let counted = CountReads {
+        inner: &txn,
+        reads: std::cell::Cell::new(0),
+    };
+    assert!(DeadExits::new(&counted, graph, &vertices)?.is_none());
+    assert_eq!(
+        counted.reads.get(),
+        vertices.len(),
+        "fallback precedes adjacency materialization"
+    );
+    vertices.remove(&extra_dead);
+
+    // One extra alive exit rounds up to 257 words per row. The fallback
+    // must keep this last exit, rather than truncate the frontier to fit.
+    let extra_alive = vertex(dead_count + alive_count + 2);
+    put_graph_with_rev(
+        &mut txn,
+        graph,
+        EdgeFlags::BLOCK,
+        Vertex::ROOT,
+        extra_alive,
+        real,
+    )?;
+    put_graph_with_rev(
+        &mut txn,
+        graph,
+        EdgeFlags::PSEUDO,
+        vertex(1),
+        extra_alive,
+        ChangeId::ROOT,
+    )?;
+    vertices.insert(extra_alive);
+    let counted = CountReads {
+        inner: &txn,
+        reads: std::cell::Cell::new(0),
+    };
+    assert!(DeadExits::new(&counted, graph, &vertices)?.is_none());
+    assert_eq!(
+        counted.reads.get(),
+        vertices.len(),
+        "fallback precedes adjacency materialization"
+    );
+    exits.clear();
+    alive_exits_through_dead(
+        &txn,
+        graph,
+        vertex(1),
+        &mut exits,
+        &mut DeadContext::new(true),
+    )?;
+    assert_eq!(exits, [first_alive, extra_alive].into_iter().collect());
+    Ok(())
+}
+
+#[test]
 fn frontier_snapshot_matches_walks_and_invalidates_dead_sources() -> Result<(), anyhow::Error> {
     let env = sanakirja::Pristine::new_anon()?;
     let mut txn = env.mut_txn_begin()?;
