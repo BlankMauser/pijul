@@ -47,6 +47,35 @@ pub fn max_files() -> usize {
     1
 }
 
+/// Change-cache capacity for a long-running single-process job (`pijul git`)
+/// whose change store clones all share one cache.
+///
+/// Raises the soft open-files limit to the hard limit first (each cached
+/// change keeps its file open), so the capacity does not depend on the soft
+/// limit the process happened to inherit: with a 1024 soft limit and 12 cores,
+/// [`max_files`] gives 42 entries and the cache thrashes. Half of the open
+/// files limit, at most 65536 entries.
+#[cfg(unix)]
+pub fn shared_cache_capacity() -> usize {
+    let n = match rlimit::increase_nofile_limit(u64::MAX) {
+        Ok(n) => n,
+        Err(error) => {
+            warn!("Failed to raise the open files limit: {error}");
+            rlimit::getrlimit(rlimit::Resource::NOFILE)
+                .map(|(soft, _)| soft)
+                .unwrap_or(256)
+        }
+    };
+    let cap = ((n / 2) as usize).clamp(64, 1 << 16);
+    debug!("shared_cache_capacity = {:?} (open files limit {:?})", cap, n);
+    cap
+}
+
+#[cfg(not(unix))]
+pub fn shared_cache_capacity() -> usize {
+    1024
+}
+
 impl Repository {
     fn find_repository_root(
         directory_override: Option<&Path>,

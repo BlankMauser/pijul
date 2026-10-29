@@ -175,7 +175,9 @@ pub fn apply_change_ws<T: MutTxnT, P: ChangeStore>(
 ) -> Result<(u64, Merkle), ApplyError<P::Error, T>> {
     debug!("apply_change {:?}", hash.to_base32());
     workspace.clear();
-    let change = changes.get_change(hash).map_err(ApplyError::Changestore)?;
+    let change = changes
+        .get_change_without_contents(hash)
+        .map_err(ApplyError::Changestore)?;
 
     for hash in change.dependencies.iter() {
         if let Hash::None = hash {
@@ -224,7 +226,9 @@ pub fn apply_change_rec_ws<T: TxnT + MutTxnT, P: ChangeStore>(
     let mut dep_stack = vec![(*hash, true, !deps_only)];
     let mut visited = HashSet::default();
     while let Some((hash, first, actually_apply)) = dep_stack.pop() {
-        let change = changes.get_change(&hash).map_err(ApplyError::Changestore)?;
+        let change = changes
+            .get_change_without_contents(&hash)
+            .map_err(ApplyError::Changestore)?;
         let shash: SerializedHash = (&hash).into();
         if first {
             if !visited.insert(hash) {

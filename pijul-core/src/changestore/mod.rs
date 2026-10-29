@@ -83,6 +83,12 @@ pub trait ChangeStore {
     ) -> Result<Hash, E>;
     fn del_change(&self, h: &Hash) -> Result<bool, Self::Error>;
     fn get_change(&self, h: &Hash) -> Result<Change, Self::Error>;
+    /// The change `h` with its hunks but possibly without its contents
+    /// (`contents` may be left empty). Used by `apply`, which never reads
+    /// them. Defaults to [`Self::get_change`].
+    fn get_change_without_contents(&self, h: &Hash) -> Result<Change, Self::Error> {
+        self.get_change(h)
+    }
     fn get_file_meta<'a, F: Fn(ChangeId) -> Option<Hash>>(
         &self,
         hash: F,
