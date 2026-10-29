@@ -1,0 +1,21 @@
+pijul/src/commands/git.rs
+  s_c0e2bd2477bb03::t_3709e75d43bec9 697-736,886-913,1363-1412
+pijul/src/commands/git_prefetch.rs
+  s_c0e2bd2477bb03::t_eb41c1dab6b335 33-43,99-106,112-128,130-139,149-152,203-224
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2ef7768fafa23444bd989b47915558cefcc0e253",
+  "prompts": {},
+  "sessions": {
+    "s_c0e2bd2477bb03": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a18906-b180-7093-8fac-d665985fe5f6",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
