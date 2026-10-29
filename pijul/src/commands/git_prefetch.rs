@@ -18,6 +18,10 @@ pub(super) struct Delta {
     pub new: PathBuf,
     pub mode: git2::FileMode,
     pub status: git2::Delta,
+    /// Blob sizes (0 for an absent side or a submodule), from the object
+    /// headers; `u64::MAX` if the header cannot be read.
+    pub old_size: u64,
+    pub new_size: u64,
 }
 
 pub(super) struct Prepared {
@@ -68,6 +72,14 @@ impl Prepared {
             let old = parent.tree()?;
             let mut diff = git.diff_tree_to_tree(Some(&old), Some(&tree), None)?;
             diff.find_similar(None)?;
+            let odb = git.odb()?;
+            let size = |f: git2::DiffFile<'_>| {
+                if f.id().is_zero() || f.mode() == git2::FileMode::Commit {
+                    0
+                } else {
+                    odb.read_header(f.id()).map_or(u64::MAX, |h| h.0 as u64)
+                }
+            };
             parents.push(
                 diff.deltas()
                     .map(|d| Delta {
@@ -75,6 +87,8 @@ impl Prepared {
                         new: d.new_file().path().unwrap().to_path_buf(),
                         mode: d.new_file().mode(),
                         status: d.status(),
+                        old_size: size(d.old_file()),
+                        new_size: size(d.new_file()),
                     })
                     .collect(),
             );

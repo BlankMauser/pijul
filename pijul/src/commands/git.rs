@@ -694,12 +694,12 @@ fn git_reset<'a, T: TxnTExt + MutTxnTExt>(
     Ok((object, prefixes, pref, touched))
 }
 
-/// Largest total size of the files a commit diffs (new contents, as Git
-/// reports it) for which the importer still uses the parallel `Builder::record`.
-/// That path holds, for every file of the commit at once, the new file and the
-/// reconstructed old side (about twice this figure, plus the diff itself), so
-/// the budget bounds its memory. Above it the serial path is used.
-/// `PIJUL_GIT_PARALLEL_BUDGET` (bytes) overrides it, e.g. `0` to force serial.
+/// Largest total of old + new contents of the files a commit diffs for which
+/// the importer still uses the parallel `Builder::record`. That path holds, for
+/// every file of the commit at once, the new file and the reconstructed old
+/// side (plus the diff itself), so the budget bounds its memory. Above it the
+/// serial path is used. `PIJUL_GIT_PARALLEL_BUDGET` (bytes) overrides it; `0`
+/// disables parallel recording.
 const PARALLEL_RECORD_BUDGET: u64 = 256 << 20;
 
 fn parallel_record_budget() -> u64 {
@@ -709,26 +709,38 @@ fn parallel_record_budget() -> u64 {
         .unwrap_or(PARALLEL_RECORD_BUDGET)
 }
 
-/// Whether the files a record of this commit would diff (everything `skip`
-/// does not vouch for, that exists as a file in the new tree) total at most
-/// `budget` bytes according to `size`.
-fn diffed_bytes_within(
-    files: &std::collections::HashMap<String, prefetch::Entry>,
+/// Whether recording this commit with the parallel `Builder::record` stays
+/// within `budget` bytes. A budget of 0 disables parallel recording.
+///
+/// Counted conservatively: every file the record diffs is held as its new
+/// contents *and* the reconstructed old side, so a delta weighs `old + new`
+/// (a bulk truncation to empty files still weighs all the old data), and a
+/// file diffed only because it is unsettled (unchanged in Git, so old = new =
+/// the blob `size` reports) weighs twice its blob.
+fn parallel_record_within_budget(
+    prepared: &prefetch::Prepared,
     skip: &Skip,
     mut size: impl FnMut(&prefetch::Entry) -> u64,
     budget: u64,
 ) -> bool {
+    if budget == 0 {
+        return false;
+    }
     let mut total = 0u64;
-    let diffed = skip
-        .touched
-        .iter()
-        .chain(skip.unsettled.iter().filter(|p| !skip.touched.contains(*p)));
-    for path in diffed {
-        if let Some(entry) = files.get(path).filter(|e| !e.is_dir) {
-            total = total.saturating_add(size(entry));
-            if total > budget {
-                return false;
-            }
+    let mut add = |n: u64| {
+        total = total.saturating_add(n);
+        total <= budget
+    };
+    for delta in prepared.parents.iter().flatten() {
+        if !add(delta.old_size.saturating_add(delta.new_size)) {
+            return false;
+        }
+    }
+    for path in skip.unsettled.iter().filter(|p| !skip.touched.contains(*p)) {
+        if let Some(entry) = prepared.files.get(path).filter(|e| !e.is_dir)
+            && !add(size(entry).saturating_mul(2))
+        {
+            return false;
         }
     }
     true
@@ -890,8 +902,8 @@ fn import_commit<T: TxnTExt + MutTxnTExt + GraphIter + Send + Sync + 'static>(
     // the same change.
     let parallel = parallel && {
         let budget = parallel_record_budget();
-        let within = diffed_bytes_within(
-            &prepared.files,
+        let within = parallel_record_within_budget(
+            prepared,
             skip.as_ref().unwrap(),
             |entry| {
                 repo.git_objects
@@ -1376,32 +1388,129 @@ mod budget_tests {
         std::sync::Arc::new(paths.iter().map(|p| p.to_string()).collect())
     }
 
+    /// Files diffed only because they are unsettled weigh twice their blob;
+    /// directories and paths absent from the tree weigh nothing.
     #[test]
-    fn budget_counts_touched_and_unsettled_files_once() {
+    fn unsettled_files_count_twice_once() {
         let files: std::collections::HashMap<_, _> = [
-            ("big".to_string(), entry(1, false)),
-            ("also".to_string(), entry(2, false)),
+            ("a".to_string(), entry(1, false)),
+            ("b".to_string(), entry(2, false)),
             ("dir".to_string(), entry(3, true)),
-            ("untouched".to_string(), entry(4, false)),
+            ("touched".to_string(), entry(4, false)),
         ]
         .into();
-        let skip = Skip {
-            touched: set(&["big", "dir", "gone"]),
-            unsettled: set(&["big", "also"]),
+        let prepared = prefetch::Prepared {
+            oid: git2::Oid::ZERO_SHA1,
+            files: std::sync::Arc::new(files),
+            tree_order: Vec::new(),
+            parents: vec![Vec::new()],
+            elapsed: std::time::Duration::ZERO,
         };
-        // 100 bytes each: `big` once, `also`; not the dir, the missing path
-        // or the untouched file.
+        let skip = Skip {
+            touched: set(&["touched"]),
+            unsettled: set(&["a", "b", "dir", "gone", "touched"]),
+        };
         let size = |_: &prefetch::Entry| 100;
-        assert!(diffed_bytes_within(&files, &skip, size, 200));
-        assert!(!diffed_bytes_within(&files, &skip, size, 199));
-        assert!(!diffed_bytes_within(&files, &skip, size, 0));
+        assert!(parallel_record_within_budget(&prepared, &skip, size, 400));
+        assert!(!parallel_record_within_budget(&prepared, &skip, size, 399));
         // An unknown size is the worst case.
-        assert!(!diffed_bytes_within(
-            &files,
+        assert!(!parallel_record_within_budget(
+            &prepared,
             &skip,
             |_| u64::MAX,
             u64::MAX - 1
         ));
+    }
+
+    /// A repository whose first commit adds `n` files of `len` bytes and whose
+    /// second commit rewrites each with `new`; returns the second commit's
+    /// snapshot and the `Skip` the importer would build for it.
+    fn rewrite(n: usize, len: usize, new: &[u8]) -> (prefetch::Prepared, Skip, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let git = git2::Repository::init(dir.path()).unwrap();
+        let author = git2::Signature::now("t", "t@example.invalid").unwrap();
+        let commit = |content: &[u8], parents: &[&git2::Commit]| {
+            let blob = git.blob(content).unwrap();
+            let mut b = git.treebuilder(None).unwrap();
+            for i in 0..n {
+                b.insert(format!("f{i}"), blob, 0o100644).unwrap();
+            }
+            let tree = git.find_tree(b.write().unwrap()).unwrap();
+            git.commit(None, &author, &author, "c", &tree, parents)
+                .unwrap()
+        };
+        let first = commit(&vec![b'x'; len], &[]);
+        let first = git.find_commit(first).unwrap();
+        let second = commit(new, &[&first]);
+        let prepared = prefetch::Prepared::load(&git, second).unwrap();
+        let touched = prepared.parents[0]
+            .iter()
+            .flat_map(|d| [&d.old, &d.new])
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let skip = Skip {
+            touched: std::sync::Arc::new(touched),
+            unsettled: set(&[]),
+        };
+        (prepared, skip, dir)
+    }
+
+    fn blob_len(repo: &Path, e: &prefetch::Entry) -> u64 {
+        let git = git2::Repository::open(repo).unwrap();
+        git.odb().unwrap().read_header(e.oid).unwrap().0 as u64
+    }
+
+    /// Truncating many large files to nothing is modification-only and its new
+    /// side totals zero, but the retained plans own every old file's contents.
+    #[test]
+    fn bulk_truncation_counts_the_old_side() {
+        let (prepared, skip, dir) = rewrite(8, 1 << 20, b"");
+        assert!(
+            prepared.parents[0]
+                .iter()
+                .all(|d| d.status == git2::Delta::Modified)
+        );
+        let size = |e: &prefetch::Entry| blob_len(dir.path(), e);
+        // 8 MiB of old contents against a 1 MiB budget.
+        assert!(!parallel_record_within_budget(
+            &prepared,
+            &skip,
+            size,
+            1 << 20
+        ));
+        assert!(!parallel_record_within_budget(
+            &prepared,
+            &skip,
+            size,
+            7 << 20
+        ));
+        assert!(parallel_record_within_budget(
+            &prepared,
+            &skip,
+            size,
+            8 << 20
+        ));
+    }
+
+    #[test]
+    fn rewrite_counts_old_plus_new() {
+        let (prepared, skip, dir) = rewrite(2, 1000, &[b'y'; 500]);
+        let size = |e: &prefetch::Entry| blob_len(dir.path(), e);
+        assert!(parallel_record_within_budget(&prepared, &skip, size, 3000));
+        assert!(!parallel_record_within_budget(&prepared, &skip, size, 2999));
+    }
+
+    /// Budget 0 means "never record in parallel", whatever the commit weighs.
+    #[test]
+    fn zero_budget_disables_parallel_record() {
+        let (prepared, skip, dir) = rewrite(1, 1, b"");
+        let size = |e: &prefetch::Entry| blob_len(dir.path(), e);
+        assert!(!parallel_record_within_budget(&prepared, &skip, size, 0));
+        let empty = Skip {
+            touched: set(&[]),
+            unsettled: set(&[]),
+        };
+        assert!(!parallel_record_within_budget(&prepared, &empty, size, 0));
     }
 
     #[test]
