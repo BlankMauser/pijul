@@ -1,0 +1,32 @@
+contrib/git-import-determinism/README.md
+  h_03360edcd9e88f 1-42
+contrib/git-import-determinism/compare.sh
+  h_03360edcd9e88f 1-29
+contrib/git-import-determinism/convert.sh
+  h_03360edcd9e88f 1-52
+contrib/git-import-determinism/corpus.sh
+  h_03360edcd9e88f 1-13
+contrib/git-import-determinism/gitdb-dump/.gitignore
+  h_03360edcd9e88f 1
+contrib/git-import-determinism/gitdb-dump/Cargo.lock
+  h_03360edcd9e88f 1-276
+contrib/git-import-determinism/gitdb-dump/Cargo.toml
+  h_03360edcd9e88f 1-11
+contrib/git-import-determinism/gitdb-dump/src/main.rs
+  h_03360edcd9e88f 1-30
+contrib/git-import-determinism/make_synthetic.sh
+  h_03360edcd9e88f 1-66
+contrib/git-import-determinism/run-all.sh
+  h_03360edcd9e88f 1-15
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "86de107c97dc9bb4e33429cfd7b483b9b7420a20",
+  "prompts": {},
+  "humans": {
+    "h_03360edcd9e88f": {
+      "author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
