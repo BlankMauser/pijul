@@ -1,0 +1,14 @@
+pijul-core/.gitignore
+  h_03360edcd9e88f 1-10
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "aa514eee33012aa84cd930c4e4c5a71152b766bc",
+  "prompts": {},
+  "humans": {
+    "h_03360edcd9e88f": {
+      "author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
