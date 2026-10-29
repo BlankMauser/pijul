@@ -1,0 +1,16 @@
+contrib/git-import-determinism/README.md
+  h_03360edcd9e88f 44-47
+pijul/src/commands/git.rs
+  h_03360edcd9e88f 1134-1137,1145-1146
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9c4d150948f6c328206fc8b68eb5e6ddecaad7b5",
+  "prompts": {},
+  "humans": {
+    "h_03360edcd9e88f": {
+      "author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
