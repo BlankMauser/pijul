@@ -37,6 +37,9 @@ edited / directory / binary renames, deletions, binary add+modify, an exec-bit
 change, a symlink, an empty commit, and a second root merged with
 `--allow-unrelated-histories`.
 
+The fast-path parity gates, regression diagnosis and final measurement are in
+[fast-import-validation.md](fast-import-validation.md).
+
 ## Import fast-path invariants
 
 - Git-unchanged does not mean Pijul-clean. A previous record can leave zombie
