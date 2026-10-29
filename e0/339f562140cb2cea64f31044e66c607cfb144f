@@ -1,0 +1,14 @@
+pijul-core/src/fs.rs
+  h_03360edcd9e88f 878-885,900,902-910,915-916,920-923,952-963
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e0339f562140cb2cea64f31044e66c607cfb144f",
+  "prompts": {},
+  "humans": {
+    "h_03360edcd9e88f": {
+      "author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
