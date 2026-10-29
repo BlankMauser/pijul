@@ -1,0 +1,14 @@
+pijul/tests/git_checkpoint.py
+  h_03360edcd9e88f 1-198
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2825fe2e1e3a3beb6c9c3c331c4463c3097a69b4",
+  "prompts": {},
+  "humans": {
+    "h_03360edcd9e88f": {
+      "author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
