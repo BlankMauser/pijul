@@ -1,0 +1,19 @@
+pijul/tests/git_checkpoint.py
+  s_c0e2bd2477bb03::t_d2006064d8b5cc 10,15,199-238
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c0ed35d98eb0277b7ccfc5d2d577776313906596",
+  "prompts": {},
+  "sessions": {
+    "s_c0e2bd2477bb03": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a18906-b180-7093-8fac-d665985fe5f6",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
