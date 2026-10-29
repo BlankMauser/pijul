@@ -32,6 +32,11 @@ struct OpenRepo {
     n: usize,
     check: usize,
     current_commit: Option<git2::Oid>,
+    /// Per imported commit whose channel is still alive: the paths whose
+    /// contents in that channel may not be settled, i.e. a full diff against
+    /// the commit's own blob could still produce hunks (see `Unsettled`).
+    /// No entry means unknown: the children diff every file.
+    unsettled: std::collections::HashMap<git2::Oid, std::sync::Arc<HashSet<String>>>,
 }
 
 #[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq)]
@@ -102,6 +107,7 @@ impl Git {
             n: 0,
             check: self.check,
             current_commit: None,
+            unsettled: std::collections::HashMap::new(),
         };
         import(&git, &mut env_git, &mut repo, &dag)?;
 
@@ -357,9 +363,16 @@ fn import(
 
                 let mut stats = Stats::new(oid);
                 import_commit_parents(repo, dag, &txn, &channel, &oid, &mut ws, &mut stats)?;
-                let state = import_commit(git, repo, &txn, &channel, &oid, &mut stats)?;
+                let state = import_commit(git, repo, dag, &txn, &channel, &oid, &mut stats)?;
                 save_state(env_git, &oid, state)?;
                 dag.collect_dead_parents(&oid, &mut todo, &txn)?;
+                if let Some(parents) = dag.parents.get(&oid) {
+                    for p in parents {
+                        if todo.refs.get(p) == Some(&0) {
+                            repo.unsettled.remove(p);
+                        }
+                    }
+                }
                 dag.insert_children_in_todo(&oid, &mut todo);
 
                 if let Some(ref mut f) = repo.stats {
@@ -531,7 +544,15 @@ fn git_reset<'a, T: TxnTExt + MutTxnTExt>(
     child: &git2::Oid,
 
     stats: &mut Stats,
-) -> Result<(git2::Object<'a>, BTreeMap<PathBuf, bool>, HashSet<String>), anyhow::Error> {
+) -> Result<
+    (
+        git2::Object<'a>,
+        BTreeMap<PathBuf, bool>,
+        HashSet<String>,
+        Option<HashSet<String>>,
+    ),
+    anyhow::Error,
+> {
     // Reset the Git branch.
 
     debug!("resetting the git branch to {:?}", child);
@@ -543,8 +564,12 @@ fn git_reset<'a, T: TxnTExt + MutTxnTExt>(
 
     let mut prefixes = BTreeMap::new();
     let mut pref = HashSet::new();
+    // Every path (old and new side) of every delta against the parents.
+    let mut touched = HashSet::new();
+    let single_parent;
     {
         let commit = object.as_commit().unwrap();
+        single_parent = commit.parent_count() == 1;
         let new_tree = commit.tree().unwrap();
 
         debug!("inspecting commit");
@@ -562,6 +587,8 @@ fn git_reset<'a, T: TxnTExt + MutTxnTExt>(
             for delta in diff.deltas() {
                 let old_path = delta.old_file().path().unwrap();
                 let new_path = delta.new_file().path().unwrap();
+                touched.insert(old_path.to_string_lossy().into_owned());
+                touched.insert(new_path.to_string_lossy().into_owned());
                 let is_dir = delta.new_file().mode() == git2::FileMode::Tree;
                 match delta.status() {
                     git2::Delta::Renamed => {
@@ -646,7 +673,9 @@ fn git_reset<'a, T: TxnTExt + MutTxnTExt>(
         stats.git_diff_time = git_diff_time.elapsed();
         debug!("record prefixes {:?}", prefixes);
     }
-    Ok((object, prefixes, pref))
+    // Only a single-parent commit can skip diffs (see `Unsettled`).
+    let touched = if single_parent { Some(touched) } else { None };
+    Ok((object, prefixes, pref, touched))
 }
 
 #[derive(Clone)]
@@ -654,6 +683,29 @@ struct Commit<'a> {
     r: &'a git2::Repository,
     c: git2::Commit<'a>,
     pref: HashSet<String>,
+    skip: Option<Skip>,
+    /// Paths `record` asked `known_clean` about and was told to diff.
+    diffed: std::sync::Arc<std::sync::Mutex<HashSet<String>>>,
+}
+
+/// Which files `record` may skip diffing for a single-parent commit.
+///
+/// The commit's channel is a fork of its parent's channel (nothing is applied
+/// on top), and the parent's record diffed each of its files against the
+/// parent's blob. A file is *settled* in a channel when the last diff of it
+/// produced no hunks: the next diff of the same graph against the same blob
+/// produces none either. So a file needs no diff iff Git does not touch it
+/// (`touched`: every old and new path of every delta) and it is settled in
+/// the parent's channel (not in `unsettled`).
+///
+/// "Settled" is not implied by "recorded from the parent's blob": a record
+/// right after a merge can leave zombie lines that the next record of the
+/// same, unchanged file resurrects ("self-healing" hunks), and skipping that
+/// diff would change the change, hence its hash.
+#[derive(Clone)]
+struct Skip {
+    touched: std::sync::Arc<HashSet<String>>,
+    unsettled: std::sync::Arc<HashSet<String>>,
 }
 
 impl<'a> pijul_core::working_copy::WorkingCopyRead for Commit<'a> {
@@ -687,6 +739,24 @@ impl<'a> pijul_core::working_copy::WorkingCopyRead for Commit<'a> {
         Ok(())
     }
 
+    fn known_clean(&self, file: &str) -> bool {
+        let clean = match self.skip {
+            Some(ref skip) => !skip.touched.contains(file) && !skip.unsettled.contains(file),
+            None => false,
+        };
+        if !clean {
+            self.diffed.lock().unwrap().insert(file.to_string());
+        }
+        clean
+    }
+
+    fn file_size(&self, file: &str) -> Result<u64, Self::Error> {
+        // The blob's size from its header, without reading the blob.
+        let entry = self.c.tree()?.get_path(Path::new(file))?;
+        let (size, _) = self.r.odb()?.read_header(entry.id())?;
+        Ok(size as u64)
+    }
+
     fn modified_time(&self, x: &str) -> Result<std::time::SystemTime, Self::Error> {
         if self.pref.contains(x) {
             Ok(std::time::SystemTime::now())
@@ -701,12 +771,24 @@ impl<'a> pijul_core::working_copy::WorkingCopyRead for Commit<'a> {
 fn import_commit<T: TxnTExt + MutTxnTExt + GraphIter + Send + Sync + 'static>(
     git: &git2::Repository,
     repo: &mut OpenRepo,
+    dag: &Dag,
     txn: &ArcTxn<T>,
     channel: &ChannelRef<T>,
     child: &git2::Oid,
     stats: &mut Stats,
 ) -> Result<pijul_core::Merkle, anyhow::Error> {
-    let (object, prefixes, prefstr) = git_reset(git, repo, &txn, &channel, child, stats)?;
+    let (object, prefixes, prefstr, touched) =
+        git_reset(git, repo, &txn, &channel, child, stats)?;
+    let first_parent = dag.parents.get(child).and_then(|p| p.first());
+    let parent_unsettled = first_parent.and_then(|p| repo.unsettled.get(p)).cloned();
+    let skip = match (touched, &parent_unsettled) {
+        (Some(touched), Some(unsettled)) => Some(Skip {
+            touched: std::sync::Arc::new(touched),
+            unsettled: unsettled.clone(),
+        }),
+        _ => None,
+    };
+    let diffed = std::sync::Arc::new(std::sync::Mutex::new(HashSet::new()));
     debug!("prefixes = {:?}", prefixes);
     let mut txn_ = txn.write();
     let mut prefixes_ = BTreeMap::new();
@@ -778,6 +860,8 @@ fn import_commit<T: TxnTExt + MutTxnTExt + GraphIter + Send + Sync + 'static>(
             r: git,
             c: git.find_commit(*child)?,
             pref: prefstr,
+            skip,
+            diffed: diffed.clone(),
         },
         &repo.repo.changes,
         &prefixes_,
@@ -799,7 +883,7 @@ fn import_commit<T: TxnTExt + MutTxnTExt + GraphIter + Send + Sync + 'static>(
         txn.set_current_channel(&name)?;
     }
     let txn = txn.read();
-    let (n_actions, hash, state) = match rec {
+    let (n_actions, hash, state, hunk_paths) = match rec {
         Ok(x) => x,
         Err(pijul_core::LocalApplyError::ChangeAlreadyOnChannel { hash }) => {
             error!("change already on channel: {:?}", hash);
@@ -810,6 +894,28 @@ fn import_commit<T: TxnTExt + MutTxnTExt + GraphIter + Send + Sync + 'static>(
 
     if repo.check > 0 && repo.n % repo.check == 0 {
         check_alive_debug(&repo.repo.changes, &*txn, &channel.read(), line!())?;
+    }
+
+    // Unsettled paths in this commit's channel: those this change has hunks
+    // on (a later diff may still find more, e.g. zombies), plus those still
+    // unsettled in the first parent's channel that this record did not diff.
+    // A full walk diffed every tracked file, so it needs no parent state.
+    let full_walk = prefixes_.is_empty() || prefixes_.contains_key(&PathBuf::new());
+    let base = match parent_unsettled {
+        Some(u) => Some(u),
+        None if full_walk => Some(std::sync::Arc::new(HashSet::new())),
+        None => None,
+    };
+    match (hunk_paths, base) {
+        (Some(mut unsettled), Some(base)) => {
+            let diffed = diffed.lock().unwrap();
+            unsettled.extend(base.iter().filter(|p| !diffed.contains(*p)).cloned());
+            debug!("unsettled after {:?}: {:?}", child, unsettled);
+            repo.unsettled.insert(*child, std::sync::Arc::new(unsettled));
+        }
+        _ => {
+            repo.unsettled.remove(child);
+        }
     }
 
     stats.n_actions = n_actions;
@@ -834,7 +940,15 @@ fn record_apply<
     prefixes: &BTreeMap<PathBuf, bool>,
     header: pijul_core::change::ChangeHeader,
     stats: &mut Stats,
-) -> Result<(usize, Option<pijul_core::Hash>, pijul_core::Merkle), pijul_core::LocalApplyError<T>>
+) -> Result<
+    (
+        usize,
+        Option<pijul_core::Hash>,
+        pijul_core::Merkle,
+        Option<HashSet<String>>,
+    ),
+    pijul_core::LocalApplyError<T>,
+>
 where
     W::Error: 'static,
 {
@@ -879,7 +993,12 @@ where
     let rec = state.finish();
     let mut txn = txn.write();
     if rec.actions.is_empty() {
-        return Ok((0, None, txn.current_state(&channel.read()).map_err(TxnErr)?));
+        return Ok((
+            0,
+            None,
+            txn.current_state(&channel.read()).map_err(TxnErr)?,
+            Some(HashSet::new()),
+        ));
     }
     let actions: Vec<_> = rec
         .actions
@@ -887,6 +1006,22 @@ where
         .map(|rec| rec.globalize(&*txn).unwrap())
         .collect();
     let n = actions.len();
+    // The paths this change has hunks on; `None` if a hunk is not about one
+    // path (roots).
+    let mut hunk_paths = Some(HashSet::new());
+    for a in actions.iter() {
+        match a {
+            pijul_core::change::Hunk::AddRoot { .. } | pijul_core::change::Hunk::DelRoot { .. } => {
+                hunk_paths = None;
+                break;
+            }
+            a => {
+                if let Some(ref mut h) = hunk_paths {
+                    h.insert(a.path().to_string());
+                }
+            }
+        }
+    }
     let (dependencies, extra_known) =
         pijul_core::change::dependencies(&*txn, &channel.read(), actions.iter())?;
     let mut change = pijul_core::change::LocalChange::make_change(
@@ -908,7 +1043,7 @@ where
     let apply_time = std::time::Instant::now();
     let (_, m) = txn.apply_local_change(&channel, &change, &hash, &rec.updatables)?;
     stats.apply_time = apply_time.elapsed();
-    Ok((n, Some(hash), m))
+    Ok((n, Some(hash), m, hunk_paths))
 }
 
 struct Stats {
