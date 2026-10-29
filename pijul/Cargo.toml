@@ -29,6 +29,7 @@ include = [
     "src/commands/file_operations.rs",
     "src/commands/fork.rs",
     "src/commands/git.rs",
+    "src/commands/git_checkpoint.rs",
     "src/commands/git_prefetch.rs",
     "src/commands/hooks.rs",
     "src/commands/http_token.rs",

@@ -49,6 +49,8 @@ The fast-path parity gates, regression diagnosis and final measurement are in
   unlike a fresh addition, they may mutate existing descendants/aliases.
   Merges/resumes full-diff
   until certificates are re-established. Names/metadata are always checked.
+  Certificates are in-memory only: a checkpoint restore (`--import-state-in`)
+  clears them, so no skip is ever trusted across a restore.
 - Parallel `Builder::record` is deterministic across worker counts, but its
   new-file allocation happens before existing-file diffs. This is **not** the
   layout of `record_single_thread` for mixed additions/edits. The importer
@@ -62,6 +64,16 @@ The fast-path parity gates, regression diagnosis and final measurement are in
   object reader; no non-Sync git2 handle is shared unsafely. No blobs are read
   merely to populate a snapshot. Early importer errors disconnect and join the
   producer, including when its result queue is full.
+- Parallel recording is gated by a Git-content size threshold
+  (`PARALLEL_RECORD_BUDGET`, 256 MiB): the sum over the commit's diffed files of
+  old + new blob sizes as Git reports them (an unsettled-only file counts twice
+  its blob). Above it the importer takes the serial path, which produces the
+  same change for these namespace-stable commits. It is a heuristic, **not a
+  hard memory limit**: real memory also depends on diff algorithm state,
+  line-index overhead, worker count and allocator behaviour.
+  `PIJUL_GIT_PARALLEL_BUDGET=<bytes>` overrides it; `0` disables parallel record.
+- Checkpoint capture (`--import-state-out`) happens right after a commit is
+  imported, before its parents' channels are disposed of.
 
 Self-check: the harness was shown to catch a deliberate change (one commit's
 timestamp shifted by 1 s): it reported the commit, its two hashes, and the 13
