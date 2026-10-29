@@ -1,0 +1,16 @@
+pijul/src/commands/git.rs
+  h_03360edcd9e88f 13-15,27-32,44,60-66,115,117-148,168-173,344-346,408-417
+pijul/src/commands/git_checkpoint.rs
+  h_03360edcd9e88f 1-192
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e2bac3011a60adf446e99fcbbbd33ecac781559e",
+  "prompts": {},
+  "humans": {
+    "h_03360edcd9e88f": {
+      "author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
