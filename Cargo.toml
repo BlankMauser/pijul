@@ -84,6 +84,7 @@ rand_chacha = "0.10"
 regex = "1.11"
 reqwest = { version = "0.13", features = ["stream", "json", "query"] }
 rlimit = "0.11"
+rustc-hash = "2.1"
 sanakirja = { version = "2.0.0-beta", default-features = false, features = ["crc32"] }
 serde = { version = "1.0", features = [ "serde_derive" ] }
 serde_derive = "1.0"

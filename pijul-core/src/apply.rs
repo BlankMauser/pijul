@@ -10,9 +10,15 @@ use thiserror::Error;
 mod dead_context;
 mod dead_exits;
 mod descendants;
+mod exits_memo;
+mod scan_memo;
 use dead_context::DeadContext;
 use dead_exits::DeadExits;
 use descendants::Descendants;
+use exits_memo::ExitsMemo;
+use rustc_hash::FxHashSet;
+use scan_memo::ScanMemo;
+use std::hash::BuildHasher;
 pub mod edge;
 pub(crate) use edge::*;
 pub mod vertex;
@@ -644,15 +650,23 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
         is_on_path: false,
     }];
 
-    let mut visited = BTreeSet::new();
+    // Membership only: the DFS order comes from the stack. Sorted afterwards
+    // for `DeadExits`, which wants Vertex order.
+    let mut visited: FxHashSet<Vertex<ChangeId>> = FxHashSet::default();
     let mut descendants = Descendants::default();
+    // Aliveness never changes during the repair (pseudo-edges do not change
+    // it), so the DFS can fill the cache the reduction below reads.
+    let mut dead_context = DeadContext::new(true);
     // `entering[d]` = alive vertices that reach a dead vertex `d` (the
     // `last_alive` of each revisit of `d`). Together with `descendants[d]`
     // (the alive vertices below `d`), this is the bipartite order relation
     // "every entering < every exiting" that the reconnection must preserve.
     // We collect it here and emit its *transitive reduction* after the DFS,
     // instead of materialising the full product on every revisit.
-    let mut entering: BTreeSet<(Vertex<ChangeId>, Vertex<ChangeId>)> = BTreeSet::new();
+    //
+    // Collected unordered, then sorted and deduplicated: the same sequence as
+    // the `BTreeSet` this used to be, without a tree insertion per revisit.
+    let mut entering: Vec<(Vertex<ChangeId>, Vertex<ChangeId>)> = Vec::new();
     // Deferred "reconnect to nearest alive ancestor" edges (the old branches B
     // and C). Like the `entering × exiting` product, a single alive ancestor
     // reconnects to *every* alive vertex below a dead region, which is the
@@ -675,7 +689,7 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
             // after the DFS. (The old code reconnected `last_alive` to every
             // descendant here, which is the transitive *closure* and blows up
             // quadratically when both sides are chains.)
-            entering.insert((elt.vertex, elt.last_alive));
+            entering.push((elt.vertex, elt.last_alive));
             // `elt.is_alive()` (vertex == last_alive) only reflects the vertex's
             // own aliveness on its *first* visit. On a revisit reached through a
             // different path, `last_alive` is an ancestor, so we must test the
@@ -683,7 +697,7 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
             // several alive ancestors only gets reconnected from the first one.
             // Reconnecting it from every such ancestor is fine: the redundant
             // pseudo-edges are pruned at output time.
-            if !is_alive(txn, channel, &elt.vertex)? {
+            if !dead_context.is_alive(txn, channel, elt.vertex)? {
                 continue;
             }
 
@@ -828,36 +842,51 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
     // what this repair did before it reduced anything. The reduction is an
     // optimisation of the *output*, so paying a redundant pseudo-edge is always
     // allowed — paying an unbounded graph walk per applied change is not.
-    let dead_vertices: Vec<Vertex<ChangeId>> = {
-        let mut v: Vec<_> = entering.iter().map(|(d, _)| *d).collect();
-        v.dedup();
-        v
-    };
-    debug!(target: "pijul_core::apply::repair", "DFS complete: {} vertices, {} revisited vertices, {} bridges", visited.len(), dead_vertices.len(), bridges.len());
-    let mut frontiers = if dead_vertices.len() > PROBE_MAX_SET {
-        DeadExits::new(txn, channel, &visited)?
+    //
+    // Nothing below depends on the iteration order of the hash sets: each dead
+    // vertex's probes all run before its insertions, and the insertions of one
+    // dead vertex commute (`reconnected`, the cache invalidations and the
+    // snapshot invalidation are all order-independent).
+    entering.sort_unstable();
+    entering.dedup();
+    let n_dead = entering.chunk_by(|a, b| a.0 == b.0).count();
+    debug!(target: "pijul_core::apply::repair", "DFS complete: {} vertices, {} revisited vertices, {} bridges", visited.len(), n_dead, bridges.len());
+    let mut frontiers = if n_dead > PROBE_MAX_SET {
+        let mut sorted: Vec<_> = visited.iter().copied().collect();
+        sorted.sort_unstable();
+        DeadExits::new(txn, channel, &sorted.into_iter().collect())?
     } else {
         None
     };
+    drop(visited);
     debug!(target: "pijul_core::apply::repair", "frontier snapshot cached={}", frontiers.is_some());
-    let mut reached = HashSet::default();
-    let mut dead_context = DeadContext::new(true);
+    // Without the snapshot, the alive exits of each dead vertex are computed
+    // once (per strongly connected dead component) and shared.
+    let mut exits_memo = ExitsMemo::default();
+    // The minimal-exiting probes go through the same few exit vertices for
+    // many dead vertices: walk from each once.
+    let mut scan_memo = ScanMemo::default();
+    let mut reached = FxHashSet::default();
+    let mut ent: FxHashSet<Vertex<ChangeId>> = FxHashSet::default();
+    let mut exi: FxHashSet<Vertex<ChangeId>> = FxHashSet::default();
+    let mut maximal = Vec::new();
+    let mut non_minimal = FxHashSet::default();
     // Different dead vertices often imply the same bridge. Preserve its first
     // insertion's order, but do not repeat the two pristine writes for it.
-    let mut reconnected = HashSet::default();
-    for d in dead_vertices {
-        let ent: HashSet<Vertex<ChangeId>> = entering
-            .range((d, Vertex::ROOT)..=(d, Vertex::MAX))
-            .map(|(_, l)| *l)
-            .collect();
-        let mut exi: HashSet<Vertex<ChangeId>> = descendants.get(d).into_iter().collect();
+    let mut reconnected = FxHashSet::default();
+    for group in entering.chunk_by(|a, b| a.0 == b.0) {
+        let d = group[0].0;
+        ent.clear();
+        ent.extend(group.iter().map(|(_, l)| *l));
+        exi.clear();
+        exi.extend(descendants.get(d));
         // The DFS only records the alive descendants of the dead vertices on
         // the path when it finds them: a dead vertex whose dead children were
         // already visited gets none, although it leads to theirs.
         if let Some(frontiers) = &frontiers {
             frontiers.extend(d, &mut exi);
         } else {
-            alive_exits_through_dead(txn, channel, d, &mut exi, &mut dead_context)?;
+            exits_memo.extend(txn, channel, d, &mut exi, &mut dead_context)?;
         }
         if exi.is_empty() {
             continue;
@@ -867,7 +896,7 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
         // another entering vertex through alive edges (that other one is
         // closer to the dead region and will carry the bridge). A lone
         // entering vertex — by far the common case — is trivially maximal.
-        let mut maximal = Vec::with_capacity(ent.len());
+        maximal.clear();
         if ent.len() == 1 || ent.len() > PROBE_MAX_SET {
             maximal.extend(ent.iter().copied())
         } else {
@@ -881,10 +910,17 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
         // Minimal exiting: an exiting vertex is redundant if another exiting
         // vertex reaches it (that other one is closer to the dead region).
         // A lone exiting vertex is trivially minimal.
-        let mut non_minimal = HashSet::default();
+        non_minimal.clear();
         if exi.len() > 1 && exi.len() <= PROBE_MAX_SET {
             for &r in exi.iter() {
-                forward_reachable_within(txn, channel, r, &exi, &mut reached, &mut dead_context)?;
+                scan_memo.reachable_within(
+                    txn,
+                    channel,
+                    r,
+                    &exi,
+                    &mut reached,
+                    &mut dead_context,
+                )?;
                 for &x in reached.iter() {
                     non_minimal.insert(x);
                 }
@@ -898,7 +934,13 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
                 }
                 debug!("put_pseudo (reduced) {:?} {:?}", l, r);
                 if put_graph_with_rev(txn, channel, EdgeFlags::PSEUDO, l, r, ChangeId::ROOT)? {
+                    // A walk never expands an alive vertex: only an edge from a
+                    // dead source can change the exits of a dead vertex.
+                    if !dead_context.is_alive(txn, channel, l)? {
+                        exits_memo.clear();
+                    }
                     dead_context.invalidate(l);
+                    scan_memo.invalidate(l);
                     // The initial inode may be used as an ancestor even when
                     // actually dead. Unless its new edge preserves all cached
                     // frontiers, fall back to exact current-graph walks.
@@ -917,7 +959,7 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
     // pair is pushed many times by the DFS (once per path through it): the
     // duplicates would each pay for a probe that the first emission already
     // made redundant, so drop them up front, keeping the DFS's order.
-    let mut emitted = HashSet::default();
+    let mut emitted = FxHashSet::default();
     for (u, v) in bridges {
         if u == v || !emitted.insert((u, v)) {
             continue;
@@ -961,61 +1003,84 @@ fn is_forward_reachable<T: GraphTxnT>(
     if from == to {
         return Ok(true);
     }
-    let mut visited = HashSet::default();
-    visited.insert(from);
-    let mut stack = vec![from];
-    let mut budget = PROBE_BUDGET;
-    while let Some(w) = stack.pop() {
-        if budget == 0 {
-            return Ok(false);
-        }
-        budget -= 1;
-        // Dead vertices order nothing (the alive graph does not have them):
-        // a path through one does not make the reconnection redundant.
-        if w != from && !context.is_alive(txn, channel, w)? {
-            continue;
-        }
-        for &c in context.forward_edges(txn, channel, w)? {
-            if c == to {
-                return Ok(true);
-            }
-            if visited.insert(c) {
-                stack.push(c)
-            }
-        }
+    // The search's first step scans `from`'s children for `to` before it
+    // pushes any of them: when `to` is one, that is the whole search. This is
+    // the common case (the bridge is already in the graph), and it saves the
+    // visited-set insertions of every child scanned before `to`.
+    if context.forward_edges(txn, channel, from)?.contains(&to) {
+        return Ok(true);
     }
-    Ok(false)
+    let mut visited = std::mem::take(&mut context.scratch_visited);
+    let mut stack = std::mem::take(&mut context.scratch_stack);
+    visited.clear();
+    stack.clear();
+    let result = (|| {
+        visited.insert(from);
+        stack.push(from);
+        let mut budget = PROBE_BUDGET;
+        while let Some(w) = stack.pop() {
+            if budget == 0 {
+                return Ok(false);
+            }
+            budget -= 1;
+            // Dead vertices order nothing (the alive graph does not have them):
+            // a path through one does not make the reconnection redundant.
+            if w != from && !context.is_alive(txn, channel, w)? {
+                continue;
+            }
+            for &c in context.forward_edges(txn, channel, w)? {
+                if c == to {
+                    return Ok(true);
+                }
+                if visited.insert(c) {
+                    stack.push(c)
+                }
+            }
+        }
+        Ok(false)
+    })();
+    context.scratch_visited = visited;
+    context.scratch_stack = stack;
+    result
 }
 
 /// Does `from` reach any vertex of `targets` other than itself, over alive
 /// (non-`DELETED`, non-`PARENT`) edges? Stops at the first one: used to decide
 /// whether `from` is maximal, which needs no more than that.
-fn reaches_any_within<T: GraphTxnT>(
+fn reaches_any_within<T: GraphTxnT, S: BuildHasher>(
     txn: &T,
     channel: &T::Graph,
     from: Vertex<ChangeId>,
-    targets: &HashSet<Vertex<ChangeId>>,
+    targets: &std::collections::HashSet<Vertex<ChangeId>, S>,
     context: &mut DeadContext,
 ) -> Result<bool, BlockError<T::GraphError>> {
-    let mut visited = HashSet::default();
-    visited.insert(from);
-    let mut stack = vec![from];
-    let mut budget = PROBE_BUDGET;
-    while let Some(v) = stack.pop() {
-        if budget == 0 {
-            return Ok(false);
-        }
-        budget -= 1;
-        for &c in context.forward_edges(txn, channel, v)? {
-            if c != from && targets.contains(&c) {
-                return Ok(true);
+    let mut visited = std::mem::take(&mut context.scratch_visited);
+    let mut stack = std::mem::take(&mut context.scratch_stack);
+    visited.clear();
+    stack.clear();
+    let result = (|| {
+        visited.insert(from);
+        stack.push(from);
+        let mut budget = PROBE_BUDGET;
+        while let Some(v) = stack.pop() {
+            if budget == 0 {
+                return Ok(false);
             }
-            if visited.insert(c) {
-                stack.push(c)
+            budget -= 1;
+            for &c in context.forward_edges(txn, channel, v)? {
+                if c != from && targets.contains(&c) {
+                    return Ok(true);
+                }
+                if visited.insert(c) {
+                    stack.push(c)
+                }
             }
         }
-    }
-    Ok(false)
+        Ok(false)
+    })();
+    context.scratch_visited = visited;
+    context.scratch_stack = stack;
+    result
 }
 
 /// Forward BFS from `from` over alive (non-`DELETED`, non-`PARENT`) edges,
@@ -1023,51 +1088,61 @@ fn reaches_any_within<T: GraphTxnT>(
 /// itself). Used to compute maximal/minimal elements of a set in the alive
 /// partial order. Stops once every target is accounted for, or the budget runs
 /// out — a short answer only leaves extra pseudo-edges behind.
-fn forward_reachable_within<T: GraphTxnT>(
+#[cfg(test)]
+fn forward_reachable_within<T: GraphTxnT, S: BuildHasher, S2: BuildHasher>(
     txn: &T,
     channel: &T::Graph,
     from: Vertex<ChangeId>,
-    targets: &HashSet<Vertex<ChangeId>>,
-    out: &mut HashSet<Vertex<ChangeId>>,
+    targets: &std::collections::HashSet<Vertex<ChangeId>, S>,
+    out: &mut std::collections::HashSet<Vertex<ChangeId>, S2>,
     context: &mut DeadContext,
 ) -> Result<(), BlockError<T::GraphError>> {
     out.clear();
     let max_hits = targets.len() - usize::from(targets.contains(&from));
-    let mut visited = HashSet::default();
-    visited.insert(from);
-    let mut stack = vec![from];
-    let mut budget = PROBE_BUDGET;
-    while let Some(v) = stack.pop() {
-        if budget == 0 {
-            return Ok(());
-        }
-        budget -= 1;
-        // As in `is_forward_reachable`, do not go through dead vertices.
-        if v != from && !context.is_alive(txn, channel, v)? {
-            continue;
-        }
-        for &c in context.forward_edges(txn, channel, v)? {
-            if c != from && targets.contains(&c) {
-                out.insert(c);
-                if out.len() >= max_hits {
-                    return Ok(());
+    let mut visited = std::mem::take(&mut context.scratch_visited);
+    let mut stack = std::mem::take(&mut context.scratch_stack);
+    visited.clear();
+    stack.clear();
+    let result = (|| {
+        visited.insert(from);
+        stack.push(from);
+        let mut budget = PROBE_BUDGET;
+        while let Some(v) = stack.pop() {
+            if budget == 0 {
+                return Ok(());
+            }
+            budget -= 1;
+            // As in `is_forward_reachable`, do not go through dead vertices.
+            if v != from && !context.is_alive(txn, channel, v)? {
+                continue;
+            }
+            for &c in context.forward_edges(txn, channel, v)? {
+                if c != from && targets.contains(&c) {
+                    out.insert(c);
+                    if out.len() >= max_hits {
+                        return Ok(());
+                    }
+                }
+                if visited.insert(c) {
+                    stack.push(c)
                 }
             }
-            if visited.insert(c) {
-                stack.push(c)
-            }
         }
-    }
-    Ok(())
+        Ok(())
+    })();
+    context.scratch_visited = visited;
+    context.scratch_stack = stack;
+    result
 }
 
 /// Adds to `out` the first alive vertices below the dead vertex `d`, going
 /// through dead vertices only (along any non-`PARENT` edge, deleted or not).
-fn alive_exits_through_dead<T: GraphTxnT>(
+#[cfg(test)]
+fn alive_exits_through_dead<T: GraphTxnT, S: BuildHasher>(
     txn: &T,
     channel: &T::Graph,
     d: Vertex<ChangeId>,
-    out: &mut HashSet<Vertex<ChangeId>>,
+    out: &mut std::collections::HashSet<Vertex<ChangeId>, S>,
     context: &mut DeadContext,
 ) -> Result<(), BlockError<T::GraphError>> {
     // `entering` also holds revisited alive vertices, whose reconnection is not
@@ -1173,11 +1248,11 @@ pub(crate) fn clean_unjustified_pseudo_edges<T: GraphMutTxnT + TreeTxnT>(
     inodes: &HashSet<Position<ChangeId>>,
 ) -> Result<(), LocalApplyError<T>> {
     let mut stack = Vec::new();
-    let mut visited = HashSet::default();
+    let mut visited = FxHashSet::default();
     let mut jstack = Vec::new();
-    let mut jvisited = HashSet::default();
+    let mut jvisited = FxHashSet::default();
     let mut context = DeadContext::new(false);
-    let mut targets = HashSet::default();
+    let mut targets = FxHashSet::default();
     let mut candidates = Vec::new();
     let mut del = Vec::new();
     for root in inodes.iter() {
@@ -1240,13 +1315,13 @@ pub(crate) fn clean_unjustified_pseudo_edges<T: GraphMutTxnT + TreeTxnT>(
 // and visitation, just as the single-target search does (including cycles and
 // dead targets). Never truncate this search: an incomplete answer deletes
 // justified edges and changes the graph's order.
-fn retain_unjustified_pseudo_targets<T: GraphTxnT>(
+fn retain_unjustified_pseudo_targets<T: GraphTxnT, S: BuildHasher, S2: BuildHasher>(
     txn: &T,
     channel: &T::Graph,
     from: Vertex<ChangeId>,
-    targets: &mut HashSet<Vertex<ChangeId>>,
+    targets: &mut std::collections::HashSet<Vertex<ChangeId>, S>,
     stack: &mut Vec<Vertex<ChangeId>>,
-    visited: &mut HashSet<Vertex<ChangeId>>,
+    visited: &mut std::collections::HashSet<Vertex<ChangeId>, S2>,
     context: &mut DeadContext,
 ) -> Result<(), BlockError<T::GraphError>> {
     if targets.is_empty() {

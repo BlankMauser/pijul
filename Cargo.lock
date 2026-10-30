@@ -2373,6 +2373,7 @@ dependencies = [
  "rand 0.10.2",
  "rand_chacha 0.10.0",
  "regex",
+ "rustc-hash",
  "sanakirja",
  "serde",
  "serde_derive",

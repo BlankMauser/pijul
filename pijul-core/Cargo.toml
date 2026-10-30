@@ -151,6 +151,7 @@ nom.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
 regex.workspace = true
+rustc-hash.workspace = true
 sanakirja.workspace = true
 serde_derive.workspace = true
 serde_json.workspace = true

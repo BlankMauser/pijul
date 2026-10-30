@@ -241,7 +241,7 @@ fn clean_pseudo_fan_over_long_deleted_region() -> Result<(), anyhow::Error> {
         let budget = 4 * n as usize + 8;
         assert!(counted.reads.get() > 8 * budget);
         counted.reads.set(0);
-        let mut targets = (n + 1..=2 * n + 1).map(vertex).collect();
+        let mut targets: HashSet<_> = (n + 1..=2 * n + 1).map(vertex).collect();
         retain_unjustified_pseudo_targets(
             &counted,
             graph,
@@ -595,5 +595,257 @@ fn frontier_snapshot_matches_walks_and_invalidates_dead_sources() -> Result<(), 
     let mut snapshot = DeadExits::new(&txn, graph, &vertices)?;
     DeadExits::invalidate_after_insert(&mut snapshot, vertex(1), vertex(999));
     assert!(snapshot.is_none());
+    Ok(())
+}
+
+/// Tiny deterministic generator, so the randomized graphs below are the same
+/// on every run.
+struct Lcg(u64);
+impl Lcg {
+    fn next(&mut self, n: u64) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (self.0 >> 33) % n
+    }
+}
+
+/// A random graph of `n` vertices below the root: a random spanning tree of
+/// alive and deleted edges, then `extra` random edges (cycles included) that
+/// are alive, deleted or pseudo.
+fn random_graph<T: GraphMutTxnT>(
+    txn: &mut T,
+    graph: &mut T::Graph,
+    rng: &mut Lcg,
+    n: u64,
+    extra: u64,
+) -> Result<(), anyhow::Error> {
+    let real = ChangeId(L64(42));
+    let deleted = EdgeFlags::BLOCK | EdgeFlags::DELETED;
+    let pick = |rng: &mut Lcg| match rng.next(3) {
+        0 => EdgeFlags::BLOCK,
+        1 => deleted,
+        _ => EdgeFlags::PSEUDO,
+    };
+    for i in 1..=n {
+        let p = rng.next(i);
+        let from = if p == 0 { Vertex::ROOT } else { vertex(p) };
+        let flags = if rng.next(2) == 0 {
+            EdgeFlags::BLOCK
+        } else {
+            deleted
+        };
+        put_graph_with_rev(txn, graph, flags, from, vertex(i), real)?;
+    }
+    for _ in 0..extra {
+        let (a, b) = (1 + rng.next(n), 1 + rng.next(n));
+        if a == b {
+            continue;
+        }
+        let flags = pick(rng);
+        let intro = if flags.contains(EdgeFlags::PSEUDO) {
+            ChangeId::ROOT
+        } else {
+            real
+        };
+        put_graph_with_rev(txn, graph, flags, vertex(a), vertex(b), intro)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn exits_memo_matches_walks_on_random_graphs() -> Result<(), anyhow::Error> {
+    for seed in 0..40u64 {
+        let env = sanakirja::Pristine::new_anon()?;
+        let mut txn = env.mut_txn_begin()?;
+        let channel =
+            txn.open_or_create_channel(&crate::small_string::SmallString::from_str("test"))?;
+        let mut channel = channel.write();
+        let graph = &mut *channel;
+        let mut rng = Lcg(seed);
+        let n = 30 + rng.next(60);
+        random_graph(&mut txn, graph, &mut rng, n, 2 * n)?;
+        let mut memo = ExitsMemo::default();
+        let mut context = DeadContext::new(true);
+        for round in 0..4 {
+            for i in (0..=n).rev() {
+                let v = if i == 0 { Vertex::ROOT } else { vertex(i) };
+                let mut walked = HashSet::default();
+                alive_exits_through_dead(&txn, graph, v, &mut walked, &mut DeadContext::new(true))?;
+                let mut cached = FxHashSet::default();
+                memo.extend(&txn, graph, v, &mut cached, &mut context)?;
+                assert_eq!(
+                    cached
+                        .iter()
+                        .copied()
+                        .collect::<std::collections::BTreeSet<_>>(),
+                    walked.iter().copied().collect(),
+                    "seed {seed} round {round} vertex {v:?}"
+                );
+            }
+            // Insert pseudo-edges as the repair does, with its invalidation.
+            for _ in 0..3 {
+                let (a, b) = (1 + rng.next(n), 1 + rng.next(n));
+                if a == b {
+                    continue;
+                }
+                if put_graph_with_rev(
+                    &mut txn,
+                    graph,
+                    EdgeFlags::PSEUDO,
+                    vertex(a),
+                    vertex(b),
+                    ChangeId::ROOT,
+                )? {
+                    if !context.is_alive(&txn, graph, vertex(a))? {
+                        memo.clear();
+                    }
+                    context.invalidate(vertex(a));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn scan_memo_matches_bounded_probes() -> Result<(), anyhow::Error> {
+    for seed in 0..12u64 {
+        let env = sanakirja::Pristine::new_anon()?;
+        let mut txn = env.mut_txn_begin()?;
+        let channel =
+            txn.open_or_create_channel(&crate::small_string::SmallString::from_str("test"))?;
+        let mut channel = channel.write();
+        let graph = &mut *channel;
+        let mut rng = Lcg(1000 + seed);
+        // Large enough for the probes to run out of budget.
+        let n = 2 * PROBE_BUDGET as u64 + rng.next(200);
+        random_graph(&mut txn, graph, &mut rng, n, n / 2)?;
+        let mut memo = ScanMemo::default();
+        let mut context = DeadContext::new(true);
+        for round in 0..6 {
+            for _ in 0..60 {
+                let from = vertex(1 + rng.next(n));
+                let mut targets: HashSet<_> = HashSet::default();
+                for _ in 0..1 + rng.next(8) {
+                    targets.insert(vertex(1 + rng.next(n)));
+                }
+                if rng.next(4) == 0 {
+                    targets.insert(from);
+                }
+                let mut direct = HashSet::default();
+                forward_reachable_within(
+                    &txn,
+                    graph,
+                    from,
+                    &targets,
+                    &mut direct,
+                    &mut DeadContext::new(true),
+                )?;
+                let mut cached = HashSet::default();
+                memo.reachable_within(&txn, graph, from, &targets, &mut cached, &mut context)?;
+                assert_eq!(cached, direct, "seed {seed} round {round} from {from:?}");
+            }
+            for _ in 0..5 {
+                let (a, b) = (1 + rng.next(n), 1 + rng.next(n));
+                if a == b {
+                    continue;
+                }
+                if put_graph_with_rev(
+                    &mut txn,
+                    graph,
+                    EdgeFlags::PSEUDO,
+                    vertex(a),
+                    vertex(b),
+                    ChangeId::ROOT,
+                )? {
+                    context.invalidate(vertex(a));
+                    memo.invalidate(vertex(a));
+                }
+            }
+            // An edge from a walk's own source changes that walk's answer.
+            for _ in 0..5 {
+                let (a, b) = (vertex(1 + rng.next(n)), vertex(1 + rng.next(n)));
+                if a == b {
+                    continue;
+                }
+                let targets: HashSet<_> = [b].into_iter().collect();
+                let mut before = HashSet::default();
+                memo.reachable_within(&txn, graph, a, &targets, &mut before, &mut context)?;
+                if put_graph_with_rev(&mut txn, graph, EdgeFlags::PSEUDO, a, b, ChangeId::ROOT)? {
+                    context.invalidate(a);
+                    memo.invalidate(a);
+                }
+                let mut after = HashSet::default();
+                memo.reachable_within(&txn, graph, a, &targets, &mut after, &mut context)?;
+                assert_eq!(after, targets, "seed {seed} new edge {a:?} -> {b:?}");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn direct_child_shortcut_answers_like_the_search() -> Result<(), anyhow::Error> {
+    for seed in 0..20u64 {
+        let env = sanakirja::Pristine::new_anon()?;
+        let mut txn = env.mut_txn_begin()?;
+        let channel =
+            txn.open_or_create_channel(&crate::small_string::SmallString::from_str("test"))?;
+        let mut channel = channel.write();
+        let graph = &mut *channel;
+        let mut rng = Lcg(5000 + seed);
+        let n = 40 + rng.next(80);
+        random_graph(&mut txn, graph, &mut rng, n, 3 * n)?;
+        let mut context = DeadContext::new(true);
+        for a in 1..=n {
+            for b in 1..=n {
+                let (a, b) = (vertex(a), vertex(b));
+                // The search this shortcut stands for, written out in full.
+                let expected = a == b || {
+                    let mut visited = HashSet::default();
+                    visited.insert(a);
+                    let mut stack = vec![a];
+                    let mut budget = PROBE_BUDGET;
+                    let mut found = false;
+                    'search: while let Some(w) = stack.pop() {
+                        if budget == 0 {
+                            break;
+                        }
+                        budget -= 1;
+                        if w != a && !is_alive(&txn, graph, &w)? {
+                            continue;
+                        }
+                        let mut children = Vec::new();
+                        for e in iter_adjacent(
+                            &txn,
+                            graph,
+                            w,
+                            EdgeFlags::empty(),
+                            EdgeFlags::all() - EdgeFlags::DELETED - EdgeFlags::PARENT,
+                        )? {
+                            children.push(*txn.find_block(graph, e?.dest())?);
+                        }
+                        for c in children {
+                            if c == b {
+                                found = true;
+                                break 'search;
+                            }
+                            if visited.insert(c) {
+                                stack.push(c)
+                            }
+                        }
+                    }
+                    found
+                };
+                assert_eq!(
+                    is_forward_reachable(&txn, graph, a, b, &mut context)?,
+                    expected,
+                    "seed {seed} {a:?} -> {b:?}"
+                );
+            }
+        }
+    }
     Ok(())
 }

@@ -4,8 +4,8 @@
 //! deletions until after all searches. Zombie repair invalidates the source
 //! adjacency whenever it inserts a pseudo-edge. Pseudo-edges never change real
 //! aliveness, so the aliveness cache remains valid in both phases.
-use crate::HashMap;
 use crate::pristine::*;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet};
 
 type Neighbour = (Vertex<ChangeId>, bool);
 type Neighbours = Vec<Neighbour>;
@@ -15,6 +15,11 @@ pub(super) struct DeadContext {
     alive: HashMap<Vertex<ChangeId>, bool>,
     edges: HashMap<Vertex<ChangeId>, Neighbours>,
     forward: HashMap<Vertex<ChangeId>, Vec<Vertex<ChangeId>>>,
+    /// Scratch buffers reused by the probes and walks that take this context,
+    /// so that each probe does not allocate (and grow) a fresh set. They hold
+    /// no state between calls: every user clears them first.
+    pub(super) scratch_visited: FxHashSet<Vertex<ChangeId>>,
+    pub(super) scratch_stack: Vec<Vertex<ChangeId>>,
 }
 
 impl DeadContext {
@@ -24,6 +29,8 @@ impl DeadContext {
             alive: HashMap::default(),
             edges: HashMap::default(),
             forward: HashMap::default(),
+            scratch_visited: FxHashSet::default(),
+            scratch_stack: Vec::new(),
         }
     }
 

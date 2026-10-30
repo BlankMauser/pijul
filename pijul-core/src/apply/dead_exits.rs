@@ -6,8 +6,10 @@
 //! discards the snapshot if an inserted edge could extend a dead frontier.
 //! An edge whose destination frontier is already covered changes no snapshot.
 use crate::pristine::*;
-use crate::{HashMap, HashSet};
+use rustc_hash::FxHashMap as HashMap;
+use std::collections::HashSet;
 use std::collections::{BTreeSet, VecDeque};
+use std::hash::BuildHasher;
 
 pub(super) struct DeadExits {
     dead: HashMap<Vertex<ChangeId>, usize>,
@@ -109,7 +111,11 @@ impl DeadExits {
         }
     }
 
-    pub(super) fn extend(&self, d: Vertex<ChangeId>, out: &mut HashSet<Vertex<ChangeId>>) {
+    pub(super) fn extend<S: BuildHasher>(
+        &self,
+        d: Vertex<ChangeId>,
+        out: &mut HashSet<Vertex<ChangeId>, S>,
+    ) {
         if let Some(&i) = self.dead.get(&d) {
             for (word, &bits) in self.exits[i].iter().enumerate() {
                 let mut bits = bits;

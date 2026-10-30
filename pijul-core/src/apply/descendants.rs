@@ -4,8 +4,8 @@
 //! quadratic in *allocated* memory (millions of 48-byte keys). Sparse words
 //! retain every pair without allocating a dense dead-by-alive matrix. Queries
 //! restore Vertex order, matching the old BTreeSet range iteration exactly.
-use crate::HashMap;
 use crate::pristine::{ChangeId, Vertex};
+use rustc_hash::FxHashMap as HashMap;
 use std::collections::BTreeMap;
 
 #[derive(Default)]
