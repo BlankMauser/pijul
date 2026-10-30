@@ -24,8 +24,14 @@ use std::rc::Rc;
 type Exits = Rc<[Vertex<ChangeId>]>;
 
 /// Budget, in vertices, for the stored answers plus the union being built.
-/// The budget is checked before each union is allocated, so the memo never
-/// holds more than this. A computation that would exceed it stops, and
+/// The budget is checked before each union is allocated, so the retained and
+/// accounted vertex payload never exceeds this (about 192 MiB by default,
+/// before overhead). It is not a total-memory cap: the traversal buffers
+/// (`index`, `vertices`, `low`, `scc_stack`, `calls`), the adjacency
+/// copies (`children` per frame, `alive`, `below`) and the direct-child
+/// collection (`direct`, `parts`) are allocated before the check and are
+/// not counted. `peak()` reports this accounting, not actual allocation.
+/// A computation that would exceed it stops, and
 /// the query falls back to the exact walk instead: dropping or never storing
 /// answers only costs recomputing them, never reachability.
 const MAX_STORED: usize = 1 << 23;
