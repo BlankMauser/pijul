@@ -1,0 +1,22 @@
+contrib/git-import-determinism/README.md
+  h_03360edcd9e88f 52-53,67-76
+pijul/Cargo.toml
+  h_03360edcd9e88f 32
+pijul/src/commands/git.rs
+  h_03360edcd9e88f 13-14,29-34,52,68-74,134,136-171,191-196,396-398,463-472,766-767
+pijul/src/commands/git_checkpoint.rs
+  h_03360edcd9e88f 1-218
+pijul/tests/git_checkpoint.py
+  h_03360edcd9e88f 1-240
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "eff55b4bb46839b83413da077c50f00b535828c8",
+  "prompts": {},
+  "humans": {
+    "h_03360edcd9e88f": {
+      "author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}

@@ -1,0 +1,24 @@
+contrib/git-import-determinism/README.md
+  h_03360edcd9e88f 40-60
+contrib/git-import-determinism/make_synthetic.sh
+  h_03360edcd9e88f 65-70
+pijul-core/src/record.rs
+  h_03360edcd9e88f 1561-1564
+pijul/Cargo.toml
+  h_03360edcd9e88f 32
+pijul/src/commands/git.rs
+  h_03360edcd9e88f 13-15,38,114-116,248,293-321,367,401,404-405,584,608,611,614-616,619-620,667,686-687,689,698-700,748-756,761-762,766,779-781,800-801,816,824,827-828,838-845,915-916,934,986,988-990,999,1015-1050,1058-1085,1089-1116,1301-1322
+pijul/src/commands/git_prefetch.rs
+  h_03360edcd9e88f 1-166
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0ceb2964ca62f6385d9c5877b4f235023d87cdf9",
+  "prompts": {},
+  "humans": {
+    "h_03360edcd9e88f": {
+      "author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}

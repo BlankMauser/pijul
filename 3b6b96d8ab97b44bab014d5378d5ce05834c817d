@@ -1,0 +1,16 @@
+pijul/src/commands/git.rs
+  h_03360edcd9e88f 697-702,712-721,726-728,730-743,905-906,1391-1392,1394,1396-1397,1399,1402-1408,1410-1411,1414-1415,1417-1418,1425-1515
+pijul/src/commands/git_prefetch.rs
+  h_03360edcd9e88f 21-24,75-82,90-91
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3b6b96d8ab97b44bab014d5378d5ce05834c817d",
+  "prompts": {},
+  "humans": {
+    "h_03360edcd9e88f": {
+      "author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}

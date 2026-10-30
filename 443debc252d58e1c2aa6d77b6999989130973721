@@ -1,0 +1,18 @@
+pijul-core/src/record.rs
+  h_03360edcd9e88f 1561-1574
+pijul-core/src/working_copy/mod.rs
+  h_03360edcd9e88f 20-26
+pijul/src/commands/git.rs
+  h_03360edcd9e88f 35-39,110,366,369-375,547-555,567-569,572,590-591,676-678,686-708,742-759,774,780-791,863-864,886,899-920,943-951,996-1001,1009-1024,1046
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "443debc252d58e1c2aa6d77b6999989130973721",
+  "prompts": {},
+  "humans": {
+    "h_03360edcd9e88f": {
+      "author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}

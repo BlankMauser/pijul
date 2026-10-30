@@ -1,0 +1,58 @@
+.ignore
+  h_03360edcd9e88f 7
+CHANGELOG.md
+  h_03360edcd9e88f 22-25
+pijul-core/src/apply.rs
+  h_03360edcd9e88f 316-321,429,440-442,492-494,937-938,943,1023-1024,1028,1043-1046,1086
+pijul-core/src/change/printable.rs
+  h_03360edcd9e88f 613-618,643
+pijul-core/src/change/text_changes.rs
+  h_03360edcd9e88f 22-26,843,886,1130-1143
+pijul-core/src/diff/replace.rs
+  h_03360edcd9e88f 115-119
+pijul-core/src/output/working_copy.rs
+  h_03360edcd9e88f 86-92,97,115-120,135,859,1023-1093
+pijul-core/src/pristine/mod.rs
+  h_03360edcd9e88f 2447-2502
+pijul-core/src/record.rs
+  h_03360edcd9e88f 147-176,266,305,1267-1271
+pijul-core/src/tests/filesystem.rs
+  h_03360edcd9e88f 56-177
+pijul-core/src/tests/mod.rs
+  h_03360edcd9e88f 31
+pijul-core/src/tests/text_roundtrip.rs
+  h_03360edcd9e88f 1-210
+pijul-core/src/tests/unrecord.rs
+  h_03360edcd9e88f 1505
+pijul-core/src/unrecord/mod.rs
+  h_03360edcd9e88f 96-97
+pijul-remote/src/lib.rs
+  h_03360edcd9e88f 613,658
+pijul-remote/src/local.rs
+  h_03360edcd9e88f 325
+pijul/src/commands/apply.rs
+  h_03360edcd9e88f 79-85,101-108,117-130,168,177
+pijul/src/commands/clone.rs
+  h_03360edcd9e88f 117-119,121,134,305
+pijul/src/commands/diff.rs
+  h_03360edcd9e88f 114-119,311-314
+pijul/src/commands/pushpull.rs
+  h_03360edcd9e88f 1223-1225
+pijul/src/commands/record.rs
+  h_03360edcd9e88f 45-49,72-93,718-730
+pijul/src/commands/reset.rs
+  h_03360edcd9e88f 133,168-171,201,230
+pijul/src/commands/unrecord.rs
+  h_03360edcd9e88f 37
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a572755e6f48a45cb6addb1fbf41482452bdc3ca",
+  "prompts": {},
+  "humans": {
+    "h_03360edcd9e88f": {
+      "author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
