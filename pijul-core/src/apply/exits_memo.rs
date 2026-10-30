@@ -23,14 +23,28 @@ use std::rc::Rc;
 
 type Exits = Rc<[Vertex<ChangeId>]>;
 
-/// Stored answers beyond which the memo starts over. Dropping answers only
-/// costs recomputing them.
+/// Budget, in vertices, for the stored answers plus the union being built.
+/// The budget is checked before each union is allocated, so the memo never
+/// holds more than this. A computation that would exceed it stops, and
+/// the query falls back to the exact walk instead: dropping or never storing
+/// answers only costs recomputing them, never reachability.
 const MAX_STORED: usize = 1 << 23;
 
-#[derive(Default)]
 pub(super) struct ExitsMemo {
     done: FxHashMap<Vertex<ChangeId>, Exits>,
     stored: usize,
+    budget: usize,
+    /// Highest `stored` plus union in flight seen, for the tests.
+    peak: usize,
+    /// A computation from an empty memo did not fit: answer uncached queries
+    /// with the walk until the next `clear`.
+    full: bool,
+}
+
+impl Default for ExitsMemo {
+    fn default() -> Self {
+        Self::with_budget(MAX_STORED)
+    }
 }
 
 struct Frame {
@@ -40,9 +54,37 @@ struct Frame {
 }
 
 impl ExitsMemo {
+    pub(super) fn with_budget(budget: usize) -> Self {
+        ExitsMemo {
+            done: FxHashMap::default(),
+            stored: 0,
+            budget,
+            peak: 0,
+            full: false,
+        }
+    }
+
+    /// Vertices held by the distinct stored answers, counted independently
+    /// of the memo's own accounting.
+    #[cfg(test)]
+    pub(super) fn stored_elements(&self) -> usize {
+        let mut seen = HashSet::new();
+        self.done
+            .values()
+            .filter(|e| seen.insert(Rc::as_ptr(e) as *const Vertex<ChangeId>))
+            .map(|e| e.len())
+            .sum()
+    }
+
+    #[cfg(test)]
+    pub(super) fn peak(&self) -> usize {
+        self.peak
+    }
+
     pub(super) fn clear(&mut self) {
         self.done.clear();
         self.stored = 0;
+        self.full = false;
     }
 
     /// Adds to `out` the first alive vertices below the dead vertex `d`, going
@@ -59,24 +101,34 @@ impl ExitsMemo {
             return Ok(());
         }
         if !self.done.contains_key(&d) {
-            if self.stored > MAX_STORED {
+            let mut fits = !self.full && self.compute(txn, channel, d, context)?;
+            if !fits && !self.full && self.stored > 0 {
+                // Earlier answers took the room: start over once.
                 self.clear();
+                fits = self.compute(txn, channel, d, context)?;
             }
-            self.compute(txn, channel, d, context)?;
+            if !fits {
+                // Even alone, the answers below `d` do not fit: walk.
+                self.full = true;
+                return super::alive_exits_through_dead(txn, channel, d, out, context);
+            }
         }
         out.extend(self.done[&d].iter().copied());
         Ok(())
     }
 
     /// Iterative Tarjan over the dead vertices reachable from the dead `d`
-    /// through dead vertices, skipping components already answered.
+    /// through dead vertices, skipping components already answered. Returns
+    /// `false`, with `d` unanswered, when storing the answers would exceed the
+    /// budget; the components completed before that keep their (exact)
+    /// answers.
     fn compute<T: GraphTxnT>(
         &mut self,
         txn: &T,
         channel: &T::Graph,
         d: Vertex<ChangeId>,
         context: &mut DeadContext,
-    ) -> Result<(), BlockError<T::GraphError>> {
+    ) -> Result<bool, BlockError<T::GraphError>> {
         let mut index: FxHashMap<Vertex<ChangeId>, usize> = FxHashMap::default();
         let mut vertices = Vec::new();
         let mut low = Vec::new();
@@ -169,6 +221,15 @@ impl ExitsMemo {
                 let exits: Exits = if direct.is_empty() && parts.len() == 1 {
                     parts.pop().unwrap()
                 } else {
+                    // The union is held twice at most (vector, then its
+                    // shared copy): check it fits before building it.
+                    let need = direct.len() + parts.iter().map(|p| p.len()).sum::<usize>();
+                    let in_flight = self.stored.saturating_add(need.saturating_mul(2));
+                    if in_flight > self.budget {
+                        return Ok(false);
+                    }
+                    self.peak = self.peak.max(in_flight);
+                    direct.reserve_exact(need - direct.len());
                     for p in &parts {
                         direct.extend(p.iter().copied());
                     }
@@ -188,6 +249,6 @@ impl ExitsMemo {
                 low[p] = low[p].min(low[idx]);
             }
         }
-        Ok(())
+        Ok(true)
     }
 }

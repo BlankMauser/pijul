@@ -1137,7 +1137,8 @@ fn forward_reachable_within<T: GraphTxnT, S: BuildHasher, S2: BuildHasher>(
 
 /// Adds to `out` the first alive vertices below the dead vertex `d`, going
 /// through dead vertices only (along any non-`PARENT` edge, deleted or not).
-#[cfg(test)]
+/// The exact walk `ExitsMemo` answers like, and falls back to when its
+/// answers do not fit its budget.
 fn alive_exits_through_dead<T: GraphTxnT, S: BuildHasher>(
     txn: &T,
     channel: &T::Graph,

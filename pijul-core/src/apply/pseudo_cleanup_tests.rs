@@ -656,7 +656,9 @@ fn random_graph<T: GraphMutTxnT>(
 
 #[test]
 fn exits_memo_matches_walks_on_random_graphs() -> Result<(), anyhow::Error> {
-    for seed in 0..40u64 {
+    // The default budget, and one small enough to make the memo fall back to
+    // walks part of the time.
+    for (seed, budget) in (0..40u64).flat_map(|s| [(s, None), (s, Some(24))]) {
         let env = sanakirja::Pristine::new_anon()?;
         let mut txn = env.mut_txn_begin()?;
         let channel =
@@ -666,7 +668,7 @@ fn exits_memo_matches_walks_on_random_graphs() -> Result<(), anyhow::Error> {
         let mut rng = Lcg(seed);
         let n = 30 + rng.next(60);
         random_graph(&mut txn, graph, &mut rng, n, 2 * n)?;
-        let mut memo = ExitsMemo::default();
+        let mut memo = budget.map_or_else(ExitsMemo::default, ExitsMemo::with_budget);
         let mut context = DeadContext::new(true);
         for round in 0..4 {
             for i in (0..=n).rev() {
@@ -681,7 +683,7 @@ fn exits_memo_matches_walks_on_random_graphs() -> Result<(), anyhow::Error> {
                         .copied()
                         .collect::<std::collections::BTreeSet<_>>(),
                     walked.iter().copied().collect(),
-                    "seed {seed} round {round} vertex {v:?}"
+                    "seed {seed} budget {budget:?} round {round} vertex {v:?}"
                 );
             }
             // Insert pseudo-edges as the repair does, with its invalidation.
@@ -705,6 +707,72 @@ fn exits_memo_matches_walks_on_random_graphs() -> Result<(), anyhow::Error> {
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// A dead chain D1 -> ... -> Dn where every Di also has its own alive exit Ai:
+/// the exits of Di are {Ai..An}, so storing every suffix takes n²/2 vertices.
+/// The memo must stay within its budget (temporary unions included) and still
+/// give the exact walk's answers.
+#[test]
+fn exits_memo_stays_within_budget_on_chain_with_distinct_exits() -> Result<(), anyhow::Error> {
+    let env = sanakirja::Pristine::new_anon()?;
+    let mut txn = env.mut_txn_begin()?;
+    let channel =
+        txn.open_or_create_channel(&crate::small_string::SmallString::from_str("test"))?;
+    let mut channel = channel.write();
+    let graph = &mut *channel;
+    let real = ChangeId(L64(42));
+    let deleted = EdgeFlags::BLOCK | EdgeFlags::DELETED;
+    let n = 400u64;
+    let dead = |i: u64| vertex(i);
+    let exit = |i: u64| vertex(n + i);
+    put_graph_with_rev(&mut txn, graph, deleted, Vertex::ROOT, dead(1), real)?;
+    for i in 1..=n {
+        if i < n {
+            put_graph_with_rev(&mut txn, graph, deleted, dead(i), dead(i + 1), real)?;
+        }
+        put_graph_with_rev(&mut txn, graph, EdgeFlags::BLOCK, dead(i), exit(i), real)?;
+    }
+    let budget = 8 * n as usize;
+    let mut memo = ExitsMemo::with_budget(budget);
+    let mut context = DeadContext::new(true);
+    // D1 first (the whole chain), then revisits from both ends.
+    let order: Vec<u64> = std::iter::once(1)
+        .chain(1..=n)
+        .chain((1..=n).rev())
+        .collect();
+    for i in order {
+        let mut walked = HashSet::default();
+        alive_exits_through_dead(
+            &txn,
+            graph,
+            dead(i),
+            &mut walked,
+            &mut DeadContext::new(true),
+        )?;
+        assert_eq!(walked.len() as u64, n - i + 1);
+        let mut cached = FxHashSet::default();
+        memo.extend(&txn, graph, dead(i), &mut cached, &mut context)?;
+        assert_eq!(
+            cached
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            walked.iter().copied().collect(),
+            "vertex D{i}"
+        );
+        let stored = memo.stored_elements();
+        assert!(
+            stored <= budget,
+            "D{i}: {stored} stored vertices, budget {budget}"
+        );
+        assert!(
+            memo.peak() <= budget,
+            "D{i}: peak {} > budget {budget}",
+            memo.peak()
+        );
     }
     Ok(())
 }
