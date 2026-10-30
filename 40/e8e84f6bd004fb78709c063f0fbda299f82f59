@@ -1,0 +1,32 @@
+Cargo.lock
+  h_03360edcd9e88f 2376
+Cargo.toml
+  h_03360edcd9e88f 87
+pijul-core/Cargo.toml
+  h_03360edcd9e88f 154
+pijul-core/src/apply.rs
+  h_03360edcd9e88f 13-14,18-21,653-655,657-659,666-669,692,700,845-857,861,863-873,876-882,889,899,913,916-923,937-941,943,962,1006-1023,1025-1037,1040-1044,1050,1054,1057-1067,1069-1076,1079-1083,1091-1092,1096-1097,1102-1112,1114-1128,1131-1135,1140-1141,1145,1251,1253,1255,1318,1322,1324
+pijul-core/src/apply/dead_context.rs
+  h_03360edcd9e88f 8,18-22,32-33
+pijul-core/src/apply/dead_exits.rs
+  h_03360edcd9e88f 9-10,12,114-118
+pijul-core/src/apply/descendants.rs
+  h_03360edcd9e88f 8
+pijul-core/src/apply/exits_memo.rs
+  h_03360edcd9e88f 1-193
+pijul-core/src/apply/pseudo_cleanup_tests.rs
+  h_03360edcd9e88f 244,600-851
+pijul-core/src/apply/scan_memo.rs
+  h_03360edcd9e88f 1-116
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "40e8e84f6bd004fb78709c063f0fbda299f82f59",
+  "prompts": {},
+  "humans": {
+    "h_03360edcd9e88f": {
+      "author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
