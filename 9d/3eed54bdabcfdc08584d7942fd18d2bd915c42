@@ -1,0 +1,18 @@
+pijul-core/src/apply.rs
+  h_03360edcd9e88f 1140-1141
+pijul-core/src/apply/exits_memo.rs
+  h_03360edcd9e88f 26-30,36-47,57-83,87,104-106,108-113,121-124,131,224-232,252
+pijul-core/src/apply/pseudo_cleanup_tests.rs
+  h_03360edcd9e88f 659-661,671,686,714-779
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9d3eed54bdabcfdc08584d7942fd18d2bd915c42",
+  "prompts": {},
+  "humans": {
+    "h_03360edcd9e88f": {
+      "author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
