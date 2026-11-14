@@ -662,6 +662,11 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
     // Membership only: the DFS order comes from the stack. Sorted afterwards
     // for `DeadExits`, which wants Vertex order.
     let mut visited: FxHashSet<Vertex<ChangeId>> = FxHashSet::default();
+    // Every `PSEUDO` edge introduced by `ROOT` (what `put_graph_with_rev`
+    // writes below) of the visited vertices, by source and destination: the
+    // DFS reads all their edges anyway, and the repair only adds edges, each
+    // added here too. `group_inserts_anything` looks pairs up in it.
+    let mut root_pseudo: FxHashSet<(Vertex<ChangeId>, Position<ChangeId>)> = FxHashSet::default();
     let mut descendants = Descendants::default();
     // Aliveness never changes during the repair (pseudo-edges do not change
     // it), so the DFS can fill the cache the reduction below reads.
@@ -782,6 +787,9 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
                 return Ok(());
             }
 
+            if e.flag() == EdgeFlags::PSEUDO && e.introduced_by() == ChangeId::ROOT {
+                root_pseudo.insert((elt.vertex, e.dest()));
+            }
             let child = txn.find_block(channel, e.dest())?;
             if let Some(record) = record.as_mut() {
                 if !e.flag().contains(EdgeFlags::PSEUDO) {
@@ -984,6 +992,7 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
                 channel,
                 &ent,
                 &exi,
+                (&visited, &root_pseudo),
                 &mut missing,
                 &mut scan_memo,
                 &mut dead_context,
@@ -1034,6 +1043,7 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
                 }
                 debug!("put_pseudo (reduced) {:?} {:?}", l, r);
                 if put_graph_with_rev(txn, channel, EdgeFlags::PSEUDO, l, r, ChangeId::ROOT)? {
+                    root_pseudo.insert((l, r.start_pos()));
                     if let Some(h) = hints.as_mut() {
                         h.inserted.push((l, r));
                     }
@@ -1072,6 +1082,7 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
         }
         debug!("put_pseudo (bridge) {:?} {:?}", u, v);
         if put_graph_with_rev(txn, channel, EdgeFlags::PSEUDO, u, v, ChangeId::ROOT)? {
+            root_pseudo.insert((u, v.start_pos()));
             if let Some(h) = hints.as_mut() {
                 h.inserted.push((u, v));
             }
@@ -1130,6 +1141,10 @@ fn group_inserts_anything<T: GraphTxnT, S: BuildHasher, S2: BuildHasher>(
     channel: &T::Graph,
     ent: &std::collections::HashSet<Vertex<ChangeId>, S>,
     exi: &std::collections::HashSet<Vertex<ChangeId>, S2>,
+    (visited, root_pseudo): (
+        &FxHashSet<Vertex<ChangeId>>,
+        &FxHashSet<(Vertex<ChangeId>, Position<ChangeId>)>,
+    ),
     missing: &mut Vec<(Vertex<ChangeId>, Vertex<ChangeId>)>,
     scan_memo: &mut ScanMemo,
     context: &mut DeadContext,
@@ -1140,10 +1155,14 @@ fn group_inserts_anything<T: GraphTxnT, S: BuildHasher, S2: BuildHasher>(
             if l == r {
                 continue;
             }
-            let e = SerializedEdge::new(EdgeFlags::PSEUDO, r.change, r.start, ChangeId::ROOT);
-            match txn.get_graph(channel, &l, Some(&e))? {
-                Some(f) if *f == e => {}
-                _ => missing.push((l, r)),
+            let present = if visited.contains(&l) {
+                root_pseudo.contains(&(l, r.start_pos()))
+            } else {
+                let e = SerializedEdge::new(EdgeFlags::PSEUDO, r.change, r.start, ChangeId::ROOT);
+                matches!(txn.get_graph(channel, &l, Some(&e))?, Some(f) if *f == e)
+            };
+            if !present {
+                missing.push((l, r))
             }
         }
     }
