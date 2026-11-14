@@ -1,0 +1,35 @@
+pijul-core/src/apply.rs
+  s_1c803441e16f97::t_d62a0b10465914 416,418,447,654,726,845,918-925,980-981,1089-1107
+  s_1c803441e16f97::t_a1e2738dea2204 1108
+pijul-core/src/tests/mod.rs
+  s_1c803441e16f97::t_d62a0b10465914 16
+pijul-core/src/tests/incremental_repair.rs
+  s_1c803441e16f97::t_d62a0b10465914 1-260
+pijul-core/src/tests/squash_fuzz.rs
+  s_1c803441e16f97::t_d62a0b10465914 40-43,280,338,809,816-841
+  s_a3b97129423e50::t_991e9d7f88d704 842-843
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "43c9b226d640be8eab22732cd55f6bd4ec026fc3",
+  "prompts": {},
+  "sessions": {
+    "s_1c803441e16f97": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "pi-pocket-pi",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "BlankMauser <thomasluvan@gmail.com>"
+    },
+    "s_a3b97129423e50": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1d9a1-4657-7261-ae24-9d426b33a05f",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
