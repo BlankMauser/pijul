@@ -37,6 +37,10 @@ use std::io::Write;
 type Store = changestore::memory::Memory;
 
 thread_local! {
+    /// When set, every step of the walk appends here a digest of each
+    /// channel's graph (edge by edge) and output (`incremental_repair`).
+    pub(super) static TRACE: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
     /// Check, at every step, that outputting a channel (which deletes the
     /// redundant pseudo-edges it finds) does not change what it outputs next
     /// time. Also set by `FUZZ_CHECK_REDUNDANT`, for a long run.
@@ -273,7 +277,7 @@ fn same_set(a: &[Hash], b: &[Hash]) -> bool {
 
 /// Walk `nsteps` steps of `seed`. With `by_hand_at`, stop at that step (a
 /// squash) and return what [`record_by_hand`] says of it.
-fn fuzz_squash_seed(
+pub(super) fn fuzz_squash_seed(
     seed: u64,
     nsteps: usize,
     verbose: bool,
@@ -331,6 +335,7 @@ fn fuzz_squash_seed(
         log::set_max_level(log::LevelFilter::Off);
     }
     for step in 0..nsteps {
+        trace_step(&txn, &chans, &changes)?;
         if verbose {
             // Steps are logged once done: this tells which one failed.
             eprintln!("[{step}] start");
@@ -801,10 +806,39 @@ fn fuzz_squash_seed(
             }
         }
     }
+    trace_step(&txn, &chans, &changes)?;
     if verbose {
         eprintln!("seed {seed}: {accepted} squashes accepted, {refused} refused");
     }
     Ok(None)
+}
+
+/// Append to `TRACE`, when set, each channel's graph and output.
+fn trace_step<T>(
+    txn: &ArcTxn<T>,
+    chans: &[(ChannelRef<T>, Vec<Hash>)],
+    changes: &Store,
+) -> Result<(), anyhow::Error>
+where
+    T: MutTxnT + crate::pristine::GraphIter + Send + Sync + 'static,
+    T::Channel: Send + Sync,
+{
+    if TRACE.with(|t| t.borrow().is_none()) {
+        return Ok(());
+    }
+    let mut entries = Vec::new();
+    for (ch, _) in chans.iter() {
+        let lines = graph_lines(&*txn.read(), ch);
+        let (out, conflicts) = render(txn, ch, changes)?;
+        entries.push(format!(
+            "{}\n--\n{}\n{} conflicts",
+            lines.join("\n"),
+            String::from_utf8_lossy(&out),
+            conflicts
+        ));
+    }
+    TRACE.with(|t| t.borrow_mut().as_mut().unwrap().extend(entries));
+    Ok(())
 }
 
 /// With `strict`, a squash refused because record is not faithful is an error

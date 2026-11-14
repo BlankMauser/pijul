@@ -413,9 +413,9 @@ fn apply_change_to_channel<
 
     let mut inodes = clean_obsolete_pseudo_edges(txn, T::graph_mut(channel), ws, change_id)?;
     collect_missing_contexts(txn, txn.graph(channel), ws, change, change_id, &mut inodes)?;
-    let mut hints = SweepHints::default();
+    let mut hints = repair_shortcuts().then(SweepHints::default);
     for &i in inodes.iter() {
-        repair_zombies(txn, T::graph_mut(channel), i, None, Some(&mut hints))?;
+        repair_zombies(txn, T::graph_mut(channel), i, None, hints.as_mut())?;
     }
     for &i in inodes.iter() {
         repair_up(txn, T::graph_mut(channel), i)?;
@@ -444,7 +444,7 @@ fn apply_change_to_channel<
             }
         }
     }
-    clean_unjustified_pseudo_edges(txn, T::graph_mut(channel), &inodes, Some(&hints))?;
+    clean_unjustified_pseudo_edges(txn, T::graph_mut(channel), &inodes, hints.as_ref())?;
     forget_touched_stats(txn, change_id)?;
     info!("done applying change");
     Ok((n, merkle))
@@ -651,6 +651,7 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
     mut hints: Option<&mut SweepHints>,
 ) -> Result<(), LocalApplyError<T>> {
     info!("repair_zombies {:?}", root);
+    let shortcuts = repair_shortcuts();
     let mut stack = vec![StackElt {
         vertex: root.inode_vertex(),
         last_alive: root.inode_vertex(),
@@ -722,7 +723,7 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
                         // As below: `v` pushed this copy, and along a
                         // non-deleted edge the bridge would be dropped as
                         // a direct child.
-                        if v.vertex != elt.vertex && !elt.via_alive {
+                        if v.vertex != elt.vertex && !(shortcuts && elt.via_alive) {
                             // We need to reconnect, and we can do it now
                             // since we won't have a chance to visit that
                             // edge (because non-PARENT edge we are
@@ -841,7 +842,7 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
                         // `is_forward_reachable` (edges are only added in
                         // between): do not defer it. Every other copy of
                         // the same pair is dropped the same way.
-                        if stack[len - 1].via_alive {
+                        if shortcuts && stack[len - 1].via_alive {
                             break;
                         }
                         // We need to reconnect, and we can do it now
@@ -914,8 +915,14 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
     // visited vertices. Both answer exactly (the walk's answers, on the
     // current graph), so when and whether the snapshot is built changes only
     // the time taken.
-    let mut pending_snapshot = n_dead > PROBE_MAX_SET;
-    let mut frontiers: Option<DeadExits> = None;
+    let mut pending_snapshot = shortcuts && n_dead > PROBE_MAX_SET;
+    let mut frontiers = if !shortcuts && n_dead > PROBE_MAX_SET {
+        let mut sorted: Vec<_> = visited.iter().copied().collect();
+        sorted.sort_unstable();
+        DeadExits::new(txn, channel, &sorted.into_iter().collect())?
+    } else {
+        None
+    };
     debug!(target: "pijul_core::apply::repair", "frontier snapshot cached={}", frontiers.is_some());
     // Without the snapshot, the alive exits of each dead vertex are computed
     // once (per strongly connected dead component) and shared.
@@ -970,7 +977,8 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
         // colder, never different: they are exact. A later group that
         // reconnects one of these pairs finds it in the graph, as it would
         // have found it in `reconnected`.
-        if ent.len().saturating_mul(exi.len()) <= MAX_PRESENT_CHECK
+        if shortcuts
+            && ent.len().saturating_mul(exi.len()) <= MAX_PRESENT_CHECK
             && !group_inserts_anything(
                 txn,
                 channel,
@@ -1076,6 +1084,26 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: repair without the shortcuts of `repair_shortcuts`, to compare
+    /// the graphs both ways build.
+    pub(crate) static FULL_REPAIR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether `repair_zombies` and the sweep skip the work whose result is
+/// already in the graph (always, outside the tests that compare both ways).
+fn repair_shortcuts() -> bool {
+    #[cfg(test)]
+    {
+        !FULL_REPAIR.get()
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
 }
 
 /// Above this many candidate pairs for one dead vertex, `repair_zombies` does
