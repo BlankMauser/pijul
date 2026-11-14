@@ -1,0 +1,29 @@
+pijul-core/src/apply/scan_memo.rs
+  s_1c803441e16f97::t_3d0393dcfe737f 12-17,20-22,35,41-54,67-68,70-74,83-126,132-133,139-170,175,177-190,192-195
+pijul-core/src/unrecord/mod.rs
+  s_1c803441e16f97::t_3d0393dcfe737f 303,326-332,345
+pijul-core/src/apply/exits_memo.rs
+  s_1c803441e16f97::t_3d0393dcfe737f 90-96
+pijul-core/src/apply.rs
+  s_1c803441e16f97::t_3d0393dcfe737f 19,416,418,447,620-624,651,658,684-686,722-725,754-757,775-776,785-791,804,808-825,838-846,909-918,931,944-949,959-986,1029-1031,1067-1069,1074-1076,1081-1167,1438,1448,1450-1494,1549-1645,1647
+  s_1c803441e16f97::t_2a73dd1a7be80c 1646
+  s_1c803441e16f97::t_9e0d6687d7fa5d 1648
+pijul-core/src/apply/pseudo_cleanup_tests.rs
+  s_1c803441e16f97::t_3d0393dcfe737f 262
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7efba7b7bb03cbf2bfe9e2d4c0dbd2e0781a07ca",
+  "prompts": {},
+  "sessions": {
+    "s_1c803441e16f97": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "pi-pocket-pi",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
