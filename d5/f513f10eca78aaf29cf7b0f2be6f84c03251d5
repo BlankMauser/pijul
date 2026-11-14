@@ -1,0 +1,19 @@
+pijul-core/src/apply.rs
+  s_1c803441e16f97::t_cbc0d0197c2a8f 665-669,790-792,995,1046,1085,1144-1147,1158-1165
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d5f513f10eca78aaf29cf7b0f2be6f84c03251d5",
+  "prompts": {},
+  "sessions": {
+    "s_1c803441e16f97": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "pi-pocket-pi",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
