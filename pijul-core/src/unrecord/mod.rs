@@ -300,7 +300,7 @@ fn unapply<
                 }
             }
             let mut log = crate::apply::ZombieRepairLog::default();
-            crate::apply::repair_zombies(txn, channel, inode, Some((&mut log, change_id)))?;
+            crate::apply::repair_zombies(txn, channel, inode, Some((&mut log, change_id)), None)?;
             remove_leftover_markings(txn, channel, change_id, &log)?;
         }
     }
@@ -323,7 +323,13 @@ fn unapply<
     for &i in inodes.iter() {
         debug!("inodes: repair zombie {:?}", i);
         let mut log = crate::apply::ZombieRepairLog::default();
-        crate::apply::repair_zombies(txn, T::graph_mut(channel), i, Some((&mut log, change_id)))?;
+        crate::apply::repair_zombies(
+            txn,
+            T::graph_mut(channel),
+            i,
+            Some((&mut log, change_id)),
+            None,
+        )?;
         remove_leftover_markings(txn, T::graph_mut(channel), change_id, &log)?;
     }
     crate::apply::repair_cyclic_paths(txn, T::graph_mut(channel), &mut ws.apply)?;
@@ -336,7 +342,7 @@ fn unapply<
             inodes.insert(i);
         }
     }
-    crate::apply::clean_unjustified_pseudo_edges(txn, T::graph_mut(channel), &inodes)?;
+    crate::apply::clean_unjustified_pseudo_edges(txn, T::graph_mut(channel), &inodes, None)?;
     debug!("unapply done");
     Ok(())
 }

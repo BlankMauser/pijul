@@ -87,6 +87,13 @@ impl ExitsMemo {
         self.peak
     }
 
+    /// The memo's own accounting of stored answers (see `MAX_STORED`): how
+    /// much work it has kept so far, used to decide when a `DeadExits`
+    /// snapshot of the whole file is worth building instead.
+    pub(super) fn stored(&self) -> usize {
+        self.stored
+    }
+
     pub(super) fn clear(&mut self) {
         self.done.clear();
         self.stored = 0;

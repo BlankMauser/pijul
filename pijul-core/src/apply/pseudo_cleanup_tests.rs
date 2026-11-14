@@ -259,7 +259,7 @@ fn clean_pseudo_fan_over_long_deleted_region() -> Result<(), anyhow::Error> {
         );
     }
     let inodes = [Vertex::ROOT.start_pos()].into_iter().collect();
-    clean_unjustified_pseudo_edges(&mut txn, graph, &inodes)?;
+    clean_unjustified_pseudo_edges(&mut txn, graph, &inodes, None)?;
     let remaining: HashSet<_> = iter_adjacent(
         &txn,
         graph,
