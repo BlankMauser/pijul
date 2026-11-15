@@ -13,6 +13,7 @@ mod conflict;
 mod diff;
 mod file_conflicts;
 mod filesystem;
+mod incremental_repair;
 mod inode_symmetry;
 mod missing_context;
 mod partial;

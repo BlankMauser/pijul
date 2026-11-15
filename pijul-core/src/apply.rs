@@ -16,7 +16,7 @@ use dead_context::DeadContext;
 use dead_exits::DeadExits;
 use descendants::Descendants;
 use exits_memo::ExitsMemo;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use scan_memo::ScanMemo;
 use std::hash::BuildHasher;
 pub mod edge;
@@ -413,8 +413,9 @@ fn apply_change_to_channel<
 
     let mut inodes = clean_obsolete_pseudo_edges(txn, T::graph_mut(channel), ws, change_id)?;
     collect_missing_contexts(txn, txn.graph(channel), ws, change, change_id, &mut inodes)?;
+    let mut hints = repair_shortcuts().then(SweepHints::default);
     for &i in inodes.iter() {
-        repair_zombies(txn, T::graph_mut(channel), i, None)?;
+        repair_zombies(txn, T::graph_mut(channel), i, None, hints.as_mut())?;
     }
     for &i in inodes.iter() {
         repair_up(txn, T::graph_mut(channel), i)?;
@@ -443,7 +444,7 @@ fn apply_change_to_channel<
             }
         }
     }
-    clean_unjustified_pseudo_edges(txn, T::graph_mut(channel), &inodes)?;
+    clean_unjustified_pseudo_edges(txn, T::graph_mut(channel), &inodes, hints.as_ref())?;
     forget_touched_stats(txn, change_id)?;
     info!("done applying change");
     Ok((n, merkle))
@@ -616,6 +617,11 @@ struct StackElt {
     vertex: Vertex<ChangeId>,
     last_alive: Vertex<ChangeId>,
     is_on_path: bool,
+    /// Pushed along a non-`DELETED` edge by a vertex that is alive (as
+    /// `is_alive` says on its own path element): that vertex is the first
+    /// on-path element below this one, and its forward edges
+    /// (`DeadContext::forward_edges`) contain this one.
+    via_alive: bool,
 }
 
 impl StackElt {
@@ -642,17 +648,25 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
     channel: &mut T::Graph,
     root: Position<ChangeId>,
     mut log: Option<(&mut ZombieRepairLog, ChangeId)>,
+    mut hints: Option<&mut SweepHints>,
 ) -> Result<(), LocalApplyError<T>> {
     info!("repair_zombies {:?}", root);
+    let shortcuts = repair_shortcuts();
     let mut stack = vec![StackElt {
         vertex: root.inode_vertex(),
         last_alive: root.inode_vertex(),
         is_on_path: false,
+        via_alive: false,
     }];
 
     // Membership only: the DFS order comes from the stack. Sorted afterwards
     // for `DeadExits`, which wants Vertex order.
     let mut visited: FxHashSet<Vertex<ChangeId>> = FxHashSet::default();
+    // Every `PSEUDO` edge introduced by `ROOT` (what `put_graph_with_rev`
+    // writes below) of the visited vertices, by source and destination: the
+    // DFS reads all their edges anyway, and the repair only adds edges, each
+    // added here too. `group_inserts_anything` looks pairs up in it.
+    let mut root_pseudo: FxHashSet<(Vertex<ChangeId>, Position<ChangeId>)> = FxHashSet::default();
     let mut descendants = Descendants::default();
     // Aliveness never changes during the repair (pseudo-edges do not change
     // it), so the DFS can fill the cache the reduction below reads.
@@ -673,6 +687,9 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
     // transitive closure; we defer them and emit only those not already made
     // reachable by another reconnection (transitive reduction).
     let mut bridges: Vec<(Vertex<ChangeId>, Vertex<ChangeId>)> = Vec::new();
+    // For `SweepHints`: what the sweep reads of every visited vertex, taken
+    // from the edges the DFS reads anyway.
+    let mut record = hints.as_ref().map(|_| FileHint::default());
 
     while let Some(elt) = stack.pop() {
         debug!("elt {:?}", elt);
@@ -708,7 +725,10 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
                     // If the last vertex on the path to `current` is not
                     // alive, a reconnect is needed.
                     if v.is_alive() {
-                        if v.vertex != elt.vertex {
+                        // As below: `v` pushed this copy, and along a
+                        // non-deleted edge the bridge would be dropped as
+                        // a direct child.
+                        if v.vertex != elt.vertex && !(shortcuts && elt.via_alive) {
                             // We need to reconnect, and we can do it now
                             // since we won't have a chance to visit that
                             // edge (because non-PARENT edge we are
@@ -737,6 +757,10 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
         });
 
         let len = stack.len();
+        // `pristine::is_alive`, from the same edges, for `SweepHints`.
+        let mut alive_exact = elt.vertex.is_root();
+        let real_start = record.as_ref().map(|r| r.arena.len()).unwrap_or(0);
+        let mut pseudo = Vec::new();
         // If this is the first visit, find the children, in flag
         // order (alive first), since we don't want to reconnect
         // vertices multiple times.
@@ -754,6 +778,8 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
                     // This vertex is alive!
                     stack[len - 1].last_alive = elt.vertex;
                 }
+                alive_exact |= !e.flag().intersects(EdgeFlags::DELETED | EdgeFlags::PSEUDO)
+                    && (e.flag().contains(EdgeFlags::BLOCK) || elt.vertex.is_empty());
                 continue;
             } else if e.flag().contains(EdgeFlags::FOLDER) {
                 // If we are here, at least one child of `root` is
@@ -761,7 +787,17 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
                 return Ok(());
             }
 
+            if e.flag() == EdgeFlags::PSEUDO && e.introduced_by() == ChangeId::ROOT {
+                root_pseudo.insert((elt.vertex, e.dest()));
+            }
             let child = txn.find_block(channel, e.dest())?;
+            if let Some(record) = record.as_mut() {
+                if !e.flag().contains(EdgeFlags::PSEUDO) {
+                    record.arena.push(*child);
+                } else if !e.flag().is_deleted() {
+                    pseudo.push((e.flag(), *child, e.introduced_by()));
+                }
+            }
             // Record leftover zombie markings owned by the unrecorded change,
             // seen for free during this descent (edge is already non-PARENT,
             // non-FOLDER here).
@@ -774,7 +810,26 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
                 vertex: *child,
                 last_alive: elt.last_alive,
                 is_on_path: false,
+                via_alive: !e.flag().contains(EdgeFlags::DELETED),
             });
+        }
+
+        if let Some(record) = record.as_mut() {
+            let real_end = record.arena.len() as u32;
+            record
+                .vertices
+                .insert(elt.vertex, (real_start as u32, real_end, alive_exact));
+            if !pseudo.is_empty() {
+                record.pseudo.insert(elt.vertex, pseudo);
+            }
+        }
+
+        // `via_alive` promises a bridge from the vertex below on the path, and
+        // a dead vertex never carries one: the bridge then starts further down.
+        if !stack[len - 1].is_alive() {
+            for x in &mut stack[len..] {
+                x.via_alive = false
+            }
         }
 
         if len >= 2 && stack[len - 1].is_alive() {
@@ -789,6 +844,15 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
                     // If the last vertex on the path to `current` is not
                     // alive, a reconnect is needed.
                     if v.is_alive() {
+                        // `v` is the parent this vertex was pushed from.
+                        // Along a non-deleted edge, the deferred bridge
+                        // below would be dropped as a direct child by
+                        // `is_forward_reachable` (edges are only added in
+                        // between): do not defer it. Every other copy of
+                        // the same pair is dropped the same way.
+                        if shortcuts && stack[len - 1].via_alive {
+                            break;
+                        }
                         // We need to reconnect, and we can do it now
                         // since we won't have a chance to visit that
                         // edge (because non-PARENT edge we are
@@ -851,14 +915,22 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
     entering.dedup();
     let n_dead = entering.chunk_by(|a, b| a.0 == b.0).count();
     debug!(target: "pijul_core::apply::repair", "DFS complete: {} vertices, {} revisited vertices, {} bridges", visited.len(), n_dead, bridges.len());
-    let mut frontiers = if n_dead > PROBE_MAX_SET {
+    // With many revisited dead vertices, a dense snapshot of the alive exits
+    // of every dead vertex of the file (`DeadExits`) answers the exit queries
+    // faster than `ExitsMemo`, but building it reads every visited vertex.
+    // Most of those queries are answered by groups skipped further down, so
+    // build it only once the memo has kept as many answers as there are
+    // visited vertices. Both answer exactly (the walk's answers, on the
+    // current graph), so when and whether the snapshot is built changes only
+    // the time taken.
+    let mut pending_snapshot = shortcuts && n_dead > PROBE_MAX_SET;
+    let mut frontiers = if !shortcuts && n_dead > PROBE_MAX_SET {
         let mut sorted: Vec<_> = visited.iter().copied().collect();
         sorted.sort_unstable();
         DeadExits::new(txn, channel, &sorted.into_iter().collect())?
     } else {
         None
     };
-    drop(visited);
     debug!(target: "pijul_core::apply::repair", "frontier snapshot cached={}", frontiers.is_some());
     // Without the snapshot, the alive exits of each dead vertex are computed
     // once (per strongly connected dead component) and shared.
@@ -871,6 +943,7 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
     let mut exi: FxHashSet<Vertex<ChangeId>> = FxHashSet::default();
     let mut maximal = Vec::new();
     let mut non_minimal = FxHashSet::default();
+    let mut missing = Vec::new();
     // Different dead vertices often imply the same bridge. Preserve its first
     // insertion's order, but do not repeat the two pristine writes for it.
     let mut reconnected = FxHashSet::default();
@@ -883,12 +956,48 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
         // The DFS only records the alive descendants of the dead vertices on
         // the path when it finds them: a dead vertex whose dead children were
         // already visited gets none, although it leads to theirs.
+        if pending_snapshot && frontiers.is_none() && exits_memo.stored() > visited.len() {
+            let mut sorted: Vec<_> = visited.iter().copied().collect();
+            sorted.sort_unstable();
+            frontiers = DeadExits::new(txn, channel, &sorted.into_iter().collect())?;
+            pending_snapshot = false;
+        }
         if let Some(frontiers) = &frontiers {
             frontiers.extend(d, &mut exi);
         } else {
             exits_memo.extend(txn, channel, d, &mut exi, &mut dead_context)?;
         }
         if exi.is_empty() {
+            continue;
+        }
+
+        // This group can only insert pseudo-edges `l -> r` with `l` in `ent`
+        // and `r` in `exi`, and only those with `l` maximal and `r` minimal.
+        // An insertion that finds its edge already there changes nothing (no
+        // edge, no cache invalidation). The common case is a dead region an
+        // earlier apply already repaired, found again by every later DFS of
+        // the file: its maximal x minimal pairs are all in the graph and the
+        // pairs that are missing are the non-minimal ones the reduction left
+        // out. `group_inserts_anything` proves that with walks that stop at
+        // their target, instead of the full bounded walk from every exit
+        // vertex the reduction needs. When it cannot prove it, the group
+        // runs exactly as before. Skipping a group leaves the probe caches
+        // colder, never different: they are exact. A later group that
+        // reconnects one of these pairs finds it in the graph, as it would
+        // have found it in `reconnected`.
+        if shortcuts
+            && ent.len().saturating_mul(exi.len()) <= MAX_PRESENT_CHECK
+            && !group_inserts_anything(
+                txn,
+                channel,
+                &ent,
+                &exi,
+                (&visited, &root_pseudo),
+                &mut missing,
+                &mut scan_memo,
+                &mut dead_context,
+            )?
+        {
             continue;
         }
 
@@ -934,6 +1043,10 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
                 }
                 debug!("put_pseudo (reduced) {:?} {:?}", l, r);
                 if put_graph_with_rev(txn, channel, EdgeFlags::PSEUDO, l, r, ChangeId::ROOT)? {
+                    root_pseudo.insert((l, r.start_pos()));
+                    if let Some(h) = hints.as_mut() {
+                        h.inserted.push((l, r));
+                    }
                     // A walk never expands an alive vertex: only an edge from a
                     // dead source can change the exits of a dead vertex.
                     if !dead_context.is_alive(txn, channel, l)? {
@@ -969,12 +1082,134 @@ pub(crate) fn repair_zombies<T: GraphMutTxnT + TreeTxnT>(
         }
         debug!("put_pseudo (bridge) {:?} {:?}", u, v);
         if put_graph_with_rev(txn, channel, EdgeFlags::PSEUDO, u, v, ChangeId::ROOT)? {
+            root_pseudo.insert((u, v.start_pos()));
+            if let Some(h) = hints.as_mut() {
+                h.inserted.push((u, v));
+            }
             dead_context.invalidate(u);
         }
     }
     debug!(target: "pijul_core::apply::repair", "bridges complete");
+    if let (Some(h), Some(record)) = (hints, record) {
+        h.files.insert(root, record);
+    }
 
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: repair without the shortcuts of `repair_shortcuts`, to compare
+    /// the graphs both ways build.
+    pub(crate) static FULL_REPAIR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether `repair_zombies` and the sweep skip the work whose result is
+/// already in the graph (always, outside the tests that compare both ways).
+fn repair_shortcuts() -> bool {
+    #[cfg(test)]
+    {
+        !FULL_REPAIR.get()
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+
+/// Above this many candidate pairs for one dead vertex, `repair_zombies` does
+/// not look up whether they are all present and runs the reduction.
+const MAX_PRESENT_CHECK: usize = 4096;
+
+/// Would the reduction of one dead vertex insert any pseudo-edge? It inserts
+/// `l -> r` for every `l` of `maximal(ent)` and `r` of `minimal(exi)`, exactly
+/// as `put_graph_with_rev(PSEUDO, l, r, ROOT)` writes it, and an insertion
+/// only matters when that edge is missing. So the answer is "no" when every
+/// missing pair has a non-maximal `l` or a non-minimal `r`, decided as the
+/// reduction decides them:
+///
+/// - `l` is non-maximal when `ent` has 2 to `PROBE_MAX_SET` vertices and
+///   `reaches_any_within(l, ent)`; the same call, so the same answer.
+/// - `r` is non-minimal when `exi` has 2 to `PROBE_MAX_SET` vertices and the
+///   bounded walk of `ScanMemo` from another vertex of `exi` scans `r`
+///   (`ScanMemo::any_scans`, which stops the walks when one scans `r`).
+///
+/// Returns `true` (run the reduction) as soon as one missing pair is
+/// inserted. Never approximates: every answer is the reduction's own.
+fn group_inserts_anything<T: GraphTxnT, S: BuildHasher, S2: BuildHasher>(
+    txn: &T,
+    channel: &T::Graph,
+    ent: &std::collections::HashSet<Vertex<ChangeId>, S>,
+    exi: &std::collections::HashSet<Vertex<ChangeId>, S2>,
+    (visited, root_pseudo): (
+        &FxHashSet<Vertex<ChangeId>>,
+        &FxHashSet<(Vertex<ChangeId>, Position<ChangeId>)>,
+    ),
+    missing: &mut Vec<(Vertex<ChangeId>, Vertex<ChangeId>)>,
+    scan_memo: &mut ScanMemo,
+    context: &mut DeadContext,
+) -> Result<bool, BlockError<T::GraphError>> {
+    missing.clear();
+    for &l in ent.iter() {
+        for &r in exi.iter() {
+            if l == r {
+                continue;
+            }
+            let present = if visited.contains(&l) {
+                root_pseudo.contains(&(l, r.start_pos()))
+            } else {
+                let e = SerializedEdge::new(EdgeFlags::PSEUDO, r.change, r.start, ChangeId::ROOT);
+                matches!(txn.get_graph(channel, &l, Some(&e))?, Some(f) if *f == e)
+            };
+            if !present {
+                missing.push((l, r))
+            }
+        }
+    }
+    if missing.is_empty() {
+        return Ok(false);
+    }
+
+    let probe_ent = ent.len() > 1 && ent.len() <= PROBE_MAX_SET;
+    let probe_exi = exi.len() > 1 && exi.len() <= PROBE_MAX_SET;
+    if !probe_ent && !probe_exi {
+        return Ok(true);
+    }
+    // Answers per vertex: `None` not computed yet.
+    let mut maximal: FxHashMap<Vertex<ChangeId>, bool> = FxHashMap::default();
+    let mut minimal: FxHashMap<Vertex<ChangeId>, bool> = FxHashMap::default();
+    for i in 0..missing.len() {
+        let (l, r) = missing[i];
+        // Cheapest first: a known non-maximal `l` or non-minimal `r`.
+        if maximal.get(&l) == Some(&false) || minimal.get(&r) == Some(&false) {
+            continue;
+        }
+        let r_minimal = if !probe_exi {
+            true
+        } else if let Some(&m) = minimal.get(&r) {
+            m
+        } else {
+            let m = !scan_memo.any_scans(txn, channel, exi.iter().copied(), r, context)?;
+            minimal.insert(r, m);
+            m
+        };
+        if !r_minimal {
+            continue;
+        }
+        let l_maximal = if !probe_ent {
+            true
+        } else if let Some(&m) = maximal.get(&l) {
+            m
+        } else {
+            let m = !reaches_any_within(txn, channel, l, ent, context)?;
+            maximal.insert(l, m);
+            m
+        };
+        if l_maximal {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// How many vertices a reachability probe may visit before it gives up. A probe
@@ -1247,6 +1482,7 @@ pub(crate) fn clean_unjustified_pseudo_edges<T: GraphMutTxnT + TreeTxnT>(
     txn: &mut T,
     channel: &mut T::Graph,
     inodes: &HashSet<Position<ChangeId>>,
+    hints: Option<&SweepHints>,
 ) -> Result<(), LocalApplyError<T>> {
     let mut stack = Vec::new();
     let mut visited = FxHashSet::default();
@@ -1256,7 +1492,53 @@ pub(crate) fn clean_unjustified_pseudo_edges<T: GraphMutTxnT + TreeTxnT>(
     let mut targets = FxHashSet::default();
     let mut candidates = Vec::new();
     let mut del = Vec::new();
+    let mut sources = Vec::new();
     for root in inodes.iter() {
+        // A file that `repair_zombies` just walked: the walk read the edges
+        // and aliveness of every vertex the sweep reaches, and since then
+        // only pseudo-edges were inserted (`SweepHints::inserted`) and folder
+        // edges changed, which the sweep skips and which change no
+        // aliveness. So the candidates are the walk's pseudo-edges plus the
+        // inserted ones, and the searches can read the walk's real edges and
+        // aliveness instead of the pristine. A vertex without a candidate
+        // has nothing to do (the deletions wait for the end).
+        if let Some(h) = hints
+            && let Some((hint, sources)) = h.sources(root, &mut sources)
+        {
+            let inserted = &h.inserted;
+            for &v in sources.iter() {
+                candidates.clear();
+                targets.clear();
+                if let Some(p) = hint.pseudo.get(&v) {
+                    for &(flag, c, intro) in p.iter() {
+                        targets.insert(c);
+                        candidates.push((flag, v, c, intro));
+                    }
+                }
+                for &(l, r) in inserted.iter() {
+                    if l == v {
+                        targets.insert(r);
+                        candidates.push((EdgeFlags::PSEUDO, l, r, ChangeId::ROOT));
+                    }
+                }
+                retain_unjustified_hinted(
+                    txn,
+                    channel,
+                    hint,
+                    v,
+                    &mut targets,
+                    &mut jstack,
+                    &mut jvisited,
+                    &mut context,
+                )?;
+                del.extend(
+                    candidates
+                        .drain(..)
+                        .filter(|(_, _, c, _)| targets.contains(c)),
+                );
+            }
+            continue;
+        }
         stack.clear();
         visited.clear();
         stack.push(root.inode_vertex());
@@ -1307,6 +1589,106 @@ pub(crate) fn clean_unjustified_pseudo_edges<T: GraphMutTxnT + TreeTxnT>(
     for (flag, a, b, intro) in del.drain(..) {
         debug!("deleting unjustified pseudo edge {:?} -> {:?}", a, b);
         del_graph_with_rev(txn, channel, flag, a, b, intro)?;
+    }
+    Ok(())
+}
+
+/// What `repair_zombies` saw of the files it walked during one apply, so that
+/// `clean_unjustified_pseudo_edges` does not walk them again.
+#[derive(Default)]
+pub(crate) struct SweepHints {
+    files: FxHashMap<Position<ChangeId>, FileHint>,
+    /// Every pseudo-edge `repair_zombies` inserted in this apply, any file.
+    inserted: Vec<(Vertex<ChangeId>, Vertex<ChangeId>)>,
+}
+
+#[derive(Default)]
+struct FileHint {
+    /// Every vertex of the file's walk (which reaches what the sweep reaches
+    /// from the inode: the same edges, all non-`PARENT`, none `FOLDER`):
+    /// its real children, `arena[start..end]`, and `pristine::is_alive`.
+    vertices: FxHashMap<Vertex<ChangeId>, (u32, u32, bool)>,
+    /// Real children (non-`PARENT`, non-`FOLDER`, non-`PSEUDO`, deleted or
+    /// not) of the vertices, each vertex's in adjacency order.
+    arena: Vec<Vertex<ChangeId>>,
+    /// Non-deleted, non-folder pseudo-edges, by source.
+    pseudo: FxHashMap<Vertex<ChangeId>, Vec<(EdgeFlags, Vertex<ChangeId>, ChangeId)>>,
+}
+
+impl SweepHints {
+    /// The vertices of `root`'s file that can hold a sweep candidate, in
+    /// `out`; `None` when the sweep must walk the file. Between the walk and
+    /// the sweep, the edges that change are pseudo-edges inserted by
+    /// `repair_zombies` (recorded in `inserted`) and folder edges (which the
+    /// sweep skips). An inserted edge leaving the file's walk would let the
+    /// sweep reach vertices the walk did not see: then walk.
+    fn sources<'a>(
+        &'a self,
+        root: &Position<ChangeId>,
+        out: &'a mut Vec<Vertex<ChangeId>>,
+    ) -> Option<(&'a FileHint, &'a [Vertex<ChangeId>])> {
+        let hint = self.files.get(root)?;
+        out.clear();
+        out.extend(hint.pseudo.keys().copied());
+        for &(l, r) in self.inserted.iter() {
+            if hint.vertices.contains_key(&l) {
+                if !hint.vertices.contains_key(&r) {
+                    return None;
+                }
+                out.push(l);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        Some((hint, &out[..]))
+    }
+}
+
+/// `retain_unjustified_pseudo_targets`, reading the real edges and the
+/// aliveness the file's walk recorded (the pristine for a vertex it did not
+/// record, which cannot happen for a vertex the search reaches).
+#[allow(clippy::too_many_arguments)]
+fn retain_unjustified_hinted<T: GraphTxnT, S: BuildHasher, S2: BuildHasher>(
+    txn: &T,
+    channel: &T::Graph,
+    hint: &FileHint,
+    from: Vertex<ChangeId>,
+    targets: &mut std::collections::HashSet<Vertex<ChangeId>, S>,
+    stack: &mut Vec<Vertex<ChangeId>>,
+    visited: &mut std::collections::HashSet<Vertex<ChangeId>, S2>,
+    context: &mut DeadContext,
+) -> Result<(), BlockError<T::GraphError>> {
+    if targets.is_empty() {
+        return Ok(());
+    }
+    stack.clear();
+    stack.push(from);
+    visited.clear();
+    visited.insert(from);
+    let mut children = Vec::new();
+    while !targets.is_empty() {
+        let Some(v) = stack.pop() else { break };
+        children.clear();
+        if let Some(&(start, end, _)) = hint.vertices.get(&v) {
+            for &c in hint.arena[start as usize..end as usize].iter() {
+                let alive = match hint.vertices.get(&c) {
+                    Some(&(_, _, a)) => a,
+                    None => context.is_alive(txn, channel, c)?,
+                };
+                children.push((c, alive));
+            }
+        } else {
+            children.extend_from_slice(context.edges(txn, channel, v)?);
+        }
+        for &(c, alive) in children.iter() {
+            targets.remove(&c);
+            if targets.is_empty() {
+                return Ok(());
+            }
+            if !alive && visited.insert(c) {
+                stack.push(c);
+            }
+        }
     }
     Ok(())
 }
